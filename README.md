@@ -25,8 +25,7 @@ su
 ```
 ## 5. Almost there!
 ```
-curl -o ~/roblox_reconnect.sh https://raw.githubusercontent.com/wardz25/reconnectrblx/refs/heads/main/roblox_reconnect.sh
-```
+curl -o ~/roblox_reconnect.sh https://raw.githubusercontent.com/wardz25/reconnect-rblx/refs/heads/main/roblox_reconnect.sh
 ## 6. Enable Permission for the script
 ```
 chmod +x ~/roblox_reconnect.sh
