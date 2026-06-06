@@ -28,12 +28,11 @@ su
 curl -o ~/roblox_reconnect.sh https://raw.githubusercontent.com/wardz25/reconnect-rblx/refs/heads/main/roblox_reconnect.sh
 ```
 ## 6. Enable Permission for the script
+```
 chmod +x ~/roblox_reconnect.sh
 ```
 ## 7. Run the Script!
-```
-bash ~/roblox_reconnect.sh
 ````
-
+bash ~/roblox_reconnect.sh
 
 
