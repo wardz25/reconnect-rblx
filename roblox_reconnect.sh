@@ -10,6 +10,10 @@ CHECK_INTERVAL=10
 LOG_FILE="/storage/emulated/0/roblox_reconnect.log"
 CONFIG_FILE="/data/local/tmp/roblox_config.cfg"
 
+MODE_MAIN="main"
+MODE_MARKET="market"
+URL_MARKET="https://www.roblox.com/games/129954712878723/Grow-a-Garden-Trade-World"
+
 STATE_DIR="/data/local/tmp/rbx_state"
 FILE_LAST_RECONNECT="$STATE_DIR/last_reconnect"
 FILE_IN_BACKGROUND="$STATE_DIR/in_background"
@@ -39,6 +43,7 @@ save_config() {
 # ─────────────────────────────────────────
 
 URL="$URL"
+MODE="$MODE"
 
 # Relog otomatis setiap X jam (0 = mati)
 RELOG_SETIAP_JAM=$RELOG_SETIAP_JAM
@@ -56,6 +61,7 @@ EOF
 
 default_config() {
     URL=""
+    MODE="$MODE_MAIN"
     RELOG_SETIAP_JAM=1
     RECONNECT_OTOMATIS=1
     RESTART_KALAU_CRASH=1
@@ -80,8 +86,16 @@ show_toggle() {
 }
 
 show_current_config() {
+    local MODE_LABEL
+    if [ "$MODE" = "$MODE_MARKET" ]; then
+        MODE_LABEL="Market Grow a Garden"
+    else
+        MODE_LABEL="Grow a Garden (Utama)"
+    fi
     echo ""
-    echo "  URL    : ${URL:-[belum diisi]}"
+    echo "  Mode aktif : $MODE_LABEL"
+    echo "  URL Main   : ${URL:-[belum diisi]}"
+    echo "  URL Market : [hardcoded - Trade World]"
     echo "  Relog  : ${RELOG_SETIAP_JAM} jam $([ "$RELOG_SETIAP_JAM" = "0" ] && echo '(OFF)' || echo '(ON)')"
     echo "  Reconnect otomatis : $(show_toggle $RECONNECT_OTOMATIS)"
     echo "  Restart kalau crash: $(show_toggle $RESTART_KALAU_CRASH)"
@@ -100,17 +114,29 @@ wizard_setup() {
     echo "  Halo! Config belum ada, mari setup dulu."
     echo ""
 
-    # URL
+    # URL Main (private server)
     while true; do
-        echo "  Paste link private server Roblox kamu:"
+        echo "  Paste link private server GROW A GARDEN (utama):"
         printf "  > "
         read -r URL
-        if [ -n "$URL" ]; then
-            break
-        fi
+        if [ -n "$URL" ]; then break; fi
         echo "  ⚠ URL tidak boleh kosong!"
         echo ""
     done
+
+    echo ""
+
+    # Pilih mode awal
+    echo "  Mau auto reconnect ke mana dulu?"
+    echo "  1) Grow a Garden (utama)"
+    echo "  2) Market Grow a Garden"
+    printf "  > "
+    read -r INPUT_MODE
+    if [ "$INPUT_MODE" = "2" ]; then
+        MODE="$MODE_MARKET"
+    else
+        MODE="$MODE_MAIN"
+    fi
 
     echo ""
 
@@ -169,21 +195,60 @@ menu_utama() {
         echo "  Mau ngapain?"
         echo ""
         echo "  1) Langsung jalanin"
-        echo "  2) Ganti URL private server"
-        echo "  3) Ubah setting (relog, reconnect, dll)"
-        echo "  4) Keluar"
+        echo "  2) Ganti mode (main / market)"
+        echo "  3) Ganti URL private server"
+        echo "  4) Ubah setting (relog, reconnect, dll)"
+        echo "  5) Keluar"
         echo ""
-        printf "  Pilih (1-4): "
+        printf "  Pilih (1-5): "
         read -r PILIHAN
 
         case $PILIHAN in
             1) return 0 ;;
-            2) menu_ganti_url ;;
-            3) menu_edit_setting ;;
-            4) echo ""; echo "  Sampai jumpa!"; echo ""; exit 0 ;;
-            *) echo "  ⚠ Pilih angka 1-4"; sleep 1 ;;
+            2) menu_pilih_mode ;;
+            3) menu_ganti_url ;;
+            4) menu_edit_setting ;;
+            5) echo ""; echo "  Sampai jumpa!"; echo ""; exit 0 ;;
+            *) echo "  ⚠ Pilih angka 1-5"; sleep 1 ;;
         esac
     done
+}
+
+menu_pilih_mode() {
+    clr
+    header
+    echo ""
+    echo "  Pilih mode reconnect:"
+    echo ""
+    echo "  1) Grow a Garden (utama)"
+    echo "  2) Market Grow a Garden"
+    echo "  3) Batal"
+    echo ""
+    printf "  Pilih (1-3): "
+    read -r PILIHAN_MODE
+
+    case $PILIHAN_MODE in
+        1)
+            MODE="$MODE_MAIN"
+            save_config
+            echo ""
+            echo "  ✅ Mode: Grow a Garden (utama)"
+            ;;
+        2)
+            MODE="$MODE_MARKET"
+            save_config
+            echo ""
+            echo "  ✅ Mode: Market Grow a Garden"
+            ;;
+        3)
+            echo ""
+            echo "  Dibatalkan."
+            ;;
+        *)
+            echo "  ⚠ Pilih 1-3"
+            ;;
+    esac
+    sleep 1
 }
 
 menu_ganti_url() {
@@ -193,7 +258,7 @@ menu_ganti_url() {
     echo "  URL saat ini:"
     echo "  ${URL:-[kosong]}"
     echo ""
-    echo "  Paste URL baru (Enter untuk batal):"
+    echo "  Paste URL baru untuk MAIN (Enter untuk batal):"
     printf "  > "
     read -r NEW_URL
     if [ -n "$NEW_URL" ]; then
@@ -295,14 +360,30 @@ log() {
     echo "[$(date +%H:%M:%S)] $1" | tee -a "$LOG_FILE"
 }
 
+get_active_url() {
+    if [ "$MODE" = "$MODE_MARKET" ]; then
+        echo "$URL_MARKET"
+    else
+        echo "$URL"
+    fi
+}
+
 join_private_server() {
+    local ACTIVE_URL
+    ACTIVE_URL=$(get_active_url)
+    local MODE_LABEL
+    if [ "$MODE" = "$MODE_MARKET" ]; then
+        MODE_LABEL="Market"
+    else
+        MODE_LABEL="Main"
+    fi
     log ""
-    log "🚀 Join private server..."
+    log "🚀 Join private server... [Mode: $MODE_LABEL]"
     echo "1" > "$FILE_RECONNECTING"
     am force-stop "$PKG"
     sleep 4
-    am start -a android.intent.action.VIEW -d "$URL" "$PKG"
-    log "✅ Private server launched"
+    am start -a android.intent.action.VIEW -d "$ACTIVE_URL" "$PKG"
+    log "✅ Private server launched [Mode: $MODE_LABEL]"
     echo "$(date +%s)" > "$FILE_LAST_RELOG"
 }
 
@@ -325,7 +406,7 @@ wait_for_ingame() {
         sleep 3
         am force-stop "$PKG"
         sleep 3
-        am start -a android.intent.action.VIEW -d "$URL" "$PKG"
+        am start -a android.intent.action.VIEW -d "$(get_active_url)" "$PKG"
         log "🔄 Retry join, menunggu 90s..."
 
         while read -r line; do
@@ -477,7 +558,8 @@ clr
 echo "=========================================" | tee -a "$LOG_FILE"
 echo "   ROBLOX AUTO RECONNECT + AUTO RELOG"    | tee -a "$LOG_FILE"
 echo "=========================================" | tee -a "$LOG_FILE"
-log "URL              : $URL"
+log "Mode             : $([ "$MODE" = "$MODE_MARKET" ] && echo 'Market Grow a Garden' || echo 'Grow a Garden (Utama)')"
+log "URL aktif        : $(get_active_url)"
 log "Relog            : setiap ${RELOG_SETIAP_JAM} jam    → $([ "$RELOG_SETIAP_JAM" = "0" ] && echo OFF || echo ON)"
 log "Reconnect        : DC detection  → $(show_toggle $RECONNECT_OTOMATIS)"
 log "Restart crash    : auto restart  → $(show_toggle $RESTART_KALAU_CRASH)"
