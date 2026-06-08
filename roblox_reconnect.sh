@@ -132,10 +132,19 @@ wizard_setup() {
     if [ "$MODE" = "$MODE_MAIN" ]; then
         while true; do
             echo "  Paste link private server GROW A GARDEN:"
+            echo "  Contoh: https://www.roblox.com/games/126884695634066/Grow-a-Garden?privateServerLinkCode=xxxxx"
             printf "  > "
             read -r URL
-            if [ -n "$URL" ]; then break; fi
-            echo "  ⚠ URL tidak boleh kosong!"
+            if [ -z "$URL" ]; then
+                echo "  ⚠ URL tidak boleh kosong!"
+                echo ""
+                continue
+            fi
+            if echo "$URL" | grep -qE "^https://www\.roblox\.com/games/[0-9]+/[^?]+\?privateServerLinkCode=.+$"; then
+                break
+            fi
+            echo "  ⚠ Link tidak valid! Harus berupa private server Roblox."
+            echo "  Contoh: https://www.roblox.com/games/126884695634066/Grow-a-Garden?privateServerLinkCode=xxxxx"
             echo ""
         done
         echo ""
@@ -259,18 +268,27 @@ menu_ganti_url() {
     echo "  URL saat ini:"
     echo "  ${URL:-[kosong]}"
     echo ""
-    echo "  Paste URL baru untuk MAIN (Enter untuk batal):"
-    printf "  > "
-    read -r NEW_URL
-    if [ -n "$NEW_URL" ]; then
-        URL="$NEW_URL"
-        save_config
+    echo "  Paste URL baru (Enter untuk batal):"
+    echo "  Contoh: https://www.roblox.com/games/126884695634066/Grow-a-Garden?privateServerLinkCode=xxxxx"
+    while true; do
+        printf "  > "
+        read -r NEW_URL
+        if [ -z "$NEW_URL" ]; then
+            echo ""
+            echo "  Dibatalkan."
+            break
+        fi
+        if echo "$NEW_URL" | grep -qE "^https://www\.roblox\.com/games/[0-9]+/[^?]+\?privateServerLinkCode=.+$"; then
+            URL="$NEW_URL"
+            save_config
+            echo ""
+            echo "  ✅ URL diperbarui!"
+            break
+        fi
+        echo "  ⚠ Link tidak valid! Harus private server Roblox."
+        echo "  Contoh: https://www.roblox.com/games/126884695634066/Grow-a-Garden?privateServerLinkCode=xxxxx"
         echo ""
-        echo "  ✅ URL diperbarui!"
-    else
-        echo ""
-        echo "  Dibatalkan."
-    fi
+    done
     sleep 1
 }
 
