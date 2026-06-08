@@ -114,22 +114,10 @@ wizard_setup() {
     echo "  Halo! Config belum ada, mari setup dulu."
     echo ""
 
-    # URL Main (private server)
-    while true; do
-        echo "  Paste link private server GROW A GARDEN (utama):"
-        printf "  > "
-        read -r URL
-        if [ -n "$URL" ]; then break; fi
-        echo "  ⚠ URL tidak boleh kosong!"
-        echo ""
-    done
-
-    echo ""
-
-    # Pilih mode awal
-    echo "  Mau auto reconnect ke mana dulu?"
-    echo "  1) Grow a Garden (utama)"
-    echo "  2) Market Grow a Garden"
+    # Pilih mode dulu
+    echo "  Mau auto reconnect ke mana?"
+    echo "  1) Grow a Garden  - Private Server"
+    echo "  2) Market Grow a Garden  - Public"
     printf "  > "
     read -r INPUT_MODE
     if [ "$INPUT_MODE" = "2" ]; then
@@ -139,6 +127,19 @@ wizard_setup() {
     fi
 
     echo ""
+
+    # URL Main — hanya kalau mode main
+    if [ "$MODE" = "$MODE_MAIN" ]; then
+        while true; do
+            echo "  Paste link private server GROW A GARDEN:"
+            printf "  > "
+            read -r URL
+            if [ -n "$URL" ]; then break; fi
+            echo "  ⚠ URL tidak boleh kosong!"
+            echo ""
+        done
+        echo ""
+    fi
 
     # Relog
     echo "  Relog otomatis setiap berapa jam?"
@@ -220,7 +221,7 @@ menu_pilih_mode() {
     echo ""
     echo "  Pilih mode reconnect:"
     echo ""
-    echo "  1) Grow a Garden (utama)"
+    echo "  1) Grow a Garden"
     echo "  2) Market Grow a Garden"
     echo "  3) Batal"
     echo ""
@@ -232,7 +233,7 @@ menu_pilih_mode() {
             MODE="$MODE_MAIN"
             save_config
             echo ""
-            echo "  ✅ Mode: Grow a Garden (utama)"
+            echo "  ✅ Mode: Grow a Garden"
             ;;
         2)
             MODE="$MODE_MARKET"
