@@ -132,7 +132,7 @@ wizard_setup() {
     if [ "$MODE" = "$MODE_MAIN" ]; then
         while true; do
             echo "  Paste link private server GROW A GARDEN:"
-            echo "  Contoh: https://www.roblox.com/games/126884695634066/Grow-a-Garden?privateServerLinkCode=xxxxx"
+            echo "  Contoh: https://www.roblox.com/games/126884695634066/Grow-a-Garden?privateServerLinkCode=xxx"
             printf "  > "
             read -r URL
             if [ -z "$URL" ]; then
