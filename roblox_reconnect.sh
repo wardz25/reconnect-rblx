@@ -144,7 +144,7 @@ wizard_setup() {
                 break
             fi
             echo "  ⚠ Link tidak valid! Harus berupa private server Roblox."
-            echo "  Contoh: https://www.roblox.com/games/126884695634066/Grow-a-Garden?privateServerLinkCode=xxxxx"
+            echo "  Contoh: https://www.roblox.com/games/126884695634066/Grow-a-Garden?privateServerLinkCode=xxx"
             echo ""
         done
         echo ""
@@ -269,7 +269,7 @@ menu_ganti_url() {
     echo "  ${URL:-[kosong]}"
     echo ""
     echo "  Paste URL baru (Enter untuk batal):"
-    echo "  Contoh: https://www.roblox.com/games/126884695634066/Grow-a-Garden?privateServerLinkCode=xxxxx"
+    echo "  Contoh: https://www.roblox.com/games/126884695634066/Grow-a-Garden?privateServerLinkCode=xxx"
     while true; do
         printf "  > "
         read -r NEW_URL
@@ -286,7 +286,7 @@ menu_ganti_url() {
             break
         fi
         echo "  ⚠ Link tidak valid! Harus private server Roblox."
-        echo "  Contoh: https://www.roblox.com/games/126884695634066/Grow-a-Garden?privateServerLinkCode=xxxxx"
+        echo "  Contoh: https://www.roblox.com/games/126884695634066/Grow-a-Garden?privateServerLinkCode=xxx"
         echo ""
     done
     sleep 1
