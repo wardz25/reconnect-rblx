@@ -116,8 +116,8 @@ wizard_setup() {
 
     # Pilih mode dulu
     echo "  Mau auto reconnect ke mana?"
-    echo "  1) Grow a Garden  - Private Server"
-    echo "  2) Market Grow a Garden  - Public"
+    echo "  1) Grow a Garden - Private Server"
+    echo "  2) Market Grow a Garden - Public"
     printf "  > "
     read -r INPUT_MODE
     if [ "$INPUT_MODE" = "2" ]; then
