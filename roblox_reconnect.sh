@@ -403,14 +403,13 @@ join_private_server() {
     sleep 4
 
     if [ "$MODE" = "$MODE_MARKET" ]; then
-        # Market = public web URL, buka via browser supaya Roblox app handle deep link
-        am start -a android.intent.action.VIEW \
-            -d "$ACTIVE_URL" \
-            -n com.android.chrome/com.google.android.apps.chrome.Main \
-            2>/dev/null || \
-        am start -a android.intent.action.VIEW -d "$ACTIVE_URL"
+        # Market = public game, deep link langsung ke Roblox tanpa browser
+        am start \
+            -a android.intent.action.VIEW \
+            -d "roblox://experiences/start?placeId=129954712878723" \
+            -p "$PKG"
     else
-        # Main = private server, langsung ke Roblox app
+        # Main = private server URL
         am start -a android.intent.action.VIEW -d "$ACTIVE_URL" "$PKG"
     fi
 
