@@ -397,12 +397,24 @@ join_private_server() {
         MODE_LABEL="Main"
     fi
     log ""
-    log "🚀 Join private server... [Mode: $MODE_LABEL]"
+    log "🚀 Join server... [Mode: $MODE_LABEL]"
     echo "1" > "$FILE_RECONNECTING"
     am force-stop "$PKG"
     sleep 4
-    am start -a android.intent.action.VIEW -d "$ACTIVE_URL" "$PKG"
-    log "✅ Private server launched [Mode: $MODE_LABEL]"
+
+    if [ "$MODE" = "$MODE_MARKET" ]; then
+        # Market = public web URL, buka via browser supaya Roblox app handle deep link
+        am start -a android.intent.action.VIEW \
+            -d "$ACTIVE_URL" \
+            -n com.android.chrome/com.google.android.apps.chrome.Main \
+            2>/dev/null || \
+        am start -a android.intent.action.VIEW -d "$ACTIVE_URL"
+    else
+        # Main = private server, langsung ke Roblox app
+        am start -a android.intent.action.VIEW -d "$ACTIVE_URL" "$PKG"
+    fi
+
+    log "✅ Server launched [Mode: $MODE_LABEL]"
     echo "$(date +%s)" > "$FILE_LAST_RELOG"
 }
 
