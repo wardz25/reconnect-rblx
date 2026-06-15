@@ -213,20 +213,56 @@ pilih_package() {
 }
 
 # ─────────────────────────────────────────
-#   WIZARD SETUP PERTAMA KALI
+#   WIZARD SETUP PERTAMA KALI - VERSI BARU
+#   Dengan menu 5 opsi untuk pilih settings
 # ─────────────────────────────────────────
 
 wizard_setup() {
     clr
     header
     echo ""
-    echo "  Halo! Config belum ada, mari setup dulu."
+    echo "  🎯 SETUP AWAL - SELAMAT DATANG!"
     echo ""
+    echo "  Silakan pilih opsi setup:"
+    echo ""
+    echo "  1️⃣  Setup Cepat (rekomendasi - default semua ON)"
+    echo "  2️⃣  Setup Mode Saja (Private/Public)"
+    echo "  3️⃣  Setup Lengkap (custom semua setting)"
+    echo "  4️⃣  Setup Manual (input satu-satu)"
+    echo "  5️⃣  Batal & Keluar"
+    echo ""
+    printf "  Pilih opsi (1-5): "
+    read -r SETUP_OPTION
 
-    # Pilih mode dulu
+    case $SETUP_OPTION in
+        1) wizard_setup_cepat ;;
+        2) wizard_setup_mode ;;
+        3) wizard_setup_lengkap ;;
+        4) wizard_setup_manual ;;
+        5) 
+            echo ""
+            echo "  ❌ Setup dibatalkan. Keluar."
+            sleep 1
+            exit 0
+            ;;
+        *)
+            echo "  ⚠ Pilih 1-5"
+            sleep 1
+            wizard_setup
+            ;;
+    esac
+}
+
+# OPSI 1: Setup Cepat
+wizard_setup_cepat() {
+    clr
+    header
+    echo ""
+    echo "  ⚡ SETUP CEPAT"
+    echo ""
     echo "  Mau auto reconnect ke mana?"
-    echo "  1) Grow a Garden - Private Server"
-    echo "  2) Market Grow a Garden - Public"
+    echo "  1) Grow a Garden (Private Server)"
+    echo "  2) Market Grow a Garden (Public)"
     printf "  > "
     read -r INPUT_MODE
     if [ "$INPUT_MODE" = "2" ]; then
@@ -235,34 +271,115 @@ wizard_setup() {
         MODE="$MODE_MAIN"
     fi
 
-    echo ""
-
-    # URL Main — hanya kalau mode main
     if [ "$MODE" = "$MODE_MAIN" ]; then
+        echo ""
+        echo "  Paste link private server GROW A GARDEN:"
+        echo "  Contoh: https://www.roblox.com/games/126884695634066/Grow-a-Garden?privateServerLinkCode=xxx"
         while true; do
-            echo "  Paste link private server GROW A GARDEN:"
-            echo "  Contoh: https://www.roblox.com/games/126884695634066/Grow-a-Garden?privateServerLinkCode=xxx"
             printf "  > "
             read -r URL
             if [ -z "$URL" ]; then
                 echo "  ⚠ URL tidak boleh kosong!"
-                echo ""
                 continue
             fi
             if echo "$URL" | grep -qE "^https://www\.roblox\.com/games/[0-9]+/[^?]+\?privateServerLinkCode=.+$"; then
                 break
             fi
-            echo "  ⚠ Link tidak valid! Harus berupa private server Roblox."
-            echo "  Contoh: https://www.roblox.com/games/126884695634066/Grow-a-Garden?privateServerLinkCode=xxx"
-            echo ""
+            echo "  ⚠ Link tidak valid!"
         done
+    fi
+
+    # Default semua ON
+    RELOG_SETIAP_JAM=1
+    RECONNECT_OTOMATIS=1
+    RESTART_KALAU_CRASH=1
+    RECONNECT_SAAT_HOME=0
+
+    save_config
+    echo ""
+    echo "  ✅ Config setup cepat tersimpan!"
+    sleep 2
+}
+
+# OPSI 2: Setup Mode Saja
+wizard_setup_mode() {
+    clr
+    header
+    echo ""
+    echo "  🎮 SETUP MODE"
+    echo ""
+    echo "  Mau auto reconnect ke mana?"
+    echo "  1) Grow a Garden (Private Server)"
+    echo "  2) Market Grow a Garden (Public)"
+    printf "  > "
+    read -r INPUT_MODE
+
+    if [ "$INPUT_MODE" = "2" ]; then
+        MODE="$MODE_MARKET"
+    else
+        MODE="$MODE_MAIN"
+    fi
+
+    if [ "$MODE" = "$MODE_MAIN" ]; then
         echo ""
+        echo "  Paste link private server:"
+        while true; do
+            printf "  > "
+            read -r URL
+            if [ -z "$URL" ]; then
+                echo "  ⚠ URL tidak boleh kosong!"
+                continue
+            fi
+            if echo "$URL" | grep -qE "^https://www\.roblox\.com/games/[0-9]+/[^?]+\?privateServerLinkCode=.+$"; then
+                break
+            fi
+            echo "  ⚠ Link tidak valid!"
+        done
+    fi
+
+    save_config
+    echo ""
+    echo "  ✅ Mode berhasil disimpan!"
+    sleep 2
+}
+
+# OPSI 3: Setup Lengkap (interactive dengan konfirmasi)
+wizard_setup_lengkap() {
+    clr
+    header
+    echo ""
+    echo "  ⚙️  SETUP LENGKAP"
+    echo ""
+
+    # Mode
+    echo "  1. Pilih Mode:"
+    echo "     1) Private Server"
+    echo "     2) Market (Public)"
+    printf "     > "
+    read -r INPUT_MODE
+    if [ "$INPUT_MODE" = "2" ]; then
+        MODE="$MODE_MARKET"
+    else
+        MODE="$MODE_MAIN"
+    fi
+
+    # URL (jika mode main)
+    if [ "$MODE" = "$MODE_MAIN" ]; then
+        echo ""
+        echo "  2. URL Private Server:"
+        while true; do
+            printf "     > "
+            read -r URL
+            if [ -n "$URL" ]; then break; fi
+            echo "     ⚠ URL tidak boleh kosong!"
+        done
     fi
 
     # Relog
-    echo "  Relog otomatis setiap berapa jam?"
-    echo "  (ketik 0 untuk mematikan relog otomatis, default: 1)"
-    printf "  > "
+    echo ""
+    echo "  3. Relog otomatis:"
+    echo "     Setiap berapa jam? (0=OFF, default: 1)"
+    printf "     > "
     read -r INPUT_RELOG
     if [[ "$INPUT_RELOG" =~ ^[0-9]+$ ]]; then
         RELOG_SETIAP_JAM=$INPUT_RELOG
@@ -270,36 +387,159 @@ wizard_setup() {
         RELOG_SETIAP_JAM=1
     fi
 
-    echo ""
-
     # Reconnect
-    echo "  Reconnect otomatis saat DC? (1=ON / 0=OFF, default: 1)"
-    printf "  > "
+    echo ""
+    echo "  4. Reconnect otomatis saat DC?"
+    echo "     1=ON, 0=OFF (default: 1)"
+    printf "     > "
     read -r INPUT_RC
     if [ "$INPUT_RC" = "0" ]; then RECONNECT_OTOMATIS=0; else RECONNECT_OTOMATIS=1; fi
 
-    echo ""
-
     # Crash restart
-    echo "  Restart otomatis kalau Roblox crash? (1=ON / 0=OFF, default: 1)"
-    printf "  > "
+    echo ""
+    echo "  5. Restart otomatis kalau crash?"
+    echo "     1=ON, 0=OFF (default: 1)"
+    printf "     > "
     read -r INPUT_CR
     if [ "$INPUT_CR" = "0" ]; then RESTART_KALAU_CRASH=0; else RESTART_KALAU_CRASH=1; fi
 
-    echo ""
-
     # Reconnect on home
-    echo "  Reconnect saat app di-minimize/home? (1=ON / 0=OFF, default: 0)"
-    printf "  > "
+    echo ""
+    echo "  6. Reconnect saat app di-home/minimize?"
+    echo "     1=ON, 0=OFF (default: 0)"
+    printf "     > "
     read -r INPUT_RH
     if [ "$INPUT_RH" = "1" ]; then RECONNECT_SAAT_HOME=1; else RECONNECT_SAAT_HOME=0; fi
 
     save_config
 
+    clr
+    header
     echo ""
-    echo "  ✅ Config tersimpan!"
+    echo "  📋 RINGKASAN CONFIG:"
+    show_current_config
     echo ""
-    sleep 1
+    echo "  ✅ Setup lengkap selesai!"
+    sleep 2
+}
+
+# OPSI 4: Setup Manual (satu-satu detail)
+wizard_setup_manual() {
+    clr
+    header
+    echo ""
+    echo "  🔧 SETUP MANUAL - INPUT DETAIL"
+    echo ""
+    
+    # Mode
+    echo "  ➤ Pilih Mode:"
+    echo "    1) Grow a Garden (Private Server)"
+    echo "    2) Market Grow a Garden (Public)"
+    printf "    > "
+    read -r INPUT_MODE
+    if [ "$INPUT_MODE" = "2" ]; then
+        MODE="$MODE_MARKET"
+        echo "    ✓ Mode: Market (Public)"
+    else
+        MODE="$MODE_MAIN"
+        echo "    ✓ Mode: Private Server"
+    fi
+
+    # URL Private
+    if [ "$MODE" = "$MODE_MAIN" ]; then
+        echo ""
+        echo "  ➤ Paste URL Private Server:"
+        echo "    Format: https://www.roblox.com/games/[ID]/[Name]?privateServerLinkCode=[CODE]"
+        while true; do
+            printf "    > "
+            read -r URL
+            if [ -z "$URL" ]; then
+                echo "    ⚠ Tidak boleh kosong!"
+                continue
+            fi
+            if echo "$URL" | grep -qE "^https://www\.roblox\.com/games/[0-9]+/[^?]+\?privateServerLinkCode=.+$"; then
+                echo "    ✓ URL valid!"
+                break
+            fi
+            echo "    ⚠ Format URL tidak valid!"
+        done
+    fi
+
+    # Relog Detail
+    echo ""
+    echo "  ➤ RELOG OTOMATIS"
+    echo "    Relog setiap berapa jam?"
+    echo "    • 0 = Tidak ada relog otomatis"
+    echo "    • 1 = Relog setiap 1 jam"
+    echo "    • 2 = Relog setiap 2 jam"
+    echo "    • dst..."
+    printf "    > "
+    read -r INPUT_RELOG
+    if [[ "$INPUT_RELOG" =~ ^[0-9]+$ ]]; then
+        RELOG_SETIAP_JAM=$INPUT_RELOG
+        if [ "$RELOG_SETIAP_JAM" = "0" ]; then
+            echo "    ✓ Relog otomatis: MATIKAN"
+        else
+            echo "    ✓ Relog setiap $RELOG_SETIAP_JAM jam"
+        fi
+    else
+        RELOG_SETIAP_JAM=1
+        echo "    ✓ Default: 1 jam"
+    fi
+
+    # Reconnect Detail
+    echo ""
+    echo "  ➤ RECONNECT OTOMATIS (saat DC)"
+    echo "    • 1 = Nyalakan (reconnect saat disconnected)"
+    echo "    • 0 = Matikan (tidak auto reconnect)"
+    printf "    > "
+    read -r INPUT_RC
+    if [ "$INPUT_RC" = "0" ]; then
+        RECONNECT_OTOMATIS=0
+        echo "    ✓ Reconnect otomatis: MATIKAN"
+    else
+        RECONNECT_OTOMATIS=1
+        echo "    ✓ Reconnect otomatis: NYALAKAN"
+    fi
+
+    # Crash Restart Detail
+    echo ""
+    echo "  ➤ RESTART OTOMATIS (kalau crash)"
+    echo "    • 1 = Nyalakan (restart otomatis jika Roblox crash)"
+    echo "    • 0 = Matikan (tidak auto restart)"
+    printf "    > "
+    read -r INPUT_CR
+    if [ "$INPUT_CR" = "0" ]; then
+        RESTART_KALAU_CRASH=0
+        echo "    ✓ Restart crash: MATIKAN"
+    else
+        RESTART_KALAU_CRASH=1
+        echo "    ✓ Restart crash: NYALAKAN"
+    fi
+
+    # Home Reconnect Detail
+    echo ""
+    echo "  ➤ RECONNECT SAAT HOME (minimize)"
+    echo "    • 1 = Nyalakan (reconnect meskipun app di background)"
+    echo "    • 0 = Matikan (hanya reconnect saat app aktif)"
+    printf "    > "
+    read -r INPUT_RH
+    if [ "$INPUT_RH" = "1" ]; then
+        RECONNECT_SAAT_HOME=1
+        echo "    ✓ Reconnect saat home: NYALAKAN"
+    else
+        RECONNECT_SAAT_HOME=0
+        echo "    ✓ Reconnect saat home: MATIKAN"
+    fi
+
+    save_config
+
+    echo ""
+    echo "  🎉 Setup manual selesai!"
+    echo ""
+    echo "  📋 Ringkasan:"
+    show_current_config
+    sleep 2
 }
 
 # ─────────────────────────────────────────
