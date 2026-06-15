@@ -2,28 +2,46 @@
 
 # ─────────────────────────────────────────
 #   ROBLOX AUTO RECONNECT + AUTO RELOG
-#   by: Wardz | versi: 2.0
+#   by: Wardz | versi: 2.1 (Multi-Package)
 # ─────────────────────────────────────────
 
-PKG="com.roblox.client"
+PKG=""
 CHECK_INTERVAL=10
-LOG_FILE="/storage/emulated/0/roblox_reconnect.log"
-CONFIG_FILE="/data/local/tmp/roblox_config.cfg"
 
 MODE_MAIN="main"
 MODE_MARKET="market"
 URL_MARKET="https://www.roblox.com/games/129954712878723/Grow-a-Garden-Trade-World"
 
-STATE_DIR="/data/local/tmp/rbx_state"
-FILE_LAST_RECONNECT="$STATE_DIR/last_reconnect"
-FILE_IN_BACKGROUND="$STATE_DIR/in_background"
-FILE_LAST_RELOG="$STATE_DIR/last_relog"
-FILE_RECONNECTING="$STATE_DIR/reconnecting"
+# Folder dasar — nama package bakal ditambahin
+# di belakangnya lewat set_pkg_paths()
+CONFIG_BASE_DIR="/data/local/tmp"
+STATE_BASE_DIR="/data/local/tmp"
+LOG_BASE_DIR="/storage/emulated/0"
+LAST_PKG_FILE="/data/local/tmp/rbx_last_pkg"
 
 RECONNECT_COOLDOWN=45
 MONITOR_PID=""
 LAST_VERBOSE=0
 VERBOSE_INTERVAL=600
+
+# ─────────────────────────────────────────
+#   PATH PER-PACKAGE
+#   Tiap package com.roblox.* punya config,
+#   state, dan log file masing-masing —
+#   jadi server (private/public) bisa beda
+#   per package/akun.
+# ─────────────────────────────────────────
+
+set_pkg_paths() {
+    CONFIG_FILE="${CONFIG_BASE_DIR}/roblox_config_${PKG}.cfg"
+    STATE_DIR="${STATE_BASE_DIR}/rbx_state_${PKG}"
+    LOG_FILE="${LOG_BASE_DIR}/roblox_reconnect_${PKG}.log"
+
+    FILE_LAST_RECONNECT="$STATE_DIR/last_reconnect"
+    FILE_IN_BACKGROUND="$STATE_DIR/in_background"
+    FILE_LAST_RELOG="$STATE_DIR/last_relog"
+    FILE_RECONNECTING="$STATE_DIR/reconnecting"
+}
 
 # ─────────────────────────────────────────
 #   FUNGSI CONFIG
@@ -39,6 +57,7 @@ save_config() {
     cat > "$CONFIG_FILE" <<EOF
 # ─────────────────────────────────────────
 #   CONFIG ROBLOX AUTO RECONNECT
+#   Package : $PKG
 #   Edit angka: 1 = ON, 0 = OFF
 # ─────────────────────────────────────────
 
@@ -77,6 +96,9 @@ clr() { clear 2>/dev/null || printf '\033[2J\033[H'; }
 header() {
     echo "========================================="
     echo "   ROBLOX AUTO RECONNECT + AUTO RELOG"
+    if [ -n "$PKG" ]; then
+        echo "   Akun/Package: $PKG"
+    fi
     echo "========================================="
 }
 
@@ -88,19 +110,106 @@ show_toggle() {
 show_current_config() {
     local MODE_LABEL
     if [ "$MODE" = "$MODE_MARKET" ]; then
-        MODE_LABEL="Market Grow a Garden"
+        MODE_LABEL="Market Grow a Garden (Public)"
     else
-        MODE_LABEL="Grow a Garden (Utama)"
+        MODE_LABEL="Grow a Garden - Private Server"
     fi
     echo ""
     echo "  Mode aktif : $MODE_LABEL"
     echo "  URL Main   : ${URL:-[belum diisi]}"
-    echo "  URL Market : [hardcoded - Trade World]"
+    echo "  URL Market : [Trade World]"
     echo "  Relog  : ${RELOG_SETIAP_JAM} jam $([ "$RELOG_SETIAP_JAM" = "0" ] && echo '(OFF)' || echo '(ON)')"
     echo "  Reconnect otomatis : $(show_toggle $RECONNECT_OTOMATIS)"
     echo "  Restart kalau crash: $(show_toggle $RESTART_KALAU_CRASH)"
     echo "  Reconnect saat home: $(show_toggle $RECONNECT_SAAT_HOME)"
     echo ""
+}
+
+# ─────────────────────────────────────────
+#   FUNGSI MULTI PACKAGE / PILIH AKUN
+#   Kalau di HP ada beberapa package
+#   com.roblox.* (misal hasil clone app),
+#   user bisa pilih mau pakai yang mana.
+#   Tiap package = config & server sendiri.
+# ─────────────────────────────────────────
+
+detect_roblox_packages() {
+    pm list packages 2>/dev/null | sed -n 's/^package://p' | grep -i roblox | sort
+}
+
+pilih_package() {
+    clr
+    header
+    echo ""
+
+    local PKGS=()
+    while IFS= read -r line; do
+        [ -n "$line" ] && PKGS+=("$line")
+    done < <(detect_roblox_packages)
+
+    # Tidak ada package roblox kebaca sama sekali
+    if [ ${#PKGS[@]} -eq 0 ]; then
+        echo "  ⚠ Tidak ada package 'roblox' terdeteksi via 'pm list packages'."
+        echo "  Pakai default: com.roblox.client"
+        PKG="com.roblox.client"
+        set_pkg_paths
+        echo "$PKG" > "$LAST_PKG_FILE" 2>/dev/null
+        sleep 2
+        return
+    fi
+
+    # Cuma 1 package → langsung pakai, gak perlu nanya
+    if [ ${#PKGS[@]} -eq 1 ]; then
+        PKG="${PKGS[0]}"
+        set_pkg_paths
+        echo "$PKG" > "$LAST_PKG_FILE" 2>/dev/null
+        echo "  ℹ️  Hanya 1 package Roblox terdeteksi: $PKG"
+        sleep 1
+        return
+    fi
+
+    # Lebih dari 1 package → user pilih
+    local LAST_PKG=""
+    [ -f "$LAST_PKG_FILE" ] && LAST_PKG=$(cat "$LAST_PKG_FILE" 2>/dev/null)
+
+    local DEFAULT_IDX=1
+    local i=1
+    for p in "${PKGS[@]}"; do
+        [ "$p" = "$LAST_PKG" ] && DEFAULT_IDX=$i
+        i=$((i+1))
+    done
+
+    echo "  📦 Ditemukan beberapa package Roblox di HP ini:"
+    echo "      (tiap package = akun & server sendiri)"
+    echo ""
+    i=1
+    for p in "${PKGS[@]}"; do
+        local mark=""
+        [ "$i" -eq "$DEFAULT_IDX" ] && mark="   ← terakhir dipakai"
+        echo "  $i) $p$mark"
+        i=$((i+1))
+    done
+    echo ""
+    echo "  Pilih package (Enter = pakai yang terakhir):"
+    printf "  > "
+    read -r PILIH_PKG
+
+    if [ -z "$PILIH_PKG" ]; then
+        PKG="${PKGS[$((DEFAULT_IDX-1))]}"
+    elif [[ "$PILIH_PKG" =~ ^[0-9]+$ ]] && [ "$PILIH_PKG" -ge 1 ] && [ "$PILIH_PKG" -le "${#PKGS[@]}" ]; then
+        PKG="${PKGS[$((PILIH_PKG-1))]}"
+    else
+        echo "  ⚠ Pilihan tidak valid, pakai: ${PKGS[$((DEFAULT_IDX-1))]}"
+        PKG="${PKGS[$((DEFAULT_IDX-1))]}"
+        sleep 1
+    fi
+
+    set_pkg_paths
+    echo "$PKG" > "$LAST_PKG_FILE" 2>/dev/null
+
+    echo ""
+    echo "  ✅ Package aktif: $PKG"
+    sleep 1
 }
 
 # ─────────────────────────────────────────
@@ -205,12 +314,13 @@ menu_utama() {
         echo "  Mau ngapain?"
         echo ""
         echo "  1) Langsung jalanin"
-        echo "  2) Ganti mode (main / market)"
+        echo "  2) Ganti mode (private / public)"
         echo "  3) Ganti URL private server"
         echo "  4) Ubah setting (relog, reconnect, dll)"
-        echo "  5) Keluar"
+        echo "  5) Ganti akun / package Roblox"
+        echo "  6) Keluar"
         echo ""
-        printf "  Pilih (1-5): "
+        printf "  Pilih (1-6): "
         read -r PILIHAN
 
         case $PILIHAN in
@@ -218,8 +328,9 @@ menu_utama() {
             2) menu_pilih_mode ;;
             3) menu_ganti_url ;;
             4) menu_edit_setting ;;
-            5) echo ""; echo "  Sampai jumpa!"; echo ""; exit 0 ;;
-            *) echo "  ⚠ Pilih angka 1-5"; sleep 1 ;;
+            5) menu_ganti_package ;;
+            6) echo ""; echo "  Sampai jumpa!"; echo ""; exit 0 ;;
+            *) echo "  ⚠ Pilih angka 1-6"; sleep 1 ;;
         esac
     done
 }
@@ -228,10 +339,10 @@ menu_pilih_mode() {
     clr
     header
     echo ""
-    echo "  Pilih mode reconnect:"
+    echo "  Pilih server untuk package: $PKG"
     echo ""
-    echo "  1) Grow a Garden"
-    echo "  2) Market Grow a Garden"
+    echo "  1) Grow a Garden (Private Server)"
+    echo "  2) Market Grow a Garden (Public)"
     echo "  3) Batal"
     echo ""
     printf "  Pilih (1-3): "
@@ -242,13 +353,13 @@ menu_pilih_mode() {
             MODE="$MODE_MAIN"
             save_config
             echo ""
-            echo "  ✅ Mode: Grow a Garden"
+            echo "  ✅ Mode: Grow a Garden (Private Server)"
             ;;
         2)
             MODE="$MODE_MARKET"
             save_config
             echo ""
-            echo "  ✅ Mode: Market Grow a Garden"
+            echo "  ✅ Mode: Market Grow a Garden (Public)"
             ;;
         3)
             echo ""
@@ -371,6 +482,16 @@ menu_edit_setting() {
     done
 }
 
+menu_ganti_package() {
+    pilih_package
+    default_config
+    load_config
+    if [ -z "$URL" ] && [ ! -f "$CONFIG_FILE" ]; then
+        wizard_setup
+        load_config
+    fi
+}
+
 # ─────────────────────────────────────────
 #   FUNGSI CORE (log, join, monitor)
 # ─────────────────────────────────────────
@@ -392,28 +513,17 @@ join_private_server() {
     ACTIVE_URL=$(get_active_url)
     local MODE_LABEL
     if [ "$MODE" = "$MODE_MARKET" ]; then
-        MODE_LABEL="Market"
+        MODE_LABEL="Public/Market"
     else
-        MODE_LABEL="Main"
+        MODE_LABEL="Private"
     fi
     log ""
-    log "🚀 Join server... [Mode: $MODE_LABEL]"
+    log "🚀 [$PKG] Join server... [Mode: $MODE_LABEL]"
     echo "1" > "$FILE_RECONNECTING"
     am force-stop "$PKG"
     sleep 4
-
-    if [ "$MODE" = "$MODE_MARKET" ]; then
-        # Market = public game, deep link langsung ke Roblox tanpa browser
-        am start \
-            -a android.intent.action.VIEW \
-            -d "roblox://experiences/start?placeId=129954712878723" \
-            -p "$PKG"
-    else
-        # Main = private server URL
-        am start -a android.intent.action.VIEW -d "$ACTIVE_URL" "$PKG"
-    fi
-
-    log "✅ Server launched [Mode: $MODE_LABEL]"
+    am start -a android.intent.action.VIEW -d "$ACTIVE_URL" "$PKG"
+    log "✅ [$PKG] Server launched [Mode: $MODE_LABEL]"
     echo "$(date +%s)" > "$FILE_LAST_RELOG"
 }
 
@@ -456,21 +566,21 @@ wait_for_ingame() {
 }
 
 monitor_disconnect() {
-    log "🔍 Monitor DC aktif (PID: $$)"
+    log "🔍 [$PKG] Monitor DC aktif (PID: $$)"
     echo "0" > "$FILE_IN_BACKGROUND"
 
     while read -r line; do
 
-        if echo "$line" | grep -qi "foregroundActivities=false" && echo "$line" | grep -q "com.roblox.client"; then
+        if echo "$line" | grep -qi "foregroundActivities=false" && echo "$line" | grep -q "$PKG"; then
             echo "1" > "$FILE_IN_BACKGROUND"
-            log "📱 App masuk background"
+            log "📱 [$PKG] App masuk background"
             continue
         fi
 
-        if echo "$line" | grep -qi "foregroundActivities=true" && echo "$line" | grep -q "com.roblox.client"; then
+        if echo "$line" | grep -qi "foregroundActivities=true" && echo "$line" | grep -q "$PKG"; then
             sleep 5
             echo "0" > "$FILE_IN_BACKGROUND"
-            log "📱 App kembali foreground"
+            log "📱 [$PKG] App kembali foreground"
             continue
         fi
 
@@ -560,6 +670,12 @@ if [ "$(id -u)" != "0" ]; then
 fi
 
 # ─────────────────────────────────────────
+#   MAIN — PILIH PACKAGE / AKUN ROBLOX
+# ─────────────────────────────────────────
+
+pilih_package
+
+# ─────────────────────────────────────────
 #   MAIN — LOAD CONFIG & TAMPILKAN MENU
 # ─────────────────────────────────────────
 
@@ -588,7 +704,8 @@ clr
 echo "=========================================" | tee -a "$LOG_FILE"
 echo "   ROBLOX AUTO RECONNECT + AUTO RELOG"    | tee -a "$LOG_FILE"
 echo "=========================================" | tee -a "$LOG_FILE"
-log "Mode             : $([ "$MODE" = "$MODE_MARKET" ] && echo 'Market Grow a Garden' || echo 'Grow a Garden (Utama)')"
+log "Package          : $PKG"
+log "Mode             : $([ "$MODE" = "$MODE_MARKET" ] && echo 'Market Grow a Garden (Public)' || echo 'Grow a Garden (Private Server)')"
 log "URL aktif        : $(get_active_url)"
 log "Relog            : setiap ${RELOG_SETIAP_JAM} jam    → $([ "$RELOG_SETIAP_JAM" = "0" ] && echo OFF || echo ON)"
 log "Reconnect        : DC detection  → $(show_toggle $RECONNECT_OTOMATIS)"
