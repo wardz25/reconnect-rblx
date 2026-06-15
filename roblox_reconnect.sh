@@ -2,7 +2,7 @@
 
 # ─────────────────────────────────────────
 #   ROBLOX AUTO RECONNECT + AUTO RELOG
-#   by: Wardz | versi: 2.1 (Multi-Package)
+#   by: Wardz | versi: 2.2 (Multi-Package)
 # ─────────────────────────────────────────
 
 PKG=""
@@ -112,7 +112,7 @@ show_current_config() {
     if [ "$MODE" = "$MODE_MARKET" ]; then
         MODE_LABEL="Market Grow a Garden (Public)"
     else
-        MODE_LABEL="Grow a Garden - Private Server"
+        MODE_LABEL="Game - Private Server"
     fi
     echo ""
     echo "  Mode aktif : $MODE_LABEL"
@@ -126,15 +126,54 @@ show_current_config() {
 }
 
 # ─────────────────────────────────────────
-#   FUNGSI MULTI PACKAGE / PILIH AKUN
-#   Kalau di HP ada beberapa package
-#   com.roblox.* (misal hasil clone app),
-#   user bisa pilih mau pakai yang mana.
-#   Tiap package = config & server sendiri.
+#   FUNGSI DETEKSI PACKAGE ROBLOX
+#   2 cara: 1. Running apps, 2. Regex pattern
 # ─────────────────────────────────────────
 
+detect_running_roblox_apps() {
+    ps -A 2>/dev/null | grep -i roblox | awk '{print $NF}' | sort -u | grep "^com\.roblox"
+}
+
+detect_installed_roblox_packages() {
+    pm list packages 2>/dev/null | sed -n 's/^package://p' | grep -E "^com\.roblox\.[a-zA-Z0-9]*$" | sort
+}
+
 detect_roblox_packages() {
-    pm list packages 2>/dev/null | sed -n 's/^package://p' | grep -i roblox | sort
+    local RUNNING_APPS=()
+    local INSTALLED_PKGS=()
+    
+    # Deteksi aplikasi yang sedang berjalan
+    echo "  🔄 Deteksi aplikasi Roblox yang sedang berjalan..."
+    while IFS= read -r line; do
+        [ -n "$line" ] && RUNNING_APPS+=("$line")
+    done < <(detect_running_roblox_apps)
+    
+    # Deteksi package terinstall dengan regex pattern
+    echo "  🔄 Deteksi package Roblox yang terinstall..."
+    while IFS= read -r line; do
+        [ -n "$line" ] && INSTALLED_PKGS+=("$line")
+    done < <(detect_installed_roblox_packages)
+    
+    # Gabung dan hilangkan duplikat
+    local ALL_PKGS=()
+    local SEEN=()
+    
+    for pkg in "${RUNNING_APPS[@]}" "${INSTALLED_PKGS[@]}"; do
+        local found=0
+        for seen_pkg in "${SEEN[@]}"; do
+            if [ "$pkg" = "$seen_pkg" ]; then
+                found=1
+                break
+            fi
+        done
+        if [ $found -eq 0 ]; then
+            ALL_PKGS+=("$pkg")
+            SEEN+=("$pkg")
+        fi
+    done
+    
+    # Output hasil deteksi
+    printf "%s\n" "${ALL_PKGS[@]}"
 }
 
 pilih_package() {
@@ -149,7 +188,7 @@ pilih_package() {
 
     # Tidak ada package roblox kebaca sama sekali
     if [ ${#PKGS[@]} -eq 0 ]; then
-        echo "  ⚠ Tidak ada package 'roblox' terdeteksi via 'pm list packages'."
+        echo "  ⚠ Tidak ada package 'roblox' terdeteksi."
         echo "  Pakai default: com.roblox.client"
         PKG="com.roblox.client"
         set_pkg_paths
@@ -261,8 +300,8 @@ wizard_setup_cepat() {
     echo "  ⚡ SETUP CEPAT"
     echo ""
     echo "  Mau auto reconnect ke mana?"
-    echo "  1) Grow a Garden (Private Server)"
-    echo "  2) Market Grow a Garden (Public)"
+    echo "  1) Game - Private Server"
+    echo "  2) Market Grow a Garden - Public"
     printf "  > "
     read -r INPUT_MODE
     if [ "$INPUT_MODE" = "2" ]; then
@@ -273,7 +312,7 @@ wizard_setup_cepat() {
 
     if [ "$MODE" = "$MODE_MAIN" ]; then
         echo ""
-        echo "  Paste link private server GROW A GARDEN:"
+        echo "  Paste link private server GAME:"
         echo "  Contoh: https://www.roblox.com/games/126884695634066/Grow-a-Garden?privateServerLinkCode=xxx"
         while true; do
             printf "  > "
@@ -309,8 +348,8 @@ wizard_setup_mode() {
     echo "  🎮 SETUP MODE"
     echo ""
     echo "  Mau auto reconnect ke mana?"
-    echo "  1) Grow a Garden (Private Server)"
-    echo "  2) Market Grow a Garden (Public)"
+    echo "  1) Game - Private Server"
+    echo "  2) Market Grow a Garden - Public"
     printf "  > "
     read -r INPUT_MODE
 
@@ -433,8 +472,8 @@ wizard_setup_manual() {
     
     # Mode
     echo "  ➤ Pilih Mode:"
-    echo "    1) Grow a Garden (Private Server)"
-    echo "    2) Market Grow a Garden (Public)"
+    echo "    1) Game - Private Server"
+    echo "    2) Market Grow a Garden - Public"
     printf "    > "
     read -r INPUT_MODE
     if [ "$INPUT_MODE" = "2" ]; then
@@ -544,6 +583,7 @@ wizard_setup_manual() {
 
 # ─────────────────────────────────────────
 #   MENU UTAMA (kalau config sudah ada)
+#   DENGAN TAMPILAN YANG LEBIH BAIK
 # ─────────────────────────────────────────
 
 menu_utama() {
@@ -551,14 +591,18 @@ menu_utama() {
         clr
         header
         show_current_config
-        echo "  Mau ngapain?"
-        echo ""
-        echo "  1) Langsung jalanin"
-        echo "  2) Ganti mode (private / public)"
-        echo "  3) Ganti URL private server"
-        echo "  4) Ubah setting (relog, reconnect, dll)"
-        echo "  5) Ganti akun / package Roblox"
-        echo "  6) Keluar"
+        
+        # Garis pemisah yang lebih bagus
+        echo "  ╔════════════════════════════════════╗"
+        echo "  ║       MENU UTAMA - PILIH OPSI      ║"
+        echo "  ╠════════════════════════════════════╣"
+        echo "  ║  1) 🚀 Jalanin Sekarang            ║"
+        echo "  ║  2) 🎮 Ganti Mode (Private/Public)║"
+        echo "  ║  3) 🔗 Ganti URL Private Server   ║"
+        echo "  ║  4) ⚙️  Edit Setting               ║"
+        echo "  ║  5) 📦 Ganti Package/Akun         ║"
+        echo "  ║  6) 🚪 Keluar                      ║"
+        echo "  ╚════════════════════════════════════╝"
         echo ""
         printf "  Pilih (1-6): "
         read -r PILIHAN
@@ -569,7 +613,17 @@ menu_utama() {
             3) menu_ganti_url ;;
             4) menu_edit_setting ;;
             5) menu_ganti_package ;;
-            6) echo ""; echo "  Sampai jumpa!"; echo ""; exit 0 ;;
+            6) 
+                clr
+                echo "========================================="
+                echo "   ROBLOX AUTO RECONNECT + AUTO RELOG"
+                echo "========================================="
+                echo ""
+                echo "  👋 Terima kasih telah menggunakan!"
+                echo "  Sampai jumpa lagi!"
+                echo ""
+                exit 0 
+                ;;
             *) echo "  ⚠ Pilih angka 1-6"; sleep 1 ;;
         esac
     done
@@ -581,8 +635,8 @@ menu_pilih_mode() {
     echo ""
     echo "  Pilih server untuk package: $PKG"
     echo ""
-    echo "  1) Grow a Garden (Private Server)"
-    echo "  2) Market Grow a Garden (Public)"
+    echo "  1) Game - Private Server"
+    echo "  2) Market Grow a Garden - Public"
     echo "  3) Batal"
     echo ""
     printf "  Pilih (1-3): "
@@ -593,13 +647,13 @@ menu_pilih_mode() {
             MODE="$MODE_MAIN"
             save_config
             echo ""
-            echo "  ✅ Mode: Grow a Garden (Private Server)"
+            echo "  ✅ Mode: Game - Private Server"
             ;;
         2)
             MODE="$MODE_MARKET"
             save_config
             echo ""
-            echo "  ✅ Mode: Market Grow a Garden (Public)"
+            echo "  ✅ Mode: Market Grow a Garden - Public"
             ;;
         3)
             echo ""
@@ -648,13 +702,19 @@ menu_edit_setting() {
         clr
         header
         echo ""
-        echo "  ── EDIT SETTING ──────────────────────"
-        echo ""
-        echo "  1) Relog otomatis : ${RELOG_SETIAP_JAM} jam $([ "$RELOG_SETIAP_JAM" = "0" ] && echo '(OFF)' || echo '(ON)')"
-        echo "  2) Reconnect otomatis  : $(show_toggle $RECONNECT_OTOMATIS)"
-        echo "  3) Restart kalau crash : $(show_toggle $RESTART_KALAU_CRASH)"
-        echo "  4) Reconnect saat home : $(show_toggle $RECONNECT_SAAT_HOME)"
-        echo "  5) Kembali ke menu utama"
+        echo "  ╔════════════════════════════════════╗"
+        echo "  ║        EDIT SETTING                ║"
+        echo "  ╠════════════════════════════════════╣"
+        echo "  ║  1) 🔄 Relog                       ║"
+        echo "  ║     $(printf '%-28s' ": ${RELOG_SETIAP_JAM} jam $([ "$RELOG_SETIAP_JAM" = "0" ] && echo '(OFF)' || echo '(ON)')")"  ║"
+        echo "  ║  2) 🔗 Reconnect Otomatis         ║"
+        echo "  ║     $(printf '%-28s' ": $(show_toggle $RECONNECT_OTOMATIS)")"  ║"
+        echo "  ║  3) 💥 Restart Kalau Crash        ║"
+        echo "  ║     $(printf '%-28s' ": $(show_toggle $RESTART_KALAU_CRASH)")"  ║"
+        echo "  ║  4) 🏠 Reconnect Saat Home        ║"
+        echo "  ║     $(printf '%-28s' ": $(show_toggle $RECONNECT_SAAT_HOME)")"  ║"
+        echo "  ║  5) ⬅️  Kembali                    ║"
+        echo "  ╚════════════════════════════════════╝"
         echo ""
         printf "  Pilih (1-5): "
         read -r PILIHAN
@@ -945,7 +1005,7 @@ echo "=========================================" | tee -a "$LOG_FILE"
 echo "   ROBLOX AUTO RECONNECT + AUTO RELOG"    | tee -a "$LOG_FILE"
 echo "=========================================" | tee -a "$LOG_FILE"
 log "Package          : $PKG"
-log "Mode             : $([ "$MODE" = "$MODE_MARKET" ] && echo 'Market Grow a Garden (Public)' || echo 'Grow a Garden (Private Server)')"
+log "Mode             : $([ "$MODE" = "$MODE_MARKET" ] && echo 'Market Grow a Garden (Public)' || echo 'Game - Private Server')"
 log "URL aktif        : $(get_active_url)"
 log "Relog            : setiap ${RELOG_SETIAP_JAM} jam    → $([ "$RELOG_SETIAP_JAM" = "0" ] && echo OFF || echo ON)"
 log "Reconnect        : DC detection  → $(show_toggle $RECONNECT_OTOMATIS)"
