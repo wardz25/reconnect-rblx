@@ -641,11 +641,7 @@ open_second_package() {
     fi
     
     local active_url2
-    case $mode2 in
-        "market") active_url2="$URL_MARKET" ;;
-        "gag2") active_url2="$URL_GAG2" ;;
-        *) active_url2="$url2" ;;
-    esac
+    active_url2=$(get_active_url "$mode2" "$url2")
     
     # Try split, fallback to floating
     if ! try_split_screen "$PKG2" "$active_url2"; then
@@ -665,13 +661,40 @@ log() {
     fi
 }
 
+build_join_url() {
+    # Convert link "biasa" (games/ID/Nama-Game) jadi link DIRECT-JOIN
+    # (games/start?placeId=ID), biar Roblox langsung connect ke server
+    # tanpa nyangkut di halaman Game Details / tombol Play.
+    local url=$1
+    local place_id query
+
+    place_id=$(echo "$url" | grep -oE '/games/[0-9]+' | grep -oE '[0-9]+' | head -1)
+
+    if [ -z "$place_id" ]; then
+        # Bukan format roblox.com/games/<id>/..., biarin apa adanya
+        echo "$url"
+        return
+    fi
+
+    # Ambil query string yang udah ada (privateServerLinkCode, accessCode, dll)
+    query=$(echo "$url" | grep -oE '\?.*' | sed 's/^?//')
+
+    if [ -n "$query" ]; then
+        echo "https://www.roblox.com/games/start?placeId=${place_id}&${query}"
+    else
+        echo "https://www.roblox.com/games/start?placeId=${place_id}"
+    fi
+}
+
 get_active_url() {
     local mode=$1
+    local raw_url
     case $mode in
-        "market") echo "$URL_MARKET" ;;
-        "gag2") echo "$URL_GAG2" ;;
-        *) echo "$2" ;;
+        "market") raw_url="$URL_MARKET" ;;
+        "gag2") raw_url="$URL_GAG2" ;;
+        *) raw_url="$2" ;;
     esac
+    build_join_url "$raw_url"
 }
 
 join_server() {
@@ -680,6 +703,7 @@ join_server() {
     local mode=$3
     
     log "🚀 Jalanin: $pkg"
+    log "🔗 Join URL: $url"
     am force-stop "$pkg"
     sleep 3
     am start -a android.intent.action.VIEW -d "$url" "$pkg"
