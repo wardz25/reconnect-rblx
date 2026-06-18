@@ -578,47 +578,55 @@ menu_setup_discord() {
 #   SPLIT SCREEN / FLOATING
 # ─────────────────────────────────────────
 
+check_windowing_mode() {
+    # Best-effort check: liat windowingMode aktual proses pkg2 dari dumpsys
+    # (format output beda-beda tergantung versi Android, jadi ini cuma indikasi,
+    # bukan kepastian 100%. Tetap cek mata kamu sendiri di layar device.)
+    local pkg=$1
+    dumpsys activity activities 2>/dev/null | grep -A3 "$pkg" | grep -oE "windowingMode=[0-9]+" | head -1
+}
+
 try_split_screen() {
     local pkg2=$1
     local url2=$2
-    
-    log "📱 Mencoba split screen untuk: $pkg2"
-    
-    # Check Android version & split capability
-    local android_version
-    android_version=$(getprop ro.build.version.release 2>/dev/null)
-    
-    if [ -z "$android_version" ] || [ "$android_version" -lt "7" ]; then
-        log "⚠️ Android $android_version tidak support split"
-        return 1
-    fi
-    
-    # Try split screen dengan adb
-    am start-activity-from-intent --from-split "$pkg2" "$url2" 2>/dev/null
-    if [ $? -eq 0 ]; then
-        log "✅ Split screen berhasil!"
+
+    log "📱 Mencoba split screen (windowingMode=4 / SPLIT_SCREEN_SECONDARY) untuk: $pkg2"
+
+    am start -a android.intent.action.VIEW -d "$url2" --windowingMode 4 "$pkg2" 2>/dev/null
+    sleep 2
+
+    local actual_mode
+    actual_mode=$(check_windowing_mode "$pkg2")
+
+    if echo "$actual_mode" | grep -q "windowingMode=4"; then
+        log "✅ Split screen kemungkinan berhasil ($actual_mode)"
         send_discord_notification "split" "$pkg2" "$PKG1"
         SPLIT_ENABLED=1
         return 0
     fi
-    
+
+    log "⚠️ Split screen gagal/tidak didukung device ini (status: ${actual_mode:-tidak terdeteksi})"
     return 1
 }
 
 try_floating_window() {
     local pkg2=$1
     local url2=$2
-    
-    log "🪟 Fallback: floating window untuk $pkg2"
-    
-    # Force open floating window
-    am start -a android.intent.action.VIEW -d "$url2" "$pkg2" 2>/dev/null &
+
+    log "🪟 Fallback: freeform window (windowingMode=5) untuk $pkg2"
+
+    am start -a android.intent.action.VIEW -d "$url2" --windowingMode 5 "$pkg2" 2>/dev/null
     sleep 2
-    
-    # Try to move to floating if possible
-    am force-stop com.android.systemui 2>/dev/null || true
-    
-    log "✅ Floating window opened!"
+
+    local actual_mode
+    actual_mode=$(check_windowing_mode "$pkg2")
+
+    if echo "$actual_mode" | grep -q "windowingMode=5"; then
+        log "✅ Freeform window berhasil ($actual_mode)"
+    else
+        log "⚠️ Device ini sepertinya gak support freeform — $pkg2 kemungkinan kebuka fullscreen biasa (status: ${actual_mode:-tidak terdeteksi})"
+    fi
+
     send_discord_notification "floating" "$pkg2" "$PKG1"
     return 0
 }
@@ -662,16 +670,33 @@ log() {
 }
 
 build_join_url() {
-    # Convert link "biasa" (games/ID/Nama-Game) jadi link DIRECT-JOIN
-    # (games/start?placeId=ID), biar Roblox langsung connect ke server
-    # tanpa nyangkut di halaman Game Details / tombol Play.
+    # Convert link "biasa" jadi link DIRECT-JOIN biar Roblox langsung
+    # connect ke server tanpa nyangkut di halaman Game Details.
     local url=$1
-    local place_id query
+    local place_id query code type
 
+    # Format BARU Roblox (default sejak Okt 2023) buat private/VIP server:
+    #   https://www.roblox.com/share?code=XXXX&type=Server
+    # Link ini OPAQUE — placeId & kode server-nya gak ada di URL, jadi gak
+    # bisa diparse jadi /games/start kayak link lama. Kalau dibuka via am
+    # start biasa, Roblox gagal resolve kodenya dan jatuh ke server PUBLIC
+    # (bukan private server yang dimaksud). Harus pake custom scheme internal
+    # yang dipakai app sendiri buat resolve share link:
+    if echo "$url" | grep -qE 'roblox\.com/share\?'; then
+        code=$(echo "$url" | grep -oE 'code=[^&]+' | head -1 | cut -d= -f2)
+        type=$(echo "$url" | grep -oE 'type=[^&]+' | head -1 | cut -d= -f2)
+        type="${type:-Server}"
+        if [ -n "$code" ]; then
+            echo "roblox://navigation/share_links?code=${code}&type=${type}"
+            return
+        fi
+    fi
+
+    # Format LAMA: https://www.roblox.com/games/ID/Nama-Game[?privateServerLinkCode=...]
     place_id=$(echo "$url" | grep -oE '/games/[0-9]+' | grep -oE '[0-9]+' | head -1)
 
     if [ -z "$place_id" ]; then
-        # Bukan format roblox.com/games/<id>/..., biarin apa adanya
+        # Format gak dikenal, biarin apa adanya
         echo "$url"
         return
     fi
