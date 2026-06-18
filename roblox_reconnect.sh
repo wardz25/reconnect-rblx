@@ -237,6 +237,30 @@ DISCORD_USER_ID="$DISCORD_USER_ID"
 EOF
 }
 
+persist_discord_settings() {
+    # Tulis ULANG setting Discord (global $DISCORD_ENABLED/$DISCORD_WEBHOOK/
+    # $DISCORD_USER_ID yang udah bener di memori) ke cfg file package,
+    # TANPA ganggu field URL/MODE/dll yang udah ada di file itu.
+    # Dipanggil setelah menu setup Discord, karena kalau nggak, file cfg
+    # akan tetap nyimpen DISCORD_ENABLED=0 (nilai sebelum Discord disetup)
+    # dan bakal nimpa balik setting yang baru begitu file ini di-source lagi.
+    local cfg_file=$1
+    local pkg=$2
+    local saved_url saved_mode saved_relog saved_reconnect saved_restart saved_home
+
+    if [ -f "$cfg_file" ]; then
+        saved_url=$(grep '^URL=' "$cfg_file" | head -1 | cut -d'"' -f2)
+        saved_mode=$(grep '^MODE=' "$cfg_file" | head -1 | cut -d'"' -f2)
+        saved_relog=$(grep '^RELOG_SETIAP_JAM=' "$cfg_file" | head -1 | cut -d= -f2)
+        saved_reconnect=$(grep '^RECONNECT_OTOMATIS=' "$cfg_file" | head -1 | cut -d= -f2)
+        saved_restart=$(grep '^RESTART_KALAU_CRASH=' "$cfg_file" | head -1 | cut -d= -f2)
+        saved_home=$(grep '^RECONNECT_SAAT_HOME=' "$cfg_file" | head -1 | cut -d= -f2)
+    fi
+
+    save_config "$cfg_file" "$pkg" "$saved_url" "$saved_mode" \
+        "$saved_relog" "$saved_reconnect" "$saved_restart" "$saved_home"
+}
+
 # ─────────────────────────────────────────
 #   TAMPILAN
 # ─────────────────────────────────────────
@@ -751,6 +775,38 @@ wait_ingame() {
     fi
 }
 
+verify_ingame_stable() {
+    # Fase paling rawan: tepat setelah join, Roblox lagi resolve link
+    # (apalagi private server share-link yang butuh round-trip ke server).
+    # crash_monitor cuma poll tiap 5 detik dan baru jalan SETELAH fase ini
+    # selesai — jadi kalau Roblox crash & self-restart cepat di window ini,
+    # gak ada yang ketahuan, dan Roblox bakal jatuh ke behaviour default-nya
+    # sendiri (biasanya nyambung ke server PUBLIC). Fungsi ini nge-poll
+    # ketat (tiap 1 detik) selama 20 detik pertama pasca-join buat nutup
+    # celah itu, dan langsung rejoin paksa kalau ketahuan mati di window ini.
+    local pkg=$1
+    local cfg_file=$2
+    local checks=0
+
+    log "🔁 Tight-monitor 20s pasca-join (fase paling rawan crash)..."
+    while [ $checks -lt 20 ]; do
+        sleep 1
+        if ! ps -A 2>/dev/null | grep -q "$pkg"; then
+            log "💥 $pkg mati di fase join (keluar dari jendela crash_monitor biasa) — rejoin paksa"
+            sleep 2
+            source "$cfg_file"
+            local active_url
+            active_url=$(get_active_url "$MODE" "$URL")
+            join_server "$pkg" "$active_url" "$MODE"
+            wait_ingame "$pkg"
+            checks=0
+            continue
+        fi
+        checks=$((checks + 1))
+    done
+    log "✅ Stabil pasca-join"
+}
+
 monitor_events() {
     local pkg=$1
     local cfg_file=$2
@@ -778,6 +834,7 @@ monitor_events() {
             local active_url=$(get_active_url "$MODE" "$URL")
             join_server "$pkg" "$active_url" "$MODE"
             wait_ingame "$pkg"
+            verify_ingame_stable "$pkg" "$cfg_file"
         fi
         
     done < <(logcat -v time 2>/dev/null | grep --line-buffered -iE "Sending disconnect|Connection lost|Lost connection|Disconnected from server")
@@ -797,6 +854,7 @@ crash_monitor() {
             local active_url=$(get_active_url "$MODE" "$URL")
             join_server "$pkg" "$active_url" "$MODE"
             wait_ingame "$pkg"
+            verify_ingame_stable "$pkg" "$cfg_file"
             
             open_second_package
         fi
@@ -877,6 +935,14 @@ if [ "$SETUP_DISCORD" = "1" ]; then
     sleep 2
 fi
 
+# Simpen setting Discord yang baru diisi ke file config tiap package,
+# SEBELUM file itu di-source ulang di bawah (kalau nggak, bakal ketimpa
+# balik ke nilai lama dan status Discord jadi salah/OFF terus).
+persist_discord_settings "${CONFIG_BASE_DIR}/roblox_config_${PKG1}.cfg" "$PKG1"
+if [ "$USE_MULTI_PKG" = "1" ]; then
+    persist_discord_settings "${CONFIG_BASE_DIR}/roblox_config_${PKG2}.cfg" "$PKG2"
+fi
+
 # Load config
 source "${CONFIG_BASE_DIR}/roblox_config_${PKG1}.cfg" 2>/dev/null
 
@@ -903,6 +969,7 @@ PKG1_ACTIVE_URL=$(get_active_url "$MODE" "$URL")
 # Join first package
 join_server "$PKG1" "$PKG1_ACTIVE_URL" "$MODE"
 wait_ingame "$PKG1"
+verify_ingame_stable "$PKG1" "${CONFIG_BASE_DIR}/roblox_config_${PKG1}.cfg"
 
 # Open second package if enabled
 if [ "$USE_MULTI_PKG" = "1" ]; then
