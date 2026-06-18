@@ -729,8 +729,14 @@ build_join_url() {
     query=$(echo "$url" | grep -oE '\?.*' | sed 's/^?//')
 
     if [ -n "$query" ]; then
-        echo "https://www.roblox.com/games/start?placeId=${place_id}&${query}"
+        # Private server link (ada privateServerLinkCode) — kirim MENTAH,
+        # sama kayak sistem versi lama. Link jenis ini udah auto-join langsung
+        # dari dulu, gak perlu dikonversi ke games/start.
+        echo "$url"
     else
+        # Link publik polos (market/gag2/public, tanpa query) — ini yang
+        # nyangkut di halaman Game Details kalau dikirim mentah, jadi tetap
+        # dikonversi ke format direct-join.
         echo "https://www.roblox.com/games/start?placeId=${place_id}"
     fi
 }
