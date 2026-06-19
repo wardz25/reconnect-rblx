@@ -593,12 +593,101 @@ wizard_setup_pkg() {
     sleep 2
 }
 
+menu_ganti_url_mode_pkg() {
+    # Ganti mode & URL aja, setting lain (relog/reconnect/restart/home) tetap
+    # dipertahankan dari config yang udah ada — gak perlu jawab ulang semuanya.
+    local pkg=$1
+    local pkg_num=$2
+    local cfg_file=$3
+
+    local keep_relog keep_reconnect keep_restart keep_home
+    keep_relog=$(grep '^RELOG_SETIAP_JAM=' "$cfg_file" | head -1 | cut -d= -f2)
+    keep_reconnect=$(grep '^RECONNECT_OTOMATIS=' "$cfg_file" | head -1 | cut -d= -f2)
+    keep_restart=$(grep '^RESTART_KALAU_CRASH=' "$cfg_file" | head -1 | cut -d= -f2)
+    keep_home=$(grep '^RECONNECT_SAAT_HOME=' "$cfg_file" | head -1 | cut -d= -f2)
+
+    local new_mode new_url
+    setup_mode_and_url "Ganti Mode & URL — Package $pkg_num ($pkg)" new_mode new_url
+
+    save_config "$cfg_file" "$pkg" "$new_url" "$new_mode" \
+        "$keep_relog" "$keep_reconnect" "$keep_restart" "$keep_home"
+
+    echo ""
+    echo "  ✅ Mode & URL diupdate, setting lain tetap."
+    sleep 1
+}
+
+menu_edit_settings_pkg() {
+    # Submenu toggle relog/reconnect/restart/home. URL & mode gak disentuh.
+    local pkg=$1
+    local cfg_file=$2
+
+    while true; do
+        local cur_url cur_mode cur_relog cur_reconnect cur_restart cur_home
+        cur_url=$(grep '^URL=' "$cfg_file" | head -1 | cut -d'"' -f2)
+        cur_mode=$(grep '^MODE=' "$cfg_file" | head -1 | cut -d'"' -f2)
+        cur_relog=$(grep '^RELOG_SETIAP_JAM=' "$cfg_file" | head -1 | cut -d= -f2)
+        cur_reconnect=$(grep '^RECONNECT_OTOMATIS=' "$cfg_file" | head -1 | cut -d= -f2)
+        cur_restart=$(grep '^RESTART_KALAU_CRASH=' "$cfg_file" | head -1 | cut -d= -f2)
+        cur_home=$(grep '^RECONNECT_SAAT_HOME=' "$cfg_file" | head -1 | cut -d= -f2)
+
+        clr
+        header
+        echo ""
+        echo "  ⚙️ UBAH SETTING — $pkg"
+        show_current_config "$cur_url" "$cur_mode" "$cur_relog" "$cur_reconnect" "$cur_restart" "$cur_home"
+        echo "  1) Relog interval        (sekarang: ${cur_relog} jam)"
+        echo "  2) Reconnect otomatis    (sekarang: $(show_toggle $cur_reconnect))"
+        echo "  3) Restart kalau crash   (sekarang: $(show_toggle $cur_restart))"
+        echo "  4) Reconnect saat home   (sekarang: $(show_toggle $cur_home))"
+        echo "  5) Kembali"
+        echo ""
+        printf "  Pilih (1-5): "
+        read -r PILIHAN
+
+        case $PILIHAN in
+            1)
+                echo ""
+                echo "  Relog setiap berapa jam? (0=OFF)"
+                printf "  > "
+                read -r V
+                if [[ "$V" =~ ^[0-9]+$ ]]; then
+                    save_config "$cfg_file" "$pkg" "$cur_url" "$cur_mode" "$V" "$cur_reconnect" "$cur_restart" "$cur_home"
+                    echo "  ✅ Disimpan!"
+                else
+                    echo "  ⚠ Masukkan angka!"
+                fi
+                sleep 1
+                ;;
+            2)
+                local new_val; new_val=$([ "$cur_reconnect" = "1" ] && echo 0 || echo 1)
+                save_config "$cfg_file" "$pkg" "$cur_url" "$cur_mode" "$cur_relog" "$new_val" "$cur_restart" "$cur_home"
+                echo "  ✅ Reconnect: $(show_toggle $new_val)"
+                sleep 1
+                ;;
+            3)
+                local new_val; new_val=$([ "$cur_restart" = "1" ] && echo 0 || echo 1)
+                save_config "$cfg_file" "$pkg" "$cur_url" "$cur_mode" "$cur_relog" "$cur_reconnect" "$new_val" "$cur_home"
+                echo "  ✅ Restart: $(show_toggle $new_val)"
+                sleep 1
+                ;;
+            4)
+                local new_val; new_val=$([ "$cur_home" = "1" ] && echo 0 || echo 1)
+                save_config "$cfg_file" "$pkg" "$cur_url" "$cur_mode" "$cur_relog" "$cur_reconnect" "$cur_restart" "$new_val"
+                echo "  ✅ Home RC: $(show_toggle $new_val)"
+                sleep 1
+                ;;
+            5) return ;;
+            *) echo "  ⚠ Pilih 1-5"; sleep 1 ;;
+        esac
+    done
+}
+
 setup_or_load_pkg() {
-    # Cek dulu apakah config buat package ini udah ada. Kalau ada, KASIH
-    # PILIHAN pakai config lama atau setup ulang — jangan langsung maksa
-    # wizard dari nol. Versi sebelumnya selalu manggil wizard_setup_pkg()
-    # tanpa cek apa pun, jadi config lama selalu ketimpa tiap kali script
-    # dijalanin ulang (itu penyebab "config tidak tersimpan").
+    # Cek dulu apakah config buat package ini udah ada. Kalau ada, masuk ke
+    # MAIN MENU — bukan cuma 2 pilihan run/setup-ulang doang. Dari sini bisa
+    # langsung jalan, edit URL/mode aja, edit setting lain aja, setup ulang
+    # total, atau keluar. Loop terus sampai user pilih "jalan" atau "keluar".
     local pkg=$1
     local pkg_num=$2
     local cfg_file="${CONFIG_BASE_DIR}/roblox_config_${pkg}.cfg"
@@ -608,32 +697,52 @@ setup_or_load_pkg() {
         return
     fi
 
-    local saved_url saved_mode saved_relog saved_reconnect saved_restart saved_home
-    saved_url=$(grep '^URL=' "$cfg_file" | head -1 | cut -d'"' -f2)
-    saved_mode=$(grep '^MODE=' "$cfg_file" | head -1 | cut -d'"' -f2)
-    saved_relog=$(grep '^RELOG_SETIAP_JAM=' "$cfg_file" | head -1 | cut -d= -f2)
-    saved_reconnect=$(grep '^RECONNECT_OTOMATIS=' "$cfg_file" | head -1 | cut -d= -f2)
-    saved_restart=$(grep '^RESTART_KALAU_CRASH=' "$cfg_file" | head -1 | cut -d= -f2)
-    saved_home=$(grep '^RECONNECT_SAAT_HOME=' "$cfg_file" | head -1 | cut -d= -f2)
+    while true; do
+        local saved_url saved_mode saved_relog saved_reconnect saved_restart saved_home
+        saved_url=$(grep '^URL=' "$cfg_file" | head -1 | cut -d'"' -f2)
+        saved_mode=$(grep '^MODE=' "$cfg_file" | head -1 | cut -d'"' -f2)
+        saved_relog=$(grep '^RELOG_SETIAP_JAM=' "$cfg_file" | head -1 | cut -d= -f2)
+        saved_reconnect=$(grep '^RECONNECT_OTOMATIS=' "$cfg_file" | head -1 | cut -d= -f2)
+        saved_restart=$(grep '^RESTART_KALAU_CRASH=' "$cfg_file" | head -1 | cut -d= -f2)
+        saved_home=$(grep '^RECONNECT_SAAT_HOME=' "$cfg_file" | head -1 | cut -d= -f2)
 
-    clr
-    header
-    echo ""
-    echo "  📦 Config Package $pkg_num ($pkg) ditemukan dari run sebelumnya:"
-    show_current_config "$saved_url" "$saved_mode" "$saved_relog" "$saved_reconnect" "$saved_restart" "$saved_home"
-    echo "  1) Pakai config ini, langsung jalan"
-    echo "  2) Setup ulang dari awal"
-    echo ""
-    printf "  Pilih (1-2, default 1): "
-    read -r USE_EXISTING
-
-    if [ "$USE_EXISTING" = "2" ]; then
-        wizard_setup_pkg "$pkg" "$pkg_num"
-    else
+        clr
+        header
         echo ""
-        echo "  ✅ Pakai config tersimpan untuk Package $pkg_num: $pkg"
-        sleep 1
-    fi
+        echo "  📦 Config Package $pkg_num ($pkg) ditemukan dari run sebelumnya:"
+        show_current_config "$saved_url" "$saved_mode" "$saved_relog" "$saved_reconnect" "$saved_restart" "$saved_home"
+        echo "  1) Pakai config ini, langsung jalan"
+        echo "  2) Ganti mode / URL"
+        echo "  3) Ubah setting (relog/reconnect/restart/home)"
+        echo "  4) Setup ulang semua dari awal"
+        echo "  5) Keluar"
+        echo ""
+        printf "  Pilih (1-5, default 1): "
+        read -r PILIHAN
+
+        case $PILIHAN in
+            2)
+                menu_ganti_url_mode_pkg "$pkg" "$pkg_num" "$cfg_file"
+                ;;
+            3)
+                menu_edit_settings_pkg "$pkg" "$cfg_file"
+                ;;
+            4)
+                wizard_setup_pkg "$pkg" "$pkg_num"
+                return
+                ;;
+            5)
+                echo ""
+                echo "  Sampai jumpa."
+                echo ""
+                exit 0
+                ;;
+            *)
+                # 1 atau default/kosong → pakai config tersimpan, lanjut jalan
+                return
+                ;;
+        esac
+    done
 }
 
 menu_setup_discord() {
