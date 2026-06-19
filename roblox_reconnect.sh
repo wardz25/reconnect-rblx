@@ -548,6 +548,49 @@ wizard_setup_pkg() {
     sleep 2
 }
 
+setup_or_load_pkg() {
+    # Cek dulu apakah config buat package ini udah ada. Kalau ada, KASIH
+    # PILIHAN pakai config lama atau setup ulang — jangan langsung maksa
+    # wizard dari nol. Versi sebelumnya selalu manggil wizard_setup_pkg()
+    # tanpa cek apa pun, jadi config lama selalu ketimpa tiap kali script
+    # dijalanin ulang (itu penyebab "config tidak tersimpan").
+    local pkg=$1
+    local pkg_num=$2
+    local cfg_file="${CONFIG_BASE_DIR}/roblox_config_${pkg}.cfg"
+
+    if [ ! -f "$cfg_file" ]; then
+        wizard_setup_pkg "$pkg" "$pkg_num"
+        return
+    fi
+
+    local saved_url saved_mode saved_relog saved_reconnect saved_restart saved_home
+    saved_url=$(grep '^URL=' "$cfg_file" | head -1 | cut -d'"' -f2)
+    saved_mode=$(grep '^MODE=' "$cfg_file" | head -1 | cut -d'"' -f2)
+    saved_relog=$(grep '^RELOG_SETIAP_JAM=' "$cfg_file" | head -1 | cut -d= -f2)
+    saved_reconnect=$(grep '^RECONNECT_OTOMATIS=' "$cfg_file" | head -1 | cut -d= -f2)
+    saved_restart=$(grep '^RESTART_KALAU_CRASH=' "$cfg_file" | head -1 | cut -d= -f2)
+    saved_home=$(grep '^RECONNECT_SAAT_HOME=' "$cfg_file" | head -1 | cut -d= -f2)
+
+    clr
+    header
+    echo ""
+    echo "  📦 Config Package $pkg_num ($pkg) ditemukan dari run sebelumnya:"
+    show_current_config "$saved_url" "$saved_mode" "$saved_relog" "$saved_reconnect" "$saved_restart" "$saved_home"
+    echo "  1) Pakai config ini, langsung jalan"
+    echo "  2) Setup ulang dari awal"
+    echo ""
+    printf "  Pilih (1-2, default 1): "
+    read -r USE_EXISTING
+
+    if [ "$USE_EXISTING" = "2" ]; then
+        wizard_setup_pkg "$pkg" "$pkg_num"
+    else
+        echo ""
+        echo "  ✅ Pakai config tersimpan untuk Package $pkg_num: $pkg"
+        sleep 1
+    fi
+}
+
 menu_setup_discord() {
     clr
     header
@@ -902,7 +945,7 @@ echo ""
 pilih_package "📦 PILIH PACKAGE 1" PKG1
 set_pkg_paths "$PKG1" "PKG1"
 check_clone_app "$PKG1"
-wizard_setup_pkg "$PKG1" 1
+setup_or_load_pkg "$PKG1" 1
 
 # Setup Package 2 (jika dipilih)
 if [ "$USE_MULTI_PKG" = "1" ]; then
@@ -910,15 +953,31 @@ if [ "$USE_MULTI_PKG" = "1" ]; then
     pilih_package "📦 PILIH PACKAGE 2" PKG2
     set_pkg_paths "$PKG2" "PKG2"
     check_clone_app "$PKG2"
-    wizard_setup_pkg "$PKG2" 2
+    setup_or_load_pkg "$PKG2" 2
 fi
 
-# Discord setup
+# Load Discord settings lama (kalau ada) SEBELUM nanya — kalau nggak,
+# variable global DISCORD_ENABLED/WEBHOOK/USER_ID bakal balik ke default
+# kosong/OFF tiap script dijalanin, dan kalau user jawab "tidak" di prompt
+# bawah ini, settingan Discord yang udah ON dari run sebelumnya bakal
+# ketulis ulang jadi OFF oleh persist_discord_settings.
+PKG1_CFG="${CONFIG_BASE_DIR}/roblox_config_${PKG1}.cfg"
+if [ -f "$PKG1_CFG" ]; then
+    DISCORD_ENABLED=$(grep '^DISCORD_ENABLED=' "$PKG1_CFG" | head -1 | cut -d= -f2)
+    DISCORD_WEBHOOK=$(grep '^DISCORD_WEBHOOK=' "$PKG1_CFG" | head -1 | cut -d'"' -f2)
+    DISCORD_USER_ID=$(grep '^DISCORD_USER_ID=' "$PKG1_CFG" | head -1 | cut -d'"' -f2)
+fi
+
 clr
 header
 echo ""
-echo "  Mau setup Discord webhook?"
-printf "  (1=YES, 0=NO): "
+if [ "$DISCORD_ENABLED" = "1" ]; then
+    echo "  🔔 Discord webhook udah aktif dari setup sebelumnya."
+    echo "  Mau ganti webhook/user ID?"
+else
+    echo "  Mau setup Discord webhook?"
+fi
+printf "  (1=YES, 0=NO/biarkan): "
 read -r SETUP_DISCORD
 if [ "$SETUP_DISCORD" = "1" ]; then
     echo ""
