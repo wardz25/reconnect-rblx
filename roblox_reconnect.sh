@@ -294,6 +294,51 @@ get_mode_label() {
     esac
 }
 
+# ─────────────────────────────────────────
+#   VALIDASI INPUT
+# ─────────────────────────────────────────
+
+validate_discord_webhook() {
+    # Format asli Discord: https://discord.com/api/webhooks/{snowflake}/{token}
+    # - snowflake: 17-20 digit angka (Discord ID/snowflake, makin lama makin
+    #   panjang seiring waktu, jadi range bukan angka pasti)
+    # - token: 60-90 karakter alnum + underscore/hyphen (contoh asli: 68 char)
+    # - host bisa discord.com ATAU discordapp.com (alias lama, masih jalan)
+    # - boleh ada query string opsional (?thread_id=... buat forum channel)
+    local url=$1
+    echo "$url" | grep -qE '^https://(discord|discordapp)\.com/api/webhooks/[0-9]{17,20}/[A-Za-z0-9_-]{60,90}(\?[A-Za-z0-9_=&-]*)?$'
+}
+
+validate_private_server_url() {
+    # Terima DUA format link private/VIP server Roblox:
+    # 1) Format LAMA: games/{placeId}/{nama}?privateServerLinkCode=xxx
+    #    (juga terima accessCode= sebagai alias yang kadang dipakai)
+    # 2) Format BARU (default sejak Okt 2023): share?code=xxx&type=Server
+    #    Kalau cuma divalidasi pake regex format lama, link share yang
+    #    sekarang jadi default copy-paste dari tombol Share di app Roblox
+    #    bakal SELALU ditolak wizard — padahal build_join_url() udah bisa
+    #    nangenin format ini.
+    local url=$1
+
+    if echo "$url" | grep -qE '^https://www\.roblox\.com/games/[0-9]+/[^?]+\?(privateServerLinkCode|accessCode)=[A-Za-z0-9_-]+$'; then
+        return 0
+    fi
+
+    if echo "$url" | grep -qE '^https://www\.roblox\.com/share\?(code=[A-Za-z0-9]{16,40}&type=Server|type=Server&code=[A-Za-z0-9]{16,40})$'; then
+        return 0
+    fi
+
+    return 1
+}
+
+validate_public_server_url() {
+    # Link publik polos: games/{placeId}/{nama-slug}, TANPA query string.
+    # Di-anchor di akhir ($) biar gak ke-loloskan link yang sebenernya private
+    # server/share link yang nyasar masuk ke mode public.
+    local url=$1
+    echo "$url" | grep -qE '^https://www\.roblox\.com/games/[0-9]+/[A-Za-z0-9%_-]+/?$'
+}
+
 show_current_config() {
     local url=$1
     local mode=$2
@@ -442,12 +487,12 @@ setup_mode_and_url() {
                     echo "  ⚠ URL tidak boleh kosong!"
                     continue
                 fi
-                if echo "$INPUT_URL" | grep -qE "^https://www\.roblox\.com/games/[0-9]+/[^?]+\?privateServerLinkCode=.+$"; then
+                if validate_private_server_url "$INPUT_URL"; then
                     eval "$url_var=$INPUT_URL"
                     echo "  ✅ Link valid!"
                     break
                 fi
-                echo "  ⚠ Format tidak valid!"
+                echo "  ⚠ Format tidak valid! Harus link private server (format lama atau Share)."
             done
             ;;
         2)
@@ -462,12 +507,12 @@ setup_mode_and_url() {
                     echo "  ⚠ URL tidak boleh kosong!"
                     continue
                 fi
-                if echo "$INPUT_URL" | grep -qE "^https://www\.roblox\.com/games/[0-9]+/[^/\?]+"; then
+                if validate_public_server_url "$INPUT_URL"; then
                     eval "$url_var=$INPUT_URL"
                     echo "  ✅ Link valid!"
                     break
                 fi
-                echo "  ⚠ Format tidak valid!"
+                echo "  ⚠ Format tidak valid! Harus link public, tanpa query string."
             done
             ;;
         3)
@@ -622,11 +667,11 @@ menu_setup_discord() {
             echo "  Paste webhook URL:"
             printf "  > "
             read -r DISCORD_WEBHOOK
-            if echo "$DISCORD_WEBHOOK" | grep -q "discord.com/api/webhooks"; then
+            if validate_discord_webhook "$DISCORD_WEBHOOK"; then
                 DISCORD_ENABLED=1
                 echo "  ✅ Webhook updated!"
             else
-                echo "  ⚠ Invalid!"
+                echo "  ⚠ Invalid! Format harus: https://discord.com/api/webhooks/{id}/{token}"
             fi
             sleep 1
             ;;
@@ -985,7 +1030,7 @@ if [ "$SETUP_DISCORD" = "1" ]; then
     printf "  > "
     read -r DISCORD_WEBHOOK
     
-    if echo "$DISCORD_WEBHOOK" | grep -q "discord.com/api/webhooks"; then
+    if validate_discord_webhook "$DISCORD_WEBHOOK"; then
         DISCORD_ENABLED=1
         echo ""
         echo "  User ID (opsional):"
@@ -995,7 +1040,7 @@ if [ "$SETUP_DISCORD" = "1" ]; then
         echo "  ✅ Discord configured!"
     else
         DISCORD_ENABLED=0
-        echo "  ⚠️ Invalid webhook!"
+        echo "  ⚠️ Invalid webhook! Format harus: https://discord.com/api/webhooks/{id}/{token}"
     fi
     sleep 2
 fi
