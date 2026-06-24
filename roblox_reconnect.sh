@@ -461,78 +461,101 @@ setup_mode_and_url() {
     local mode_var=$2
     local url_var=$3
     
-    clr
-    header
-    echo ""
-    echo "  $label"
-    echo ""
-    echo "  1) Game - Private Server (input link)"
-    echo "  2) Game - Public Server (input link)"
-    echo "  3) Market Grow a Garden"
-    echo "  4) Grow a Garden 2 - Public"
-    echo ""
-    printf "  Pilih mode (1-4): "
-    read -r MODE_CHOICE
-    
-    case $MODE_CHOICE in
-        1)
-            eval "$mode_var=main"
-            echo ""
-            echo "  Paste link private server:"
-            echo "  Contoh: https://www.roblox.com/games/126884695634066/Grow-a-Garden?privateServerLinkCode=xxx"
-            while true; do
-                printf "  > "
-                read -r INPUT_URL
-                if [ -z "$INPUT_URL" ]; then
-                    echo "  ⚠ URL tidak boleh kosong!"
-                    continue
-                fi
-                if validate_private_server_url "$INPUT_URL"; then
-                    eval "$url_var=$INPUT_URL"
-                    echo "  ✅ Link valid!"
-                    break
-                fi
-                echo "  ⚠ Format tidak valid! Harus link private server (format lama atau Share)."
-            done
-            ;;
-        2)
-            eval "$mode_var=public"
-            echo ""
-            echo "  Paste link public server:"
-            echo "  Contoh: https://www.roblox.com/games/126884695634066/Grow-a-Garden"
-            while true; do
-                printf "  > "
-                read -r INPUT_URL
-                if [ -z "$INPUT_URL" ]; then
-                    echo "  ⚠ URL tidak boleh kosong!"
-                    continue
-                fi
-                if validate_public_server_url "$INPUT_URL"; then
-                    eval "$url_var=$INPUT_URL"
-                    echo "  ✅ Link valid!"
-                    break
-                fi
-                echo "  ⚠ Format tidak valid! Harus link public, tanpa query string."
-            done
-            ;;
-        3)
-            eval "$mode_var=market"
-            eval "$url_var=$URL_MARKET"
-            echo "  ✅ Mode: Market Grow a Garden"
-            ;;
-        4)
-            eval "$mode_var=gag2"
-            eval "$url_var=$URL_GAG2"
-            echo "  ✅ Mode: Grow a Garden 2"
-            ;;
-        *)
-            echo "  ⚠ Pilih 1-4"
-            setup_mode_and_url "$label" "$mode_var" "$url_var"
-            return
-            ;;
-    esac
-    
-    sleep 1
+    while true; do
+        clr
+        header
+        echo ""
+        echo "  $label"
+        echo ""
+        echo "  1) Game - Private Server (input link)"
+        echo "  2) Game - Public Server (input link)"
+        echo "  3) Market Grow a Garden"
+        echo "  4) Grow a Garden 2 - Public"
+        echo "  5) Kembali ke menu sebelumnya"
+        echo "  6) Keluar"
+        echo ""
+        printf "  Pilih mode (1-6): "
+        read -r MODE_CHOICE
+        
+        case $MODE_CHOICE in
+            1)
+                printf -v "$mode_var" '%s' "main"
+                echo ""
+                echo "  Paste link private server:"
+                echo "  Contoh: https://www.roblox.com/games/ID/Nama-Game?privateServerLinkCode=xxx"
+                echo "  Atau  : https://www.roblox.com/share?code=xxx&type=Server"
+                echo "  (ketik 'back' untuk kembali)"
+                while true; do
+                    printf "  > "
+                    read -r INPUT_URL
+                    [ "$INPUT_URL" = "back" ] && break 2
+                    if [ -z "$INPUT_URL" ]; then
+                        echo "  ⚠ URL tidak boleh kosong!"
+                        continue
+                    fi
+                    if validate_private_server_url "$INPUT_URL"; then
+                        # printf -v menghindari bug eval pada bash versi Android/Termux
+                        # yang kadang set variabel di scope yang salah (bukan parent caller)
+                        printf -v "$url_var" '%s' "$INPUT_URL"
+                        echo "  ✅ Link valid!"
+                        sleep 1
+                        return 0
+                    fi
+                    echo "  ⚠ Format tidak valid! Harus link private server (format lama atau Share)."
+                done
+                ;;
+            2)
+                printf -v "$mode_var" '%s' "public"
+                echo ""
+                echo "  Paste link public server:"
+                echo "  Contoh: https://www.roblox.com/games/ID/Nama-Game"
+                echo "  (ketik 'back' untuk kembali)"
+                while true; do
+                    printf "  > "
+                    read -r INPUT_URL
+                    [ "$INPUT_URL" = "back" ] && break 2
+                    if [ -z "$INPUT_URL" ]; then
+                        echo "  ⚠ URL tidak boleh kosong!"
+                        continue
+                    fi
+                    if validate_public_server_url "$INPUT_URL"; then
+                        printf -v "$url_var" '%s' "$INPUT_URL"
+                        echo "  ✅ Link valid!"
+                        sleep 1
+                        return 0
+                    fi
+                    echo "  ⚠ Format tidak valid! Harus link public, tanpa query string."
+                done
+                ;;
+            3)
+                printf -v "$mode_var" '%s' "market"
+                printf -v "$url_var" '%s' "$URL_MARKET"
+                echo "  ✅ Mode: Market Grow a Garden"
+                sleep 1
+                return 0
+                ;;
+            4)
+                printf -v "$mode_var" '%s' "gag2"
+                printf -v "$url_var" '%s' "$URL_GAG2"
+                echo "  ✅ Mode: Grow a Garden 2"
+                sleep 1
+                return 0
+                ;;
+            5)
+                return 1
+                ;;
+            6)
+                echo ""
+                echo "  Sampai jumpa."
+                echo ""
+                exit 0
+                ;;
+            *)
+                echo "  ⚠ Pilih 1-6"
+                sleep 1
+                ;;
+        esac
+    done
 }
 
 # ─────────────────────────────────────────
@@ -738,8 +761,20 @@ setup_or_load_pkg() {
                 exit 0
                 ;;
             *)
-                # 1 atau default/kosong → pakai config tersimpan, lanjut jalan
-                return
+                # 1 atau default/kosong → pakai config tersimpan, validasi dulu
+                # Kalau mode butuh URL (main/public) tapi URL kosong, jangan
+                # biarkan lanjut — itu penyebab "Join URL: (kosong)" di log
+                # dan crash langsung. Paksa ke Ganti URL dulu sebelum bisa jalan.
+                local needs_url=0
+                [ "$saved_mode" = "main" ] || [ "$saved_mode" = "public" ] && needs_url=1
+                if [ "$needs_url" = "1" ] && [ -z "$saved_url" ]; then
+                    echo ""
+                    echo "  ⚠ URL belum diisi untuk mode ini. Masukkan URL dulu."
+                    sleep 2
+                    menu_ganti_url_mode_pkg "$pkg" "$pkg_num" "$cfg_file"
+                else
+                    return
+                fi
                 ;;
         esac
     done
@@ -1184,6 +1219,14 @@ echo ""
 
 # Get active URL
 PKG1_ACTIVE_URL=$(get_active_url "$MODE" "$URL")
+
+# Guard: URL kosong untuk mode yang butuh URL = bug pasti crash
+# Ini last-resort check kalau ada path yang lolos dari validasi di atas
+if [ -z "$PKG1_ACTIVE_URL" ] && { [ "$MODE" = "main" ] || [ "$MODE" = "public" ]; }; then
+    log "❌ FATAL: URL kosong untuk mode $MODE — config rusak atau URL belum pernah diisi"
+    log "   Hapus config dan jalankan ulang: rm ${CONFIG_BASE_DIR}/roblox_config_${PKG1}.cfg"
+    exit 1
+fi
 
 # Join first package
 join_server "$PKG1" "$PKG1_ACTIVE_URL" "$MODE"
