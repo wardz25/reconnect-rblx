@@ -29,7 +29,7 @@ LAST_VERBOSE=0
 VERBOSE_INTERVAL=600
 
 # Monitoring engine
-JOIN_TIMEOUT=70
+JOIN_TIMEOUT=90
 MONITOR_PID1=""
 MONITOR_PID2=""
 TIMEOUT_PID1=""
@@ -48,9 +48,11 @@ DETECTED_USER_ID=""
 # Split mode
 USE_MULTI_PKG=0
 SPLIT_ENABLED=0
-DISPLAY_MODE="none"          # none | split | freeform
-FREEFORM_LAYOUT="column"     # column | row
-FREEFORM_PKG_LIST=""         # space-separated extra packages untuk freeform (PKG1 selalu pertama)
+DISPLAY_MODE="none"
+FREEFORM_LAYOUT="column"
+FREEFORM_PKG_LIST=""
+USE_ALL_PKGS=0
+ALL_DETECTED_PKGS=()
 
 # ─────────────────────────────────────────
 #   PATH PER-PACKAGE
@@ -130,6 +132,58 @@ check_clone_app() {
 }
 
 # ─────────────────────────────────────────
+#   DEVICE & SYSTEM INFO
+# ─────────────────────────────────────────
+
+get_device_info() {
+    DEVICE_MODEL=$(getprop ro.product.model 2>/dev/null || echo "Unknown")
+    DEVICE_BRAND=$(getprop ro.product.brand 2>/dev/null || echo "Unknown")
+    ANDROID_VER=$(getprop ro.build.version.release 2>/dev/null || echo "?")
+}
+
+get_system_stats() {
+    # RAM dari /proc/meminfo
+    local mem_total mem_avail
+    mem_total=$(grep -i MemTotal /proc/meminfo 2>/dev/null | awk '{print $2}')
+    mem_avail=$(grep -i MemAvailable /proc/meminfo 2>/dev/null | awk '{print $2}')
+    mem_total="${mem_total:-0}"; mem_avail="${mem_avail:-0}"
+    RAM_TOTAL_MB=$(( mem_total / 1024 ))
+    RAM_FREE_MB=$(( mem_avail / 1024 ))
+    if [ "$mem_total" -gt 0 ]; then
+        RAM_USED_PCT=$(( (mem_total - mem_avail) * 100 / mem_total ))
+    else
+        RAM_USED_PCT=0
+    fi
+
+    # CPU: dua snapshot /proc/stat selang 0.5s
+    local c1_total c1_idle c2_total c2_idle
+    c1_total=$(awk '/^cpu /{t=$2+$3+$4+$5+$6+$7+$8; print t}' /proc/stat 2>/dev/null || echo 1)
+    c1_idle=$(awk '/^cpu /{print $5}' /proc/stat 2>/dev/null || echo 0)
+    sleep 0
+    c2_total=$(awk '/^cpu /{t=$2+$3+$4+$5+$6+$7+$8; print t}' /proc/stat 2>/dev/null || echo 1)
+    c2_idle=$(awk '/^cpu /{print $5}' /proc/stat 2>/dev/null || echo 0)
+    local diff_total=$(( c2_total - c1_total ))
+    local diff_idle=$(( c2_idle - c1_idle ))
+    if [ "$diff_total" -gt 0 ]; then
+        CPU_PCT=$(( (diff_total - diff_idle) * 100 / diff_total ))
+    else
+        CPU_PCT=0
+    fi
+
+    # Suhu thermal zone pertama yang tersedia
+    local temp_raw=0
+    for tz in /sys/class/thermal/thermal_zone*/temp; do
+        temp_raw=$(cat "$tz" 2>/dev/null || echo 0)
+        [ "$temp_raw" -gt 0 ] && break
+    done
+    if [ "$temp_raw" -gt 1000 ]; then
+        TEMP_C=$(echo "scale=1; $temp_raw / 1000" | bc 2>/dev/null || echo $(( temp_raw / 1000 )))
+    else
+        TEMP_C="$temp_raw"
+    fi
+}
+
+# ─────────────────────────────────────────
 #   DISCORD WEBHOOK
 # ─────────────────────────────────────────
 
@@ -137,18 +191,18 @@ send_discord_notification() {
     local event_type=$1
     local details=$2
     local pkg=$3
-    
+
     if [ "$DISCORD_ENABLED" != "1" ] || [ -z "$DISCORD_WEBHOOK" ]; then
         return
     fi
-    
+
     local timestamp
     timestamp=$(date '+%Y-%m-%d %H:%M:%S')
-    
+
     local embed_color="16711680"
     local embed_title="⚠️ Event"
     local embed_description=""
-    
+
     case $event_type in
         "disconnect")
             embed_title="❌ Disconnected"
@@ -157,7 +211,7 @@ send_discord_notification() {
             ;;
         "crash")
             embed_title="💥 Crash"
-            embed_description="**Waktu:** $timestamp"
+            embed_description="**Info:** $details\n**Waktu:** $timestamp"
             embed_color="16711680"
             ;;
         "relog")
@@ -167,27 +221,30 @@ send_discord_notification() {
             ;;
         "reconnect_success")
             embed_title="✅ Connected"
-            embed_description="**Server IP:** $details\n**Waktu:** $timestamp"
+            embed_description="**Server:** $details\n**Waktu:** $timestamp"
             embed_color="65280"
             ;;
         "split")
             embed_title="📱 Split Screen"
             embed_description="**2nd Package:** $details\n**Waktu:** $timestamp"
-            embed_color="255255"
+            embed_color="3447003"
             ;;
         "floating")
-            embed_title="🪟 Floating Window"
+            embed_title="🪟 Freeform Window"
             embed_description="**Package:** $details\n**Waktu:** $timestamp"
             embed_color="16711935"
             ;;
     esac
-    
+
+    # Ambil info device dan system stats
+    get_device_info
+    get_system_stats
+
     local mention=""
-    if [ -n "$DISCORD_USER_ID" ]; then
-        mention="<@$DISCORD_USER_ID> "
-    fi
-    
-    local payload=$(cat <<EOF
+    [ -n "$DISCORD_USER_ID" ] && mention="<@$DISCORD_USER_ID> "
+
+    local payload
+    payload=$(cat <<EOF
 {
   "content": "$mention",
   "embeds": [{
@@ -196,17 +253,28 @@ send_discord_notification() {
     "color": $embed_color,
     "fields": [
       {
-        "name": "Package",
-        "value": "$pkg",
+        "name": "📦 Package",
+        "value": "\`$pkg\`",
         "inline": true
+      },
+      {
+        "name": "📱 Device",
+        "value": "$DEVICE_BRAND $DEVICE_MODEL (Android $ANDROID_VER)",
+        "inline": true
+      },
+      {
+        "name": "🖥️ System",
+        "value": "RAM: ${RAM_FREE_MB}MB free (${RAM_USED_PCT}% used)\nCPU: ${CPU_PCT}%\nTemp: ${TEMP_C}°C",
+        "inline": false
       }
     ],
+    "footer": { "text": "Roblox Auto Reconnect" },
     "timestamp": "$(date -u +%Y-%m-%dT%H:%M:%S.000Z)"
   }]
 }
 EOF
 )
-    
+
     curl -s -X POST "$DISCORD_WEBHOOK" \
         -H "Content-Type: application/json" \
         -d "$payload" > /dev/null 2>&1 &
@@ -420,7 +488,7 @@ detect_roblox_packages() {
 pilih_package() {
     local label=$1
     local var_name=$2
-    
+
     clr
     header
     echo ""
@@ -434,13 +502,13 @@ pilih_package() {
 
     if [ ${#PKGS[@]} -eq 0 ]; then
         echo "  ⚠ Tidak ada package Roblox terdeteksi."
-        eval "$var_name=com.roblox.client"
+        printf -v "$var_name" '%s' "com.roblox.client"
         sleep 2
         return
     fi
 
     if [ ${#PKGS[@]} -eq 1 ]; then
-        eval "$var_name=${PKGS[0]}"
+        printf -v "$var_name" '%s' "${PKGS[0]}"
         echo "  ℹ️  Package: ${PKGS[0]}"
         sleep 1
         return
@@ -448,23 +516,37 @@ pilih_package() {
 
     echo "  📦 Pilih package:"
     echo ""
+    echo "  0) Semua package yang ada (pakai config yang sama)"
     local i=1
     for p in "${PKGS[@]}"; do
         echo "  $i) $p"
         i=$((i+1))
     done
     echo ""
-    printf "  Pilih (1-${#PKGS[@]}): "
+    printf "  Pilih (0-${#PKGS[@]}): "
     read -r PILIH
 
-    if [[ "$PILIH" =~ ^[0-9]+$ ]] && [ "$PILIH" -ge 1 ] && [ "$PILIH" -le "${#PKGS[@]}" ]; then
-        eval "$var_name=${PKGS[$((PILIH-1))]}"
-    else
-        eval "$var_name=${PKGS[0]}"
+    if [ "$PILIH" = "0" ]; then
+        printf -v "$var_name" '%s' "${PKGS[0]}"
+        ALL_DETECTED_PKGS=("${PKGS[@]}")
+        USE_ALL_PKGS=1
+        echo ""
+        echo "  ✅ Semua package (${#PKGS[@]}) akan pakai config yang sama:"
+        for p in "${PKGS[@]}"; do echo "    - $p"; done
+        sleep 2
+        return
     fi
-    
+
+    if [[ "$PILIH" =~ ^[0-9]+$ ]] && [ "$PILIH" -ge 1 ] && [ "$PILIH" -le "${#PKGS[@]}" ]; then
+        printf -v "$var_name" '%s' "${PKGS[$((PILIH-1))]}"
+    else
+        printf -v "$var_name" '%s' "${PKGS[0]}"
+    fi
+
     echo ""
-    echo "  ✅ Package: $(eval echo \$$var_name)"
+    local _selected_pkg
+    printf -v _selected_pkg '%s' "${!var_name}"
+    echo "  ✅ Package: ${!var_name}"
     sleep 1
 }
 
@@ -892,63 +974,128 @@ get_screen_size() {
 }
 
 check_windowing_mode() {
+    # Samsung One UI dan AOSP punya format dumpsys yang berbeda.
+    # Fungsi ini coba beberapa pattern sekaligus biar kompatibel dengan keduanya.
     local pkg=$1
-    dumpsys activity activities 2>/dev/null | grep -A3 "$pkg" | grep -oE "windowingMode=[0-9]+" | head -1
+    local dump
+    dump=$(dumpsys activity activities 2>/dev/null)
+
+    # Pattern 1: AOSP standard — "windowingMode=3"
+    local r
+    r=$(echo "$dump" | grep -A8 "$pkg" | grep -oE "windowingMode=[0-9]+" | head -1)
+    [ -n "$r" ] && echo "$r" && return
+
+    # Pattern 2: Samsung One UI — "mWindowingMode=3"
+    r=$(echo "$dump" | grep -A8 "$pkg" | grep -oE "mWindowingMode=[0-9]+" | head -1 | sed 's/m//')
+    [ -n "$r" ] && echo "$r" && return
+
+    # Pattern 3: Samsung string form — "WINDOWING_MODE_SPLIT_SCREEN_PRIMARY"
+    r=$(echo "$dump" | grep -A8 "$pkg" | grep -oE "WINDOWING_MODE_[A-Z_]+" | head -1)
+    if echo "$r" | grep -q "SPLIT_SCREEN_PRIMARY";   then echo "windowingMode=3" && return; fi
+    if echo "$r" | grep -q "SPLIT_SCREEN_SECONDARY"; then echo "windowingMode=4" && return; fi
+    if echo "$r" | grep -q "FREEFORM";               then echo "windowingMode=5" && return; fi
+    if echo "$r" | grep -q "MULTI_WINDOW";           then echo "windowingMode=6" && return; fi
+
+    # Pattern 4: stack-based check — Samsung kadang pakai stack=2 buat split primary
+    local stack
+    stack=$(echo "$dump" | grep -B2 -A2 "packageName=$pkg\|pkg=$pkg" | grep -oE "stack=[0-9]+" | head -1)
+    if echo "$stack" | grep -q "stack=2"; then echo "windowingMode=3" && return; fi
+    if echo "$stack" | grep -q "stack=3"; then echo "windowingMode=4" && return; fi
+
+    echo ""
 }
 
 init_split_screen() {
-    # Split screen yang benar:
-    # PKG1 HARUS di-launch ulang dengan windowingMode=3 (SPLIT_SCREEN_PRIMARY)
-    # dulu sebelum PKG2 bisa masuk ke mode 4 (SPLIT_SCREEN_SECONDARY).
-    # Versi lama langsung launch PKG2 ke mode 4 tanpa set PKG1 ke mode 3,
-    # jadi Android nolak karena tidak ada primary app — itu bug split-nya.
-    local pkg1=$1
-    local url1=$2
-    local pkg2=$3
-    local url2=$4
+    local pkg1=$1 url1=$2 pkg2=$3 url2=$4
 
     log "📱 Inisialisasi Split Screen..."
     log "   PKG1 (Primary, mode 3): $pkg1"
     log "   PKG2 (Secondary, mode 4): $pkg2"
 
-    # Step 1: force-stop keduanya biar bersih
+    # Enable multi-window secara global dulu — wajib di Samsung One UI
+    # kalau tidak di-set ini, --windowingMode 3/4 di-ignore oleh window manager
+    settings put global multi_window_on 1 2>/dev/null
+    settings put secure multi_window_recents_enabled 1 2>/dev/null
+
     am force-stop "$pkg1" 2>/dev/null
     am force-stop "$pkg2" 2>/dev/null
     sleep 2
 
-    # Step 2: launch PKG1 ke SPLIT_SCREEN_PRIMARY (mode 3)
+    # ── STEP 1: Launch PKG1 ke SPLIT_SCREEN_PRIMARY ──────────────────────
     am start -a android.intent.action.VIEW -d "$url1" \
         --windowingMode 3 "$pkg1" 2>/dev/null
-    sleep 3
 
-    # Step 3: cek apakah PKG1 berhasil masuk mode 3
-    local mode1
-    mode1=$(check_windowing_mode "$pkg1")
-    if ! echo "$mode1" | grep -q "windowingMode=3"; then
-        log "⚠️ Split primary gagal ($mode1) — device mungkin tidak support split"
-        log "   Fallback ke freeform 2-column..."
-        DISPLAY_MODE="freeform"
-        FREEFORM_LAYOUT="column"
-        FREEFORM_PKG_LIST="$pkg2"
-        init_freeform_windows "$pkg1" "$url1"
-        return 1
+    # Samsung butuh lebih lama untuk window manager update state-nya
+    local _w=0 mode1=""
+    while [ "$_w" -lt 10 ]; do
+        sleep 1
+        mode1=$(check_windowing_mode "$pkg1")
+        echo "$mode1" | grep -qE "windowingMode=3|windowingMode=6" && break
+        _w=$((_w+1))
+    done
+
+    if ! echo "$mode1" | grep -qE "windowingMode=3|windowingMode=6"; then
+        # Fallback Samsung: start normal dulu, lalu move task ke split via task ID
+        log "⚠️ --windowingMode 3 tidak langsung diterima ($mode1) — coba move-task..."
+
+        # Start normal terlebih dahulu kalau belum running
+        am start -a android.intent.action.VIEW -d "$url1" "$pkg1" 2>/dev/null
+        sleep 3
+
+        local task_id
+        task_id=$(dumpsys activity activities 2>/dev/null | grep -A3 "packageName=$pkg1\|pkg=$pkg1" \
+            | grep -oE "taskId=[0-9]+" | head -1 | grep -oE "[0-9]+")
+
+        if [ -n "$task_id" ]; then
+            log "   Task ID PKG1: $task_id — pindah ke split primary..."
+            am start-activity --start-task "$task_id" --windowingMode 3 2>/dev/null
+            sleep 3
+            mode1=$(check_windowing_mode "$pkg1")
+        fi
+
+        if ! echo "$mode1" | grep -qE "windowingMode=3|windowingMode=6"; then
+            log "⚠️ Split primary gagal ($mode1) — fallback freeform 2-column"
+            DISPLAY_MODE="freeform"; FREEFORM_LAYOUT="column"; FREEFORM_PKG_LIST="$pkg2"
+            init_freeform_windows "$pkg1" "$url1"
+            return 1
+        fi
     fi
 
-    # Step 4: launch PKG2 ke SPLIT_SCREEN_SECONDARY (mode 4)
+    log "✅ PKG1 split primary OK ($mode1)"
+
+    # ── STEP 2: Launch PKG2 ke SPLIT_SCREEN_SECONDARY ────────────────────
     am start -a android.intent.action.VIEW -d "$url2" \
         --windowingMode 4 "$pkg2" 2>/dev/null
-    sleep 2
 
-    local mode2
-    mode2=$(check_windowing_mode "$pkg2")
-    if echo "$mode2" | grep -q "windowingMode=4"; then
-        log "✅ Split screen berhasil (PKG1=mode3, PKG2=mode4)"
+    local _w2=0 mode2=""
+    while [ "$_w2" -lt 10 ]; do
+        sleep 1
+        mode2=$(check_windowing_mode "$pkg2")
+        echo "$mode2" | grep -qE "windowingMode=4|windowingMode=6" && break
+        _w2=$((_w2+1))
+    done
+
+    if ! echo "$mode2" | grep -qE "windowingMode=4|windowingMode=6"; then
+        local task_id2
+        task_id2=$(dumpsys activity activities 2>/dev/null | grep -A3 "packageName=$pkg2\|pkg=$pkg2" \
+            | grep -oE "taskId=[0-9]+" | head -1 | grep -oE "[0-9]+")
+        if [ -n "$task_id2" ]; then
+            am start-activity --start-task "$task_id2" --windowingMode 4 2>/dev/null
+            sleep 3
+            mode2=$(check_windowing_mode "$pkg2")
+        fi
+    fi
+
+    if echo "$mode2" | grep -qE "windowingMode=4|windowingMode=6"; then
+        log "✅ Split screen berhasil (PKG1=$mode1 PKG2=$mode2)"
         send_discord_notification "split" "$pkg2" "$pkg1"
         SPLIT_ENABLED=1
         return 0
     fi
 
-    log "⚠️ Split secondary gagal ($mode2)"
+    log "⚠️ Split secondary gagal ($mode2) — fallback freeform"
+    DISPLAY_MODE="freeform"; FREEFORM_LAYOUT="column"; FREEFORM_PKG_LIST="$pkg2"
+    init_freeform_windows "$pkg1" "$url1"
     return 1
 }
 
@@ -1214,10 +1361,6 @@ start_join_timeout() {
 }
 
 monitor_instance() {
-    # Engine monitoring utama — menggantikan monitor_events + crash_monitor.
-    # Semua deteksi difilter per-PID bukan seluruh logcat, sehingga:
-    # - Zero false positive dari package lain
-    # - Pattern disconnect spesifik per-proses
     local pkg=$1
     local cfg_file=$2
     local state_dir=$3
@@ -1226,9 +1369,26 @@ monitor_instance() {
     echo "0" > "$state_dir/in_background"
     echo "0" > "$state_dir/lag"
     echo "0" > "$state_dir/left_game"
-    update_pid "$pkg" "$state_dir"
-    local CURRENT_PID
-    CURRENT_PID=$(get_pid "$state_dir")
+
+    # Tunggu sampai Roblox benar-benar running (max 60s).
+    # Kalau langsung mulai logcat --pid=0 (Roblox belum start),
+    # logcat langsung exit → loop restart 2 detik terus-terusan seperti di screenshot.
+    local _pw=0 CURRENT_PID="0"
+    while [ "$CURRENT_PID" = "0" ] && [ "$_pw" -lt 60 ]; do
+        update_pid "$pkg" "$state_dir"
+        CURRENT_PID=$(get_pid "$state_dir")
+        if [ "$CURRENT_PID" = "0" ]; then
+            sleep 1
+            _pw=$((_pw+1))
+        fi
+    done
+
+    if [ "$CURRENT_PID" = "0" ]; then
+        log "⚠️ [$pkg] PID tidak ditemukan setelah 60s — monitor exit"
+        return 1
+    fi
+
+    log "📌 [$pkg] PID=$CURRENT_PID — mulai logcat"
 
     logcat --pid="$CURRENT_PID" -v time 2>/dev/null | while read -r line; do
 
@@ -1670,10 +1830,14 @@ echo "=========================================" | tee -a "$PKG1_LOG_FILE"
 log "Package 1        : $PKG1"
 log "Mode             : $(get_mode_label $MODE)"
 log "Reconnect Mode   : $RECONNECT_MODE"
-log "Multi Package    : $(show_toggle $USE_MULTI_PKG)"
-if [ "$USE_MULTI_PKG" = "1" ]; then
+if [ "$USE_ALL_PKGS" = "1" ]; then
+    log "Multi Package    : ALL (${#ALL_DETECTED_PKGS[@]} packages)"
+    for _ap in "${ALL_DETECTED_PKGS[@]}"; do log "  → $_ap"; done
+elif [ "$USE_MULTI_PKG" = "1" ]; then
+    log "Multi Package    : ON"
     log "Package 2        : $PKG2"
 fi
+log "Display Mode     : $DISPLAY_MODE"
 log "Discord          : $(show_toggle $DISCORD_ENABLED)"
 echo "=========================================" | tee -a "$PKG1_LOG_FILE"
 echo ""
@@ -1681,22 +1845,73 @@ echo ""
 # Get active URL
 PKG1_ACTIVE_URL=$(get_active_url "$MODE" "$URL")
 
-# Guard: URL kosong untuk mode yang butuh URL
 if [ -z "$PKG1_ACTIVE_URL" ] && { [ "$MODE" = "main" ] || [ "$MODE" = "public" ]; }; then
-    log "❌ FATAL: URL kosong untuk mode $MODE — config rusak atau URL belum pernah diisi"
-    log "   Hapus config dan jalankan ulang: rm ${CONFIG_BASE_DIR}/roblox_config_${PKG1}.cfg"
+    log "❌ FATAL: URL kosong untuk mode $MODE"
+    log "   Hapus config: rm ${CONFIG_BASE_DIR}/roblox_config_${PKG1}.cfg"
     exit 1
 fi
 
-# Join first package dan langsung start monitor
+# ── SEMUA PACKAGE MODE ────────────────────────────────────────────────────
+if [ "$USE_ALL_PKGS" = "1" ]; then
+    # Semua package pakai config PKG1 yang sama
+    log "🚀 Mode All-Packages: join ${#ALL_DETECTED_PKGS[@]} package..."
+    _ALL_STATE_DIRS=()
+    _ALL_CFGS=()
+    local _api=0
+    for _apkg in "${ALL_DETECTED_PKGS[@]}"; do
+        local _astate="${CONFIG_BASE_DIR}/state_${_apkg}"
+        local _acfg="${CONFIG_BASE_DIR}/roblox_config_${PKG1}.cfg"
+        mkdir -p "$_astate"
+        for _F in ingame joining in_background dc_count rc_count lag dc_state left_game; do
+            echo "0" > "$_astate/$_F"
+        done
+        echo "$(date +%s)" > "$_astate/last_relog"
+        echo "" > "$_astate/server_ip"
+        _ALL_STATE_DIRS+=("$_astate")
+        _ALL_CFGS+=("$_acfg")
+        sleep $((_api > 0 ? 2 : 0))
+        join_server "$_apkg" "$PKG1_ACTIVE_URL" "$MODE" "$_astate"
+        _api=$((_api+1))
+    done
+    sleep 3
+    log "🚀 Ready untuk monitoring (${#ALL_DETECTED_PKGS[@]} package)"
+    _ami=0
+    for _apkg in "${ALL_DETECTED_PKGS[@]}"; do
+        start_monitor "$_apkg" "${_ALL_CFGS[$_ami]}" "${_ALL_STATE_DIRS[$_ami]}"
+        log "📡 [$_apkg] Monitor dimulai"
+        start_join_timeout "$_apkg" "${_ALL_STATE_DIRS[$_ami]}" "${_ALL_CFGS[$_ami]}"
+        _ami=$((_ami+1))
+        sleep 1
+    done
+    # Relog loop untuk all-packages mode
+    while true; do
+        if [ "${RELOG_SETIAP_JAM:-0}" != "0" ]; then
+            local _rami=0
+            for _apkg in "${ALL_DETECTED_PKGS[@]}"; do
+                local _rastate="${_ALL_STATE_DIRS[$_rami]}"
+                _NOW=$(date +%s)
+                _LAST=$(cat "$_rastate/last_relog" 2>/dev/null | grep -oE "[0-9]+" | head -1)
+                _LAST="${_LAST:-0}"
+                if [ $((_NOW - _LAST)) -ge $((RELOG_SETIAP_JAM * 3600)) ]; then
+                    log "🔄 [$_apkg] Relog..."
+                    join_server "$_apkg" "$PKG1_ACTIVE_URL" "$MODE" "$_rastate"
+                    start_monitor "$_apkg" "${_ALL_CFGS[$_rami]}" "$_rastate"
+                    start_join_timeout "$_apkg" "$_rastate" "${_ALL_CFGS[$_rami]}"
+                fi
+                _rami=$((_rami+1))
+            done
+        fi
+        sleep "$CHECK_INTERVAL"
+    done
+fi
+
+# ── MODE NORMAL (1 / 2 PACKAGE) ──────────────────────────────────────────
 join_server "$PKG1" "$PKG1_ACTIVE_URL" "$MODE" "$PKG1_STATE_DIR"
 start_join_timeout "$PKG1" "$PKG1_STATE_DIR" "${CONFIG_BASE_DIR}/roblox_config_${PKG1}.cfg"
 
-# Open second package if enabled
 if [ "$USE_MULTI_PKG" = "1" ]; then
     sleep 2
     open_second_package
-    # Init state files PKG2
     if [ -n "$PKG2_STATE_DIR" ]; then
         mkdir -p "$PKG2_STATE_DIR"
         for _F in ingame joining in_background dc_count rc_count lag dc_state left_game; do
@@ -1710,18 +1925,17 @@ fi
 log "🚀 Ready untuk monitoring"
 echo ""
 
-# Start monitors — per-package, PID-filtered logcat
 start_monitor "$PKG1" "${CONFIG_BASE_DIR}/roblox_config_${PKG1}.cfg" "$PKG1_STATE_DIR"
 log "📡 [$PKG1] Monitor dimulai"
 
 if [ "$USE_MULTI_PKG" = "1" ] && [ -n "$PKG2_STATE_DIR" ]; then
     sleep 2
     start_monitor "$PKG2" "${CONFIG_BASE_DIR}/roblox_config_${PKG2}.cfg" "$PKG2_STATE_DIR"
+    log "📡 [$PKG2] Monitor dimulai"
 fi
 
 # Relog periodic loop
 while true; do
-    # PKG1 relog check
     if [ "${RELOG_SETIAP_JAM:-0}" != "0" ]; then
         _NOW=$(date +%s)
         _LAST=$(cat "$PKG1_STATE_DIR/last_relog" 2>/dev/null | grep -oE "[0-9]+" | head -1)
