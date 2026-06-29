@@ -1,11 +1,12 @@
 #!/data/data/com.termux/files/usr/bin/bash
 
-# ─────────────────────────────────────────
+# ──────────────────────────────────────────────────────────────
 #   ROBLOX AUTO RECONNECT + AUTO RELOG
-#   by: Wardz | versi: 2.15 (Sphinx Dashboard - Kaeru Style)
-#   Layout mengikuti Kaeru Monitor, tanpa license key
-#   Branding Sphinx Community
-# ─────────────────────────────────────────
+#   by: Wardz | versi: 2.16 (Sphinx Dashboard - Kaeru Style)
+#   Layout persis seperti Kaeru Monitor, tanpa License Key.
+#   Menampilkan Last Updated, Device, System Stats (RAM, CPU),
+#   Status Overview, Application Details (uptime | RAM | CPU).
+# ──────────────────────────────────────────────────────────────
 
 PKG1=""
 PKG2=""
@@ -45,9 +46,12 @@ STATUS_INTERVAL=3600
 BOT_USERNAME="Sphinx Community"
 BOT_AVATAR_URL="https://raw.githubusercontent.com/wardz25/updater/main/sphinx.png"
 
-# ─────────────────────────────────────────
+# Untuk last update
+LAST_UPDATE_EPOCH=0
+
+# ──────────────────────────────────────────────────────────────
 #   PATH PER-PACKAGE
-# ─────────────────────────────────────────
+# ──────────────────────────────────────────────────────────────
 
 set_pkg_paths() {
     local pkg=$1
@@ -61,9 +65,9 @@ set_pkg_paths() {
     eval "${base_var}_FILE_RECONNECTING=\${${base_var}_STATE_DIR}/reconnecting"
 }
 
-# ─────────────────────────────────────────
+# ──────────────────────────────────────────────────────────────
 #   DETEKSI CLONE APP
-# ─────────────────────────────────────────
+# ──────────────────────────────────────────────────────────────
 
 detect_clone_app_method() {
     local pkg=$1
@@ -114,9 +118,9 @@ check_clone_app() {
     fi
 }
 
-# ─────────────────────────────────────────
+# ──────────────────────────────────────────────────────────────
 #   FUNGSI UNTUK MENDAPATKAN STATS PROSES
-# ─────────────────────────────────────────
+# ──────────────────────────────────────────────────────────────
 
 get_proc_stats() {
     local pid=$1
@@ -125,7 +129,7 @@ get_proc_stats() {
     local cpu="N/A"
     local ram_percent="N/A"
 
-    # 1. Coba dengan ps -o (toybox/toolbox)
+    # Coba dengan ps -o
     if command -v ps >/dev/null; then
         local ps_data=$(ps -p $pid -o etime,rss,pcpu --no-headers 2>/dev/null)
         if [ -z "$ps_data" ]; then
@@ -145,7 +149,7 @@ get_proc_stats() {
         fi
     fi
 
-    # 2. Jika gagal, ambil dari /proc (lebih andal)
+    # Fallback ke /proc
     if [ "$uptime" = "N/A" ] || [ "$ram_mb" = "N/A" ] || [ "$cpu" = "N/A" ]; then
         if [ -r "/proc/$pid/stat" ]; then
             local stat=$(cat /proc/$pid/stat)
@@ -190,9 +194,35 @@ get_proc_stats() {
     echo "$uptime|$ram_mb|$cpu|$ram_percent"
 }
 
-# ─────────────────────────────────────────
-#   DISCORD WEBHOOK - LAYOUT KAERU STYLE
-# ─────────────────────────────────────────
+# ──────────────────────────────────────────────────────────────
+#   FUNGSI UNTUK STATISTIK SISTEM
+# ──────────────────────────────────────────────────────────────
+
+get_system_stats() {
+    local total_ram_kb=$(grep MemTotal /proc/meminfo 2>/dev/null | awk '{print $2}')
+    local avail_ram_kb=$(grep MemAvailable /proc/meminfo 2>/dev/null | awk '{print $2}')
+    if [ -z "$avail_ram_kb" ]; then
+        avail_ram_kb=$(grep MemFree /proc/meminfo 2>/dev/null | awk '{print $2}')
+    fi
+    local total_ram_mb=$(echo "scale=0; $total_ram_kb/1024" | bc)
+    local used_ram_kb=$((total_ram_kb - avail_ram_kb))
+    local used_ram_mb=$(echo "scale=0; $used_ram_kb/1024" | bc)
+    local ram_percent=$(echo "scale=1; $used_ram_kb*100/$total_ram_kb" | bc)
+    # CPU: coba top, fallback load average
+    local cpu_load="N/A"
+    if command -v top >/dev/null; then
+        cpu_load=$(top -n 1 -b 2>/dev/null | grep -m1 "^CPU:" | awk '{print $2}' | cut -d'%' -f1)
+    fi
+    if [ -z "$cpu_load" ] || [ "$cpu_load" = "N/A" ]; then
+        cpu_load=$(awk '{print $1*100}' /proc/loadavg 2>/dev/null | cut -d. -f1)
+        if [ -z "$cpu_load" ]; then cpu_load="N/A"; fi
+    fi
+    echo "$total_ram_mb|$used_ram_mb|$ram_percent|$cpu_load"
+}
+
+# ──────────────────────────────────────────────────────────────
+#   DISCORD WEBHOOK – LAYOUT KAERU
+# ──────────────────────────────────────────────────────────────
 
 get_pkg_status() {
     local pkg=$1
@@ -219,59 +249,81 @@ send_status_update() {
     if [ "$DISCORD_ENABLED" != "1" ] || [ -z "$DISCORD_WEBHOOK" ]; then
         return
     fi
+
+    # Hitung "Last Updated"
+    local now_epoch=$(date +%s)
+    if [ "$LAST_UPDATE_EPOCH" -eq 0 ]; then
+        LAST_UPDATE_EPOCH=$now_epoch
+    fi
+    local diff=$((now_epoch - LAST_UPDATE_EPOCH))
+    local last_update_str=$(date -d "@$LAST_UPDATE_EPOCH" "+%B %d, %Y %I:%M %p" 2>/dev/null)
+    if [ -z "$last_update_str" ]; then
+        last_update_str=$(date "+%B %d, %Y %I:%M %p")
+    fi
+    local ago_str=""
+    if [ $diff -lt 60 ]; then
+        ago_str="${diff} seconds ago"
+    elif [ $diff -lt 3600 ]; then
+        ago_str="$((diff / 60)) minutes ago"
+    elif [ $diff -lt 86400 ]; then
+        ago_str="$((diff / 3600)) hours ago"
+    else
+        ago_str="$((diff / 86400)) days ago"
+    fi
+    LAST_UPDATE_EPOCH=$now_epoch
+
+    # System stats
+    IFS='|' read -r total_ram_mb used_ram_mb ram_percent cpu_load <<< "$(get_system_stats)"
+
+    # Status overview
     local online_count=0
     local offline_count=0
-    local fields=""
+    local app_details=""
     for pkg in "${PKGS[@]}"; do
         IFS='|' read -r status uptime ram_mb cpu ip ram_percent <<< "$(get_pkg_status "$pkg")"
         if [ "$status" = "Online" ]; then
             online_count=$((online_count+1))
+            app_details+="- **$uptime** | **${ram_mb} MB (${ram_percent}%)** | **${cpu}%**\n"
         else
             offline_count=$((offline_count+1))
+            app_details+="- **Offline**\n"
         fi
-        local field_value=""
-        if [ "$status" = "Online" ]; then
-            field_value="**Status:** ✅ Online\n**Uptime:** $uptime\n**RAM:** ${ram_mb} MB (${ram_percent}%)\n**CPU:** ${cpu}%\n**IP:** $ip"
-        else
-            field_value="**Status:** ❌ Offline"
-        fi
-        fields+="{\"name\":\"$pkg\",\"value\":\"$field_value\",\"inline\":true},"
     done
-    fields=${fields%,}
-    local device=$(getprop ro.product.model 2>/dev/null || echo "Unknown")
-    local timestamp=$(date -u +%Y-%m-%dT%H:%M:%S.000Z)
-    local title=""
-    local color=5814783
-    if [ $online_count -gt 0 ]; then
-        title="Connected ✅"
-        color=65280
-    else
-        title="Disconnected ❌"
-        color=16711680
-    fi
 
-    # Layout ala Kaeru Monitor
+    # Build description (Kaeru style)
+    local device=$(getprop ro.product.model 2>/dev/null || echo "Unknown")
+    local desc="Last Updated: $last_update_str ($ago_str)\n\n"
+    desc+="- **Device**: $device\n\n"
+    desc+="## System Stats\n"
+    desc+="- RAM: ${used_ram_mb}MB used (${ram_percent}%) / ${total_ram_mb}MB total\n"
+    desc+="- CPU: ${cpu_load}%\n\n"
+    desc+="## Status Overview\n"
+    desc+="- **Online**: $online_count\n- **Offline**: $offline_count\n- **Total**: ${#PKGS[@]}\n\n"
+    desc+="## Application Details\n"
+    desc+="$app_details"
+
+    # Build embed
     local embed=$(cat <<EOF
 {
   "title": "Sphinx Status Update",
-  "description": "**Device:** $device\n**Online:** $online_count | **Offline:** $offline_count | **Total:** ${#PKGS[@]}",
-  "color": $color,
+  "description": "$desc",
+  "color": 5814783,
   "thumbnail": {
     "url": "$BOT_AVATAR_URL"
   },
-  "fields": [$fields],
   "footer": {
     "text": "$BOT_USERNAME",
     "icon_url": "$BOT_AVATAR_URL"
   },
-  "timestamp": "$timestamp"
+  "timestamp": "$(date -u +%Y-%m-%dT%H:%M:%S.000Z)"
 }
 EOF
 )
+
     curl -s -X POST "$DISCORD_WEBHOOK" \
         -H "Content-Type: application/json" \
         -d "{\"username\":\"$BOT_USERNAME\",\"avatar_url\":\"$BOT_AVATAR_URL\",\"embeds\":[$embed]}" > /dev/null 2>&1 &
-    echo "  📤 Status update sent: $title ($online_count online, $offline_count offline)"
+    echo "  📤 Status update sent (Kaeru style)"
 }
 
 send_discord_notification() {
@@ -307,7 +359,6 @@ send_discord_notification() {
             embed_title="Connected ✅"
             embed_description="**Server IP:** $details\n**Waktu:** $timestamp"
             embed_color="65280"
-            # Ambil status lengkap
             IFS='|' read -r status uptime ram_mb cpu ip ram_percent <<< "$(get_pkg_status "$pkg")"
             if [ "$status" = "Online" ]; then
                 fields="[{\"name\":\"Package\",\"value\":\"$pkg\",\"inline\":true},{\"name\":\"Uptime\",\"value\":\"$uptime\",\"inline\":true},{\"name\":\"RAM\",\"value\":\"${ram_mb} MB (${ram_percent}%)\",\"inline\":true},{\"name\":\"CPU\",\"value\":\"${cpu}%\",\"inline\":true}]"
@@ -382,9 +433,9 @@ EOF
         -d "$payload" > /dev/null 2>&1 &
 }
 
-# ─────────────────────────────────────────
+# ──────────────────────────────────────────────────────────────
 #   CONFIG FUNCTIONS
-# ─────────────────────────────────────────
+# ──────────────────────────────────────────────────────────────
 
 load_config() {
     local cfg_file=$1
@@ -434,9 +485,9 @@ persist_discord_settings() {
     echo "  ✅ Discord settings saved to $cfg_file"
 }
 
-# ─────────────────────────────────────────
+# ──────────────────────────────────────────────────────────────
 #   TAMPILAN
-# ─────────────────────────────────────────
+# ──────────────────────────────────────────────────────────────
 
 clr() { clear 2>/dev/null || printf '\033[2J\033[H'; }
 
@@ -466,9 +517,9 @@ get_mode_label() {
     esac
 }
 
-# ─────────────────────────────────────────
+# ──────────────────────────────────────────────────────────────
 #   VALIDASI INPUT
-# ─────────────────────────────────────────
+# ──────────────────────────────────────────────────────────────
 
 validate_discord_webhook() {
     local url=$1
@@ -508,9 +559,9 @@ show_current_config() {
     echo ""
 }
 
-# ─────────────────────────────────────────
+# ──────────────────────────────────────────────────────────────
 #   DETEKSI PACKAGE
-# ─────────────────────────────────────────
+# ──────────────────────────────────────────────────────────────
 
 detect_running_roblox_apps() {
     ps -A 2>/dev/null | grep -i roblox | awk '{print $NF}' | sort -u | grep "^com\.roblox"
@@ -591,9 +642,9 @@ pilih_package() {
     sleep 1
 }
 
-# ─────────────────────────────────────────
+# ──────────────────────────────────────────────────────────────
 #   SETUP MODE & URL
-# ─────────────────────────────────────────
+# ──────────────────────────────────────────────────────────────
 
 setup_mode_and_url() {
     local label=$1
@@ -693,9 +744,9 @@ setup_mode_and_url() {
     done
 }
 
-# ─────────────────────────────────────────
+# ──────────────────────────────────────────────────────────────
 #   WIZARD SETUP
-# ─────────────────────────────────────────
+# ──────────────────────────────────────────────────────────────
 
 wizard_setup_pkg() {
     local pkg=$1
@@ -933,9 +984,9 @@ menu_setup_discord() {
     esac
 }
 
-# ─────────────────────────────────────────
+# ──────────────────────────────────────────────────────────────
 #   SPLIT SCREEN / FLOATING
-# ─────────────────────────────────────────
+# ──────────────────────────────────────────────────────────────
 
 get_view_activity() {
     local pkg=$1
@@ -1022,9 +1073,9 @@ open_second_package() {
     fi
 }
 
-# ─────────────────────────────────────────
+# ──────────────────────────────────────────────────────────────
 #   LOG & CORE
-# ─────────────────────────────────────────
+# ──────────────────────────────────────────────────────────────
 
 log_pkg() {
     local pkg=$1
@@ -1207,9 +1258,9 @@ start_monitoring_pkg() {
     log_pkg "$pkg" "✅ Monitoring aktif"
 }
 
-# ─────────────────────────────────────────
+# ──────────────────────────────────────────────────────────────
 #   MAIN
-# ─────────────────────────────────────────
+# ──────────────────────────────────────────────────────────────
 
 if [ "$(id -u)" != "0" ]; then
     echo "⚠️ Requesting root..."
