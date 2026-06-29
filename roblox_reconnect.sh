@@ -2,10 +2,11 @@
 
 # ─────────────────────────────────────────
 #   ROBLOX AUTO RECONNECT + AUTO RELOG
-#   by: Wardz | versi: 2.8 (All Packages Fix + Per-Package Logcat)
-#   Perbaikan: - Setiap package menggunakan logcat --pid untuk isolasi
-#              - wait_ingame dan monitor_events hanya membaca log dari PID sendiri
-#              - Crash monitor lebih akurat dengan ps -A
+#   by: Wardz | versi: 2.9 (Sphinx Community Dashboard)
+#   Perbaikan: - Dashboard ala Kaeru dengan branding Sphinx
+#              - IP per package disimpan dan ditampilkan
+#              - Thumbnail & footer menggunakan gambar dari raw GitHub
+#              - Status update lebih informatif
 # ─────────────────────────────────────────
 
 PKG1=""
@@ -41,6 +42,9 @@ USE_MULTI_PKG=0       # khusus split/freeform (tidak digunakan di opsi 2)
 USE_ALL_PKGS=0
 PKGS=()
 STATUS_INTERVAL=3600
+
+# Sphinx branding
+SPHINX_ICON_URL="https://raw.githubusercontent.com/wardz25/updater/main/sphinx.png"
 
 # ─────────────────────────────────────────
 #   PATH PER-PACKAGE
@@ -188,16 +192,22 @@ EOF
 }
 
 # ─────────────────────────────────────────
-#   STATUS PERIODIK (Dashboard Kaeru)
+#   STATUS PERIODIK (Dashboard Sphinx)
 # ─────────────────────────────────────────
 
 get_pkg_status() {
     local pkg=$1
+    local state_dir="${STATE_BASE_DIR}/rbx_state_${pkg}"
+    local ip_file="${state_dir}/last_ip"
     local pid=$(ps -A 2>/dev/null | grep "$pkg" | grep -v grep | awk '{print $2}' | head -1)
     local status="Offline"
     local uptime="N/A"
     local ram="N/A"
     local cpu="N/A"
+    local ip=""
+    if [ -f "$ip_file" ]; then
+        ip=$(cat "$ip_file")
+    fi
     if [ -n "$pid" ]; then
         status="Online"
         uptime=$(ps -o etime= -p $pid 2>/dev/null | tr -d ' ' | head -1)
@@ -210,7 +220,7 @@ get_pkg_status() {
             cpu="N/A"
         fi
     fi
-    echo "$status|$uptime|$ram|$cpu"
+    echo "$status|$uptime|$ram|$cpu|$ip"
 }
 
 send_status_update() {
@@ -221,13 +231,18 @@ send_status_update() {
     local offline_count=0
     local fields=""
     for pkg in "${PKGS[@]}"; do
-        IFS='|' read -r status uptime ram cpu <<< "$(get_pkg_status "$pkg")"
+        IFS='|' read -r status uptime ram cpu ip <<< "$(get_pkg_status "$pkg")"
         if [ "$status" = "Online" ]; then
             online_count=$((online_count+1))
         else
             offline_count=$((offline_count+1))
         fi
-        local field_value="**Uptime:** $uptime\n**RAM:** ${ram} MB\n**CPU:** ${cpu}%"
+        local field_value=""
+        if [ "$status" = "Online" ]; then
+            field_value="**Status:** ✅ Online\n**Uptime:** $uptime\n**RAM:** ${ram} MB\n**CPU:** ${cpu}%\n**IP:** $ip"
+        else
+            field_value="**Status:** ❌ Offline"
+        fi
         fields+="{\"name\":\"$pkg\",\"value\":\"$field_value\",\"inline\":true},"
     done
     fields=${fields%,}
@@ -235,10 +250,17 @@ send_status_update() {
     local timestamp=$(date -u +%Y-%m-%dT%H:%M:%S.000Z)
     local embed=$(cat <<EOF
 {
-  "title": "Kaeru Status Update",
+  "title": "Sphinx Status Update",
   "description": "**Device:** $device\n**Online:** $online_count | **Offline:** $offline_count | **Total:** ${#PKGS[@]}",
   "color": 5814783,
+  "thumbnail": {
+    "url": "$SPHINX_ICON_URL"
+  },
   "fields": [$fields],
+  "footer": {
+    "text": "Sphinx Community",
+    "icon_url": "$SPHINX_ICON_URL"
+  },
   "timestamp": "$timestamp"
 }
 EOF
@@ -900,11 +922,6 @@ log_pkg() {
     echo "[$(date +%H:%M:%S)] $msg" >> "$logfile"
 }
 
-# Untuk kompatibilitas (tidak digunakan lagi)
-log() {
-    log_pkg "$PKG1" "$1"
-}
-
 build_join_url() {
     local url=$1
     local place_id query code type
@@ -961,12 +978,13 @@ wait_ingame() {
         log_pkg "$pkg" "⚠️ Proses tidak ditemukan, skip wait_ingame"
         return
     fi
-    # Gunakan logcat --pid untuk hanya membaca log dari proses ini
+    local state_dir="${STATE_BASE_DIR}/rbx_state_${pkg}"
+    mkdir -p "$state_dir"
     timeout 90 logcat --pid="$pid" -v time 2>/dev/null | grep --line-buffered -i "Connection accepted from" | head -1 > /dev/null
     if [ $? -eq 0 ]; then
-        # Ambil IP dari log yang sama
         IP=$(logcat --pid="$pid" -v time 2>/dev/null | grep -oE "([0-9]{1,3}\.){3}[0-9]{1,3}" | head -1)
         log_pkg "$pkg" "✅ INGAME! IP: $IP"
+        echo "$IP" > "$state_dir/last_ip"
         send_discord_notification "reconnect_success" "$IP" "$pkg"
     else
         log_pkg "$pkg" "⏱️ Timeout"
@@ -1008,7 +1026,6 @@ monitor_events() {
         fi
         sleep 2
     done
-    # Baca log khusus PID ini, filter event disconnect
     logcat --pid="$pid" -v time 2>/dev/null | grep --line-buffered -iE "Sending disconnect|Connection lost|Lost connection|Disconnected from server" | while read -r line; do
         if echo "$line" | grep -qi "Sending disconnect with reason\|Connection lost\|Lost connection\|Disconnected from server"; then
             local reason
@@ -1027,32 +1044,10 @@ monitor_events() {
             join_server "$pkg" "$active_url" "$MODE"
             wait_ingame "$pkg"
             verify_ingame_stable "$pkg" "$cfg_file"
-            # Setelah rejoin, perbarui PID untuk monitor
-            pid=$(pgrep -f "$pkg" | head -1)
-            if [ -n "$pid" ]; then
-                # Lanjutkan monitoring dengan PID baru (loop akan restart karena perintah logcat di dalam while)
-                # Tapi karena kita di dalam while, kita perlu keluar dan restart monitor?
-                # Kita akan restart monitor dengan memanggil ulang fungsi ini, tapi karena kita di dalam subshell,
-                # kita bisa keluar dari loop dan memulai ulang.
-                # Cara sederhana: exec ulang monitor_events dengan pkill dan restart
-                # Atau kita bisa menggunakan pendekatan berbeda: gunakan while dengan logcat yang di-restart.
-                # Untuk kesederhanaan, kita akan keluar dari fungsi dan restart dari luar.
-                # Tapi karena ini di background, kita bisa memanggil monitor_events lagi dengan exec.
-                # Kita akan lakukan: kill proses monitor saat ini dan jalankan ulang.
-                # Namun lebih mudah: kita biarkan while berjalan dengan logcat yang akan mati jika PID berubah,
-                # dan kita restart monitor dari crash_monitor? Tidak, lebih baik kita restart monitor_events
-                # dengan cara menghentikan proses ini dan menjalankan ulang.
-                # Kita akan gunakan exec untuk mengganti proses saat ini dengan monitor_events baru.
-                # Tapi exec akan mengganti shell saat ini, yang mungkin tidak diinginkan.
-                # Alternatif: kita buat loop luar yang menangani restart monitor.
-                # Untuk menghindari kerumitan, kita akan keluar dari fungsi dan biarkan crash_monitor menangani.
-                # Karena crash_monitor akan mendeteksi crash dan melakukan rejoin, dan setelah rejoin,
-                # monitor_events yang lama sudah mati karena logcat berhenti, dan kita jalankan ulang di crash_monitor.
-                break
-            fi
+            break
         fi
     done
-    # Jika keluar dari loop, restart monitor
+    # Restart monitor jika keluar dari loop
     log_pkg "$pkg" "🔄 Merestart monitor karena PID berubah atau logcat berhenti"
     monitor_events "$pkg" "$cfg_file" &
 }
@@ -1070,8 +1065,6 @@ crash_monitor() {
             join_server "$pkg" "$active_url" "$MODE"
             wait_ingame "$pkg"
             verify_ingame_stable "$pkg" "$cfg_file"
-            # Restart monitor_events karena PID berubah
-            # Kita akan matikan monitor yang lama (jika ada) dan jalankan baru
             pkill -f "monitor_events $pkg" 2>/dev/null
             monitor_events "$pkg" "$cfg_file" &
         fi
@@ -1116,10 +1109,8 @@ if [ "$(id -u)" != "0" ]; then
     exec su -c "$0"
 fi
 
-# Trap untuk menjaga script tetap berjalan
 trap 'echo "⏹️ Script dihentikan"; exit' INT TERM
 
-# Menu awal
 clr
 echo "========================================="
 echo "   ROBLOX AUTO RECONNECT + AUTO RELOG"
@@ -1136,7 +1127,6 @@ read -r SETUP_CHOICE
 if [ "$SETUP_CHOICE" = "2" ]; then
     USE_ALL_PKGS=1
     USE_MULTI_PKG=0
-    # Ambil semua package
     PKGS=()
     while IFS= read -r line; do
         [ -n "$line" ] && PKGS+=("$line")
@@ -1149,19 +1139,16 @@ if [ "$SETUP_CHOICE" = "2" ]; then
 else
     USE_ALL_PKGS=0
     USE_MULTI_PKG=0
-    # Pilih satu package
     pilih_package "📦 PILIH PACKAGE" PKG1
     PKGS=("$PKG1")
 fi
 
-# Setup config untuk setiap package (tanpa interaksi jika USE_ALL_PKGS=1)
 for pkg in "${PKGS[@]}"; do
     set_pkg_paths "$pkg" "TMP"
     check_clone_app "$pkg"
     setup_or_load_pkg "$pkg" 1
 done
 
-# Load Discord settings dari package pertama
 PKG1_CFG="${CONFIG_BASE_DIR}/roblox_config_${PKGS[0]}.cfg"
 if [ -f "$PKG1_CFG" ]; then
     DISCORD_ENABLED=$(grep '^DISCORD_ENABLED=' "$PKG1_CFG" | head -1 | cut -d= -f2)
@@ -1200,25 +1187,20 @@ if [ "$SETUP_DISCORD" = "1" ]; then
     sleep 2
 fi
 
-# Simpan Discord settings ke semua config
 for pkg in "${PKGS[@]}"; do
     persist_discord_settings "${CONFIG_BASE_DIR}/roblox_config_${pkg}.cfg" "$pkg"
 done
 
-# Start monitoring untuk setiap package (semua di background)
 for pkg in "${PKGS[@]}"; do
     start_monitoring_pkg "$pkg" &
-    # Beri jeda agar tidak terlalu bersamaan
     sleep 2
 done
 
-# Jika mode split/freeform (tidak digunakan di opsi 2, tapi tetap didukung)
 if [ "$USE_MULTI_PKG" = "1" ] && [ -n "$PKG2" ]; then
     sleep 10
     open_second_package
 fi
 
-# Start periodic status update jika Discord enabled
 if [ "$DISCORD_ENABLED" = "1" ] && [ -n "$DISCORD_WEBHOOK" ]; then
     send_status_update
     while true; do
@@ -1227,5 +1209,4 @@ if [ "$DISCORD_ENABLED" = "1" ] && [ -n "$DISCORD_WEBHOOK" ]; then
     done &
 fi
 
-# Tunggu semua proses
 wait
