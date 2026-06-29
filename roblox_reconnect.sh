@@ -2,10 +2,10 @@
 
 # ─────────────────────────────────────────
 #   ROBLOX AUTO RECONNECT + AUTO RELOG
-#   by: Wardz | versi: 2.13 (Sphinx Dashboard + Connected with Stats)
-#   Perbaikan: - Status update pertama ditunda 15 detik
-#              - Notifikasi Connected memiliki format Sphinx + CPU/RAM
-#              - Thumbnail & footer Sphinx di semua embed
+#   by: Wardz | versi: 2.14 (Sphinx Dashboard - Real Stats)
+#   Perbaikan: - Data CPU, RAM, Uptime diambil dari /proc dan ps secara robust
+#              - Tampilkan persentase RAM, CPU, Uptime di status update
+#              - Connected notification juga menampilkan stats
 # ─────────────────────────────────────────
 
 PKG1=""
@@ -116,7 +116,90 @@ check_clone_app() {
 }
 
 # ─────────────────────────────────────────
-#   DISCORD WEBHOOK (dengan format Sphinx untuk Connected)
+#   FUNGSI UNTUK MENDAPATKAN STATS PROSES
+# ─────────────────────────────────────────
+
+get_proc_stats() {
+    local pid=$1
+    local uptime="N/A"
+    local ram_mb="N/A"
+    local cpu="N/A"
+    local ram_percent="N/A"
+
+    # 1. Coba dengan ps -o (toybox/toolbox)
+    if command -v ps >/dev/null; then
+        # Coba format etime,rss,pcpu
+        local ps_data=$(ps -p $pid -o etime,rss,pcpu --no-headers 2>/dev/null)
+        if [ -z "$ps_data" ]; then
+            ps_data=$(ps -o etime,rss,pcpu -p $pid 2>/dev/null | tail -1)
+        fi
+        if [ -n "$ps_data" ]; then
+            uptime=$(echo "$ps_data" | awk '{print $1}')
+            local rss_kb=$(echo "$ps_data" | awk '{print $2}')
+            cpu=$(echo "$ps_data" | awk '{print $3}')
+            if [ -n "$rss_kb" ] && [ "$rss_kb" -gt 0 ]; then
+                ram_mb=$(echo "scale=1; $rss_kb/1024" | bc)
+                local total_kb=$(grep MemTotal /proc/meminfo 2>/dev/null | awk '{print $2}')
+                if [ -n "$total_kb" ] && [ "$total_kb" -gt 0 ]; then
+                    ram_percent=$(echo "scale=1; $rss_kb*100/$total_kb" | bc)
+                fi
+            fi
+        fi
+    fi
+
+    # 2. Jika gagal, ambil dari /proc (lebih andal)
+    if [ "$uptime" = "N/A" ] || [ "$ram_mb" = "N/A" ] || [ "$cpu" = "N/A" ]; then
+        # Uptime: hitung dari starttime (field 22) di /proc/$pid/stat
+        if [ -r "/proc/$pid/stat" ]; then
+            local stat=$(cat /proc/$pid/stat)
+            local starttime=$(echo "$stat" | awk '{print $22}')
+            local uptime_seconds=$(cat /proc/uptime | awk '{print $1}')
+            if [ -n "$starttime" ] && [ -n "$uptime_seconds" ]; then
+                local clk_tck=$(getconf CLK_TCK 2>/dev/null || echo 100)
+                local elapsed=$((uptime_seconds - starttime/clk_tck))
+                if [ "$elapsed" -gt 0 ]; then
+                    local days=$((elapsed / 86400))
+                    local hours=$(( (elapsed % 86400) / 3600 ))
+                    local mins=$(( (elapsed % 3600) / 60 ))
+                    local secs=$((elapsed % 60))
+                    if [ "$days" -gt 0 ]; then
+                        uptime="${days}d ${hours}h ${mins}m"
+                    else
+                        uptime="${hours}h ${mins}m ${secs}s"
+                    fi
+                fi
+            fi
+            # RAM: VmRSS dari /proc/$pid/status
+            if [ -r "/proc/$pid/status" ]; then
+                local rss_kb=$(grep VmRSS /proc/$pid/status 2>/dev/null | awk '{print $2}')
+                if [ -n "$rss_kb" ] && [ "$rss_kb" -gt 0 ]; then
+                    ram_mb=$(echo "scale=1; $rss_kb/1024" | bc)
+                    local total_kb=$(grep MemTotal /proc/meminfo 2>/dev/null | awk '{print $2}')
+                    if [ -n "$total_kb" ] && [ "$total_kb" -gt 0 ]; then
+                        ram_percent=$(echo "scale=1; $rss_kb*100/$total_kb" | bc)
+                    fi
+                fi
+            fi
+        fi
+        # CPU: coba top jika tersedia
+        if [ "$cpu" = "N/A" ]; then
+            if command -v top >/dev/null; then
+                local top_data=$(top -n 1 -b -p $pid 2>/dev/null | grep -E "^$pid" | head -1)
+                if [ -n "$top_data" ]; then
+                    # format top: PID USER PR NI VIRT RES SHR S %CPU %MEM TIME+ COMMAND
+                    cpu=$(echo "$top_data" | awk '{print $9}')
+                fi
+            fi
+            # Jika masih N/A, coba dari /proc/$pid/stat (perhitungan dengan interval)
+            # Untuk sederhana, kita skip karena butuh dua pengukuran.
+        fi
+    fi
+
+    echo "$uptime|$ram_mb|$cpu|$ram_percent"
+}
+
+# ─────────────────────────────────────────
+#   DISCORD WEBHOOK
 # ─────────────────────────────────────────
 
 send_discord_notification() {
@@ -247,19 +330,7 @@ get_pkg_status() {
     fi
     if [ -n "$pid" ]; then
         status="Online"
-        uptime=$(ps -o etime= -p $pid 2>/dev/null | tr -d ' ' | head -1)
-        local rss_kb=$(ps -o rss= -p $pid 2>/dev/null | tr -d ' ' | head -1)
-        if [ -n "$rss_kb" ] && [ "$rss_kb" -gt 0 ]; then
-            ram_mb=$(echo "scale=1; $rss_kb/1024" | bc)
-            local total_kb=$(grep MemTotal /proc/meminfo 2>/dev/null | awk '{print $2}')
-            if [ -n "$total_kb" ] && [ "$total_kb" -gt 0 ]; then
-                ram_percent=$(echo "scale=1; $rss_kb*100/$total_kb" | bc)
-            fi
-        fi
-        cpu=$(ps -o %cpu= -p $pid 2>/dev/null | tr -d ' ' | head -1)
-        if [ -z "$cpu" ]; then
-            cpu="N/A"
-        fi
+        IFS='|' read -r uptime ram_mb cpu ram_percent <<< "$(get_proc_stats "$pid")"
     fi
     echo "$status|$uptime|$ram_mb|$cpu|$ip|$ram_percent"
 }
@@ -1252,9 +1323,8 @@ if [ "$USE_MULTI_PKG" = "1" ] && [ -n "$PKG2" ]; then
     open_second_package
 fi
 
-# Kirim status update pertama setelah semua package berkesempatan online (delay 15 detik)
 if [ "$DISCORD_ENABLED" = "1" ] && [ -n "$DISCORD_WEBHOOK" ]; then
-    echo "  ⏳ Menunggu 15 detik sebelum mengirim status update pertama..."
+    echo "  ⏳ Menunggu 15 detik sebelum status update pertama..."
     sleep 15
     send_status_update
     while true; do
