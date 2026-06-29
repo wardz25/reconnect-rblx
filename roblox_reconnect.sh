@@ -2,11 +2,11 @@
 
 # ──────────────────────────────────────────────────────────────
 #   ROBLOX AUTO RECONNECT + AUTO RELOG
-#   by: Wardz | versi: 2.17 (Sphinx Dashboard)
-#   Layout persis seperti Kaeru Monitor, tanpa License Key.
-#   Menampilkan Last Updated, Device, System Stats (RAM, CPU),
-#   Status Overview, Application Details (uptime | RAM | CPU).
-#   Dilengkapi emoji, nama package di Application Details.
+#   by: Wardz | versi: 2.19 (Stable + Kaeru Style)
+#   Perbaikan: - Judul "Sphinx Status Update" sebagai heading di description
+#              - Disconnected/Crash tampilkan stats terakhir
+#              - Layout konsisten antara Connected/Disconnected/Crash
+#              - Hilangkan thumbnail besar, hanya footer icon
 # ──────────────────────────────────────────────────────────────
 
 PKG1=""
@@ -221,14 +221,42 @@ get_system_stats() {
 }
 
 # ──────────────────────────────────────────────────────────────
-#   DISCORD WEBHOOK – LAYOUT KAERU + EMOJI
+#   FUNGSI UNTUK MENYIMPAN STATS TERAKHIR
+# ──────────────────────────────────────────────────────────────
+
+save_last_stats() {
+    local pkg=$1
+    local state_dir="${STATE_BASE_DIR}/rbx_state_${pkg}"
+    mkdir -p "$state_dir"
+    local stats_file="${state_dir}/last_stats"
+    IFS='|' read -r status uptime ram_mb cpu ip ram_percent <<< "$(get_pkg_status "$pkg")"
+    echo "$uptime|$ram_mb|$cpu|$ram_percent" > "$stats_file"
+}
+
+# ──────────────────────────────────────────────────────────────
+#   FUNGSI UNTUK MEMBACA STATS TERAKHIR
+# ──────────────────────────────────────────────────────────────
+
+get_last_stats() {
+    local pkg=$1
+    local state_dir="${STATE_BASE_DIR}/rbx_state_${pkg}"
+    local stats_file="${state_dir}/last_stats"
+    if [ -f "$stats_file" ]; then
+        cat "$stats_file"
+    else
+        echo "N/A|N/A|N/A|N/A"
+    fi
+}
+
+# ──────────────────────────────────────────────────────────────
+#   DISCORD WEBHOOK – LAYOUT KAERU (tanpa thumbnail besar)
 # ──────────────────────────────────────────────────────────────
 
 get_pkg_status() {
     local pkg=$1
     local state_dir="${STATE_BASE_DIR}/rbx_state_${pkg}"
     local ip_file="${state_dir}/last_ip"
-    local pid=$(ps -A 2>/dev/null | grep "$pkg" | grep -v grep | awk '{print $2}' | head -1)
+    local pid=$(pgrep -f "$pkg" 2>/dev/null | head -1)
     local status="Offline"
     local uptime="N/A"
     local ram_mb="N/A"
@@ -272,10 +300,10 @@ send_status_update() {
     fi
     LAST_UPDATE_EPOCH=$now_epoch
 
-    ## System stats
+    # System stats
     IFS='|' read -r total_ram_mb used_ram_mb ram_percent cpu_load <<< "$(get_system_stats)"
 
-    ## Status overview
+    # Status overview
     local online_count=0
     local offline_count=0
     local app_details=""
@@ -290,27 +318,25 @@ send_status_update() {
         fi
     done
 
-    # Build description
+    # Build description (Kaeru style with heading)
     local device=$(getprop ro.product.model 2>/dev/null || echo "Unknown")
-    local desc="**Last Updated:** $last_update_str ($ago_str)\n\n"
+    local desc="## Sphinx Status Update\n\n"
+    desc+="**Last Updated:** $last_update_str ($ago_str)\n\n"
     desc+="📱 **Device**: $device\n\n"
-    desc+="### 💻 System Stats\n"
+    desc+="## 💻 System Stats\n"
     desc+="- RAM: ${used_ram_mb}MB used (${ram_percent}%) / ${total_ram_mb}MB total\n"
     desc+="- CPU: ${cpu_load}%\n\n"
-    desc+="### 📊 Status Overview\n"
+    desc+="## 📊 Status Overview\n"
     desc+="- **Online**: $online_count\n- **Offline**: $offline_count\n- **Total**: ${#PKGS[@]}\n\n"
-    desc+="### 📦 Application Details\n"
+    desc+="## 📦 Application Details\n"
     desc+="$app_details"
 
-    # Build embed
+    # Build embed - TANPA THUMBNAIL, hanya footer icon
     local embed=$(cat <<EOF
 {
-  "title": "## Sphinx Status Update",
+  "title": "Sphinx Status Update",
   "description": "$desc",
   "color": 5814783,
-  "thumbnail": {
-    "url": "$BOT_AVATAR_URL"
-  },
   "footer": {
     "text": "$BOT_USERNAME",
     "icon_url": "$BOT_AVATAR_URL"
@@ -323,7 +349,7 @@ EOF
     curl -s -X POST "$DISCORD_WEBHOOK" \
         -H "Content-Type: application/json" \
         -d "{\"username\":\"$BOT_USERNAME\",\"avatar_url\":\"$BOT_AVATAR_URL\",\"embeds\":[$embed]}" > /dev/null 2>&1 &
-    echo "  📤 Status update sent"
+    echo "  📤 Status update sent (Kaeru style)"
 }
 
 send_discord_notification() {
@@ -333,27 +359,33 @@ send_discord_notification() {
     if [ "$DISCORD_ENABLED" != "1" ] || [ -z "$DISCORD_WEBHOOK" ]; then
         return
     fi
-    local timestamp
-    timestamp=$(date '+%Y-%m-%d %H:%M:%S')
+    local timestamp=$(date '+%Y-%m-%d %H:%M:%S')
     local embed_color="16711680"
     local embed_title="⚠️ Event"
     local embed_description=""
     local fields="[]"
+
+    # Baca stats terakhir (jika ada)
+    IFS='|' read -r last_uptime last_ram last_cpu last_ram_percent <<< "$(get_last_stats "$pkg")"
+
     case $event_type in
         "disconnect")
             embed_title="❌ Disconnected"
-            embed_description="**Alasan:** $details\n**Waktu:** $timestamp"
+            embed_description="**Alasan:** $details\n**Waktu:** $timestamp\n\n**Stats terakhir sebelum DC:**\nUptime: $last_uptime\nRAM: ${last_ram} MB (${last_ram_percent}%)\nCPU: ${last_cpu}%"
             embed_color="16711680"
+            fields="[{\"name\":\"Package\",\"value\":\"$pkg\",\"inline\":true}]"
             ;;
         "crash")
             embed_title="💥 Crash"
-            embed_description="**Waktu:** $timestamp"
+            embed_description="**Waktu:** $timestamp\n\n**Stats terakhir sebelum crash:**\nUptime: $last_uptime\nRAM: ${last_ram} MB (${last_ram_percent}%)\nCPU: ${last_cpu}%"
             embed_color="16711680"
+            fields="[{\"name\":\"Package\",\"value\":\"$pkg\",\"inline\":true}]"
             ;;
         "relog")
             embed_title="🔄 Relog"
             embed_description="**Waktu:** $timestamp"
             embed_color="16776960"
+            fields="[{\"name\":\"Package\",\"value\":\"$pkg\",\"inline\":true}]"
             ;;
         "reconnect_success")
             embed_title="✅ Connected"
@@ -370,20 +402,23 @@ send_discord_notification() {
             embed_title="📱 Split Screen"
             embed_description="**2nd Package:** $details\n**Waktu:** $timestamp"
             embed_color="255255"
+            fields="[{\"name\":\"Package\",\"value\":\"$pkg\",\"inline\":true}]"
             ;;
         "floating")
             embed_title="🪟 Floating Window"
             embed_description="**Package:** $details\n**Waktu:** $timestamp"
             embed_color="16711935"
+            fields="[{\"name\":\"Package\",\"value\":\"$pkg\",\"inline\":true}]"
             ;;
     esac
+
     local mention=""
     if [ -n "$DISCORD_USER_ID" ]; then
         mention="<@$DISCORD_USER_ID> "
     fi
-    local payload
-    if [ "$event_type" = "reconnect_success" ]; then
-        payload=$(cat <<EOF
+
+    # Semua notifikasi gunakan layout yang sama: footer icon, tanpa thumbnail besar
+    local payload=$(cat <<EOF
 {
   "username": "$BOT_USERNAME",
   "avatar_url": "$BOT_AVATAR_URL",
@@ -392,9 +427,6 @@ send_discord_notification() {
     "title": "$embed_title",
     "description": "$embed_description",
     "color": $embed_color,
-    "thumbnail": {
-      "url": "$BOT_AVATAR_URL"
-    },
     "fields": $fields,
     "footer": {
       "text": "$BOT_USERNAME",
@@ -405,29 +437,6 @@ send_discord_notification() {
 }
 EOF
 )
-    else
-        payload=$(cat <<EOF
-{
-  "username": "$BOT_USERNAME",
-  "avatar_url": "$BOT_AVATAR_URL",
-  "content": "$mention",
-  "embeds": [{
-    "title": "$embed_title",
-    "description": "$embed_description",
-    "color": $embed_color,
-    "fields": [
-      {
-        "name": "Package",
-        "value": "$pkg",
-        "inline": true
-      }
-    ],
-    "timestamp": "$(date -u +%Y-%m-%dT%H:%M:%S.000Z)"
-  }]
-}
-EOF
-)
-    fi
     curl -s -X POST "$DISCORD_WEBHOOK" \
         -H "Content-Type: application/json" \
         -d "$payload" > /dev/null 2>&1 &
@@ -1136,7 +1145,7 @@ join_server() {
 wait_ingame() {
     local pkg=$1
     log_pkg "$pkg" "👀 Menunggu INGAME..."
-    local pid=$(pgrep -f "$pkg" | head -1)
+    local pid=$(pgrep -f "$pkg" 2>/dev/null | head -1)
     if [ -z "$pid" ]; then
         log_pkg "$pkg" "⚠️ Proses tidak ditemukan, skip wait_ingame"
         return
@@ -1148,6 +1157,8 @@ wait_ingame() {
         IP=$(logcat --pid="$pid" -v time 2>/dev/null | grep -oE "([0-9]{1,3}\.){3}[0-9]{1,3}" | head -1)
         log_pkg "$pkg" "✅ INGAME! IP: $IP"
         echo "$IP" > "$state_dir/last_ip"
+        # Simpan stats terakhir
+        save_last_stats "$pkg"
         send_discord_notification "reconnect_success" "$IP" "$pkg"
     else
         log_pkg "$pkg" "⏱️ Timeout"
@@ -1161,7 +1172,7 @@ verify_ingame_stable() {
     log_pkg "$pkg" "🔁 Tight-monitor 20s pasca-join (fase paling rawan crash)..."
     while [ $checks -lt 20 ]; do
         sleep 1
-        if ! ps -A 2>/dev/null | grep -q "$pkg"; then
+        if ! pgrep -f "$pkg" >/dev/null 2>&1; then
             log_pkg "$pkg" "💥 $pkg mati di fase join — rejoin paksa"
             sleep 2
             source "$cfg_file"
@@ -1183,7 +1194,7 @@ monitor_events() {
     log_pkg "$pkg" "🔍 Monitor aktif"
     local pid
     while true; do
-        pid=$(pgrep -f "$pkg" | head -1)
+        pid=$(pgrep -f "$pkg" 2>/dev/null | head -1)
         if [ -n "$pid" ]; then
             break
         fi
@@ -1200,6 +1211,8 @@ monitor_events() {
                 reason="Disconnected"
             fi
             log_pkg "$pkg" "❌ DC: $reason"
+            # Simpan stats terakhir sebelum disconnect
+            save_last_stats "$pkg"
             send_discord_notification "disconnect" "$reason" "$pkg"
             sleep 3
             source "$cfg_file"
@@ -1217,18 +1230,27 @@ monitor_events() {
 crash_monitor() {
     local pkg=$1
     local cfg_file=$2
+    local missing_count=0
     while true; do
-        if ! ps -A 2>/dev/null | grep -q "$pkg"; then
-            log_pkg "$pkg" "💥 Crash detected"
-            send_discord_notification "crash" "App crashed" "$pkg"
-            sleep 3
-            source "$cfg_file"
-            local active_url=$(get_active_url "$MODE" "$URL")
-            join_server "$pkg" "$active_url" "$MODE"
-            wait_ingame "$pkg"
-            verify_ingame_stable "$pkg" "$cfg_file"
-            pkill -f "monitor_events $pkg" 2>/dev/null
-            monitor_events "$pkg" "$cfg_file" &
+        if pgrep -f "$pkg" >/dev/null 2>&1; then
+            missing_count=0
+        else
+            missing_count=$((missing_count + 1))
+            if [ $missing_count -ge 3 ]; then
+                log_pkg "$pkg" "💥 Crash detected"
+                # Simpan stats terakhir sebelum crash
+                save_last_stats "$pkg"
+                send_discord_notification "crash" "App crashed" "$pkg"
+                sleep 3
+                source "$cfg_file"
+                local active_url=$(get_active_url "$MODE" "$URL")
+                join_server "$pkg" "$active_url" "$MODE"
+                wait_ingame "$pkg"
+                verify_ingame_stable "$pkg" "$cfg_file"
+                pkill -f "monitor_events $pkg" 2>/dev/null
+                monitor_events "$pkg" "$cfg_file" &
+                missing_count=0
+            fi
         fi
         sleep 5
     done
