@@ -2,11 +2,11 @@
 
 # ─────────────────────────────────────────
 #   ROBLOX AUTO RECONNECT + AUTO RELOG
-#   by: Wardz | versi: 2.11 (Sphinx Branding + Dynamic Status)
-#   Perbaikan: - Bot username & avatar Sphinx Community
-#              - Status update title: "Connected" jika ada online, "Disconnected" jika semua offline
-#              - Tambahan persentase RAM usage per package
-#              - Semua notifikasi menggunakan brand Sphinx
+#   by: Wardz | versi: 2.12 (Sphinx Dashboard - Full Stats)
+#   Perbaikan: - Title "Connected" jika ada online, "Disconnected" jika semua offline
+#              - Tampilkan RAM (MB & %), CPU, Uptime, IP per package
+#              - Bot username & avatar Sphinx Community
+#              - Log pengiriman status update
 # ─────────────────────────────────────────
 
 PKG1=""
@@ -218,7 +218,6 @@ get_pkg_status() {
         local rss_kb=$(ps -o rss= -p $pid 2>/dev/null | tr -d ' ' | head -1)
         if [ -n "$rss_kb" ] && [ "$rss_kb" -gt 0 ]; then
             ram_mb=$(echo "scale=1; $rss_kb/1024" | bc)
-            # Dapatkan total RAM
             local total_kb=$(grep MemTotal /proc/meminfo 2>/dev/null | awk '{print $2}')
             if [ -n "$total_kb" ] && [ "$total_kb" -gt 0 ]; then
                 ram_percent=$(echo "scale=1; $rss_kb*100/$total_kb" | bc)
@@ -257,18 +256,21 @@ send_status_update() {
     fields=${fields%,}
     local device=$(getprop ro.product.model 2>/dev/null || echo "Unknown")
     local timestamp=$(date -u +%Y-%m-%dT%H:%M:%S.000Z)
-    # Tentukan judul berdasarkan status koneksi
+    # Tentukan judul dan warna berdasarkan status koneksi
     local title=""
+    local color=5814783
     if [ $online_count -gt 0 ]; then
-        title="Connected"
+        title="Connected ✅"
+        color=65280
     else
-        title="Disconnected"
+        title="Disconnected ❌"
+        color=16711680
     fi
     local embed=$(cat <<EOF
 {
   "title": "$title",
   "description": "**Device:** $device\n**Online:** $online_count | **Offline:** $offline_count | **Total:** ${#PKGS[@]}",
-  "color": 5814783,
+  "color": $color,
   "thumbnail": {
     "url": "$BOT_AVATAR_URL"
   },
@@ -281,9 +283,11 @@ send_status_update() {
 }
 EOF
 )
+    # Kirim dengan username & avatar
     curl -s -X POST "$DISCORD_WEBHOOK" \
         -H "Content-Type: application/json" \
         -d "{\"username\":\"$BOT_USERNAME\",\"avatar_url\":\"$BOT_AVATAR_URL\",\"embeds\":[$embed]}" > /dev/null 2>&1 &
+    echo "  📤 Status update sent: $title ($online_count online, $offline_count offline)"
 }
 
 # ─────────────────────────────────────────
@@ -1227,6 +1231,7 @@ if [ "$USE_MULTI_PKG" = "1" ] && [ -n "$PKG2" ]; then
 fi
 
 if [ "$DISCORD_ENABLED" = "1" ] && [ -n "$DISCORD_WEBHOOK" ]; then
+    # Kirim status awal
     send_status_update
     while true; do
         sleep $STATUS_INTERVAL
