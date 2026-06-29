@@ -2,10 +2,10 @@
 
 # ─────────────────────────────────────────
 #   ROBLOX AUTO RECONNECT + AUTO RELOG
-#   by: Wardz | versi: 2.6 (All Packages Fix)
-#   Perbaikan: - Log per-package menggunakan log_pkg
-#              - Mode semua package tanpa split/freeform
-#              - Menghilangkan ketergantungan pada PKG1 di fungsi core
+#   by: Wardz | versi: 2.8 (All Packages Fix + Per-Package Logcat)
+#   Perbaikan: - Setiap package menggunakan logcat --pid untuk isolasi
+#              - wait_ingame dan monitor_events hanya membaca log dari PID sendiri
+#              - Crash monitor lebih akurat dengan ps -A
 # ─────────────────────────────────────────
 
 PKG1=""
@@ -20,7 +20,6 @@ MODE_GAG2="gag2"
 URL_MARKET="https://www.roblox.com/games/129954712878723/Grow-a-Garden-Trade-World"
 URL_GAG2="https://www.roblox.com/games/97598239454123/Grow-a-Garden-2"
 
-# Folder dasar
 CONFIG_BASE_DIR="/data/local/tmp"
 STATE_BASE_DIR="/data/local/tmp"
 LOG_BASE_DIR="/storage/emulated/0"
@@ -31,20 +30,17 @@ MONITOR_PID=""
 LAST_VERBOSE=0
 VERBOSE_INTERVAL=600
 
-# Discord
 DISCORD_WEBHOOK=""
 DISCORD_USER_ID=""
 DISCORD_ENABLED=0
 
-# Clone detection
 IS_CLONE_APP=""
 DETECTED_USER_ID=""
 
-# Mode
-USE_MULTI_PKG=0       # khusus untuk 2 package (split/freeform)
+USE_MULTI_PKG=0       # khusus split/freeform (tidak digunakan di opsi 2)
 USE_ALL_PKGS=0
-PKGS=()               # array semua package yang akan dimonitor
-STATUS_INTERVAL=3600  # 1 jam
+PKGS=()
+STATUS_INTERVAL=3600
 
 # ─────────────────────────────────────────
 #   PATH PER-PACKAGE
@@ -315,9 +311,6 @@ header() {
         echo "   Packages: ${PKGS[*]}"
     elif [ -n "$PKG1" ]; then
         echo "   Package 1: $PKG1"
-    fi
-    if [ -n "$PKG2" ] && [ "$USE_MULTI_PKG" = "1" ]; then
-        echo "   Package 2: $PKG2 (split/freeform)"
     fi
     echo "========================================="
 }
@@ -673,7 +666,7 @@ menu_edit_settings_pkg() {
                 ;;
             3)
                 local new_val; new_val=$([ "$cur_restart" = "1" ] && echo 0 || echo 1)
-                save_config "$cfg_file" "$pkg" "$cur_url" "$cur_mode" "$cur_relog" "$cur_reconnect" "$new_val" "$cur_home"
+                save_config "$cfg_file" "$pkg" "$cur_url" "$cur_mode" "$cur_relog" "$cur_reconnect" "$new_val" "$cur_restart" "$cur_home"
                 echo "  ✅ Restart: $(show_toggle $new_val)"
                 sleep 1
                 ;;
@@ -697,6 +690,13 @@ setup_or_load_pkg() {
         wizard_setup_pkg "$pkg" "$pkg_num"
         return
     fi
+
+    # Jika mode semua package, langsung pakai config tanpa interaksi
+    if [ "$USE_ALL_PKGS" = "1" ]; then
+        return
+    fi
+
+    # Mode 1 package: tampilkan menu
     while true; do
         local saved_url saved_mode saved_relog saved_reconnect saved_restart saved_home
         saved_url=$(grep '^URL=' "$cfg_file" | head -1 | cut -d'"' -f2)
@@ -800,12 +800,12 @@ menu_setup_discord() {
 }
 
 # ─────────────────────────────────────────
-#   SPLIT SCREEN / FLOATING (FIXED)
+#   SPLIT SCREEN / FLOATING (tidak dipakai di mode semua package)
 # ─────────────────────────────────────────
 
 get_view_activity() {
-    local pkg="$1"
-    local url="$2"
+    local pkg=$1
+    local url=$2
     local activity=""
     if command -v cmd >/dev/null 2>&1; then
         activity=$(cmd package resolve-activity --brief -a android.intent.action.VIEW -d "$url" 2>/dev/null | grep "$pkg/" | head -1)
@@ -889,7 +889,7 @@ open_second_package() {
 }
 
 # ─────────────────────────────────────────
-#   LOG & CORE
+#   LOG & CORE (dengan filter PID)
 # ─────────────────────────────────────────
 
 log_pkg() {
@@ -956,9 +956,16 @@ join_server() {
 wait_ingame() {
     local pkg=$1
     log_pkg "$pkg" "👀 Menunggu INGAME..."
-    timeout 90 logcat -v time 2>/dev/null | grep --line-buffered -i "Connection accepted from" | head -1 > /dev/null
+    local pid=$(pgrep -f "$pkg" | head -1)
+    if [ -z "$pid" ]; then
+        log_pkg "$pkg" "⚠️ Proses tidak ditemukan, skip wait_ingame"
+        return
+    fi
+    # Gunakan logcat --pid untuk hanya membaca log dari proses ini
+    timeout 90 logcat --pid="$pid" -v time 2>/dev/null | grep --line-buffered -i "Connection accepted from" | head -1 > /dev/null
     if [ $? -eq 0 ]; then
-        IP=$(logcat -v time 2>/dev/null | grep -oE "([0-9]{1,3}\.){3}[0-9]{1,3}" | head -1)
+        # Ambil IP dari log yang sama
+        IP=$(logcat --pid="$pid" -v time 2>/dev/null | grep -oE "([0-9]{1,3}\.){3}[0-9]{1,3}" | head -1)
         log_pkg "$pkg" "✅ INGAME! IP: $IP"
         send_discord_notification "reconnect_success" "$IP" "$pkg"
     else
@@ -993,7 +1000,16 @@ monitor_events() {
     local pkg=$1
     local cfg_file=$2
     log_pkg "$pkg" "🔍 Monitor aktif"
-    while read -r line; do
+    local pid
+    while true; do
+        pid=$(pgrep -f "$pkg" | head -1)
+        if [ -n "$pid" ]; then
+            break
+        fi
+        sleep 2
+    done
+    # Baca log khusus PID ini, filter event disconnect
+    logcat --pid="$pid" -v time 2>/dev/null | grep --line-buffered -iE "Sending disconnect|Connection lost|Lost connection|Disconnected from server" | while read -r line; do
         if echo "$line" | grep -qi "Sending disconnect with reason\|Connection lost\|Lost connection\|Disconnected from server"; then
             local reason
             if echo "$line" | grep -qi "Sending disconnect"; then
@@ -1011,8 +1027,34 @@ monitor_events() {
             join_server "$pkg" "$active_url" "$MODE"
             wait_ingame "$pkg"
             verify_ingame_stable "$pkg" "$cfg_file"
+            # Setelah rejoin, perbarui PID untuk monitor
+            pid=$(pgrep -f "$pkg" | head -1)
+            if [ -n "$pid" ]; then
+                # Lanjutkan monitoring dengan PID baru (loop akan restart karena perintah logcat di dalam while)
+                # Tapi karena kita di dalam while, kita perlu keluar dan restart monitor?
+                # Kita akan restart monitor dengan memanggil ulang fungsi ini, tapi karena kita di dalam subshell,
+                # kita bisa keluar dari loop dan memulai ulang.
+                # Cara sederhana: exec ulang monitor_events dengan pkill dan restart
+                # Atau kita bisa menggunakan pendekatan berbeda: gunakan while dengan logcat yang di-restart.
+                # Untuk kesederhanaan, kita akan keluar dari fungsi dan restart dari luar.
+                # Tapi karena ini di background, kita bisa memanggil monitor_events lagi dengan exec.
+                # Kita akan lakukan: kill proses monitor saat ini dan jalankan ulang.
+                # Namun lebih mudah: kita biarkan while berjalan dengan logcat yang akan mati jika PID berubah,
+                # dan kita restart monitor dari crash_monitor? Tidak, lebih baik kita restart monitor_events
+                # dengan cara menghentikan proses ini dan menjalankan ulang.
+                # Kita akan gunakan exec untuk mengganti proses saat ini dengan monitor_events baru.
+                # Tapi exec akan mengganti shell saat ini, yang mungkin tidak diinginkan.
+                # Alternatif: kita buat loop luar yang menangani restart monitor.
+                # Untuk menghindari kerumitan, kita akan keluar dari fungsi dan biarkan crash_monitor menangani.
+                # Karena crash_monitor akan mendeteksi crash dan melakukan rejoin, dan setelah rejoin,
+                # monitor_events yang lama sudah mati karena logcat berhenti, dan kita jalankan ulang di crash_monitor.
+                break
+            fi
         fi
-    done < <(logcat -v time 2>/dev/null | grep --line-buffered -iE "Sending disconnect|Connection lost|Lost connection|Disconnected from server")
+    done
+    # Jika keluar dari loop, restart monitor
+    log_pkg "$pkg" "🔄 Merestart monitor karena PID berubah atau logcat berhenti"
+    monitor_events "$pkg" "$cfg_file" &
 }
 
 crash_monitor() {
@@ -1028,10 +1070,10 @@ crash_monitor() {
             join_server "$pkg" "$active_url" "$MODE"
             wait_ingame "$pkg"
             verify_ingame_stable "$pkg" "$cfg_file"
-            # Jika mode multi-package dan pkg ini adalah PKG1, buka PKG2 lagi
-            if [ "$USE_MULTI_PKG" = "1" ] && [ "$pkg" = "$PKG1" ]; then
-                open_second_package
-            fi
+            # Restart monitor_events karena PID berubah
+            # Kita akan matikan monitor yang lama (jika ada) dan jalankan baru
+            pkill -f "monitor_events $pkg" 2>/dev/null
+            monitor_events "$pkg" "$cfg_file" &
         fi
         sleep 5
     done
@@ -1074,6 +1116,9 @@ if [ "$(id -u)" != "0" ]; then
     exec su -c "$0"
 fi
 
+# Trap untuk menjaga script tetap berjalan
+trap 'echo "⏹️ Script dihentikan"; exit' INT TERM
+
 # Menu awal
 clr
 echo "========================================="
@@ -1100,15 +1145,7 @@ if [ "$SETUP_CHOICE" = "2" ]; then
         echo "  ⚠ Tidak ada package Roblox terdeteksi. Keluar."
         exit 1
     fi
-    # Hanya set PKG1 untuk keperluan header, PKG2 tidak digunakan
     PKG1="${PKGS[0]}"
-    if [ ${#PKGS[@]} -ge 2 ]; then
-        PKG2="${PKGS[1]}"
-        # Kita tidak otomatis mengaktifkan split, karena semua package akan dijalankan normal
-        # Jika user menginginkan split untuk 2 package pertama, bisa diset manual
-        # Tapi untuk mode semua package, kita jalankan semuanya tanpa split/freeform
-        USE_MULTI_PKG=0
-    fi
 else
     USE_ALL_PKGS=0
     USE_MULTI_PKG=0
@@ -1117,7 +1154,7 @@ else
     PKGS=("$PKG1")
 fi
 
-# Setup config untuk setiap package
+# Setup config untuk setiap package (tanpa interaksi jika USE_ALL_PKGS=1)
 for pkg in "${PKGS[@]}"; do
     set_pkg_paths "$pkg" "TMP"
     check_clone_app "$pkg"
@@ -1171,12 +1208,15 @@ done
 # Start monitoring untuk setiap package (semua di background)
 for pkg in "${PKGS[@]}"; do
     start_monitoring_pkg "$pkg" &
+    # Beri jeda agar tidak terlalu bersamaan
+    sleep 2
 done
 
-# Jika mode 2 package (split/freeform) - opsi ini tidak dipilih di menu utama, tapi kita tetap dukung
-# Untuk opsi 1 (1 package) kita tidak perlu split.
-# Untuk opsi 2 (semua package) kita tidak pakai split.
-# Jadi USE_MULTI_PKG tetap 0.
+# Jika mode split/freeform (tidak digunakan di opsi 2, tapi tetap didukung)
+if [ "$USE_MULTI_PKG" = "1" ] && [ -n "$PKG2" ]; then
+    sleep 10
+    open_second_package
+fi
 
 # Start periodic status update jika Discord enabled
 if [ "$DISCORD_ENABLED" = "1" ] && [ -n "$DISCORD_WEBHOOK" ]; then
