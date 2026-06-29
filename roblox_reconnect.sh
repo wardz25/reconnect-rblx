@@ -294,18 +294,18 @@ send_status_update() {
     local device=$(getprop ro.product.model 2>/dev/null || echo "Unknown")
     local desc="**Last Updated:** $last_update_str ($ago_str)\n\n"
     desc+="📱 **Device**: $device\n\n"
-    desc+="## 💻 System Stats\n"
+    desc+="### 💻 System Stats\n"
     desc+="- RAM: ${used_ram_mb}MB used (${ram_percent}%) / ${total_ram_mb}MB total\n"
     desc+="- CPU: ${cpu_load}%\n\n"
-    desc+="## 📊 Status Overview\n"
+    desc+="### 📊 Status Overview\n"
     desc+="- **Online**: $online_count\n- **Offline**: $offline_count\n- **Total**: ${#PKGS[@]}\n\n"
-    desc+="## 📦 Application Details\n"
+    desc+="### 📦 Application Details\n"
     desc+="$app_details"
 
     # Build embed
     local embed=$(cat <<EOF
 {
-  "title": "Sphinx Status Update",
+  "title": "## Sphinx Status Update",
   "description": "$desc",
   "color": 5814783,
   "thumbnail": {
