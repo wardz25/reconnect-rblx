@@ -2,11 +2,10 @@
 
 # ──────────────────────────────────────────────────────────────
 #   ROBLOX AUTO RECONNECT + AUTO RELOG
-#   by: Wardz | versi: 2.17 (Sphinx Dashboard - Kaeru Style + Emojis)
-#   Layout persis seperti Kaeru Monitor, tanpa License Key.
-#   Menampilkan Last Updated, Device, System Stats (RAM, CPU),
-#   Status Overview, Application Details (uptime | RAM | CPU).
-#   Dilengkapi emoji, nama package di Application Details.
+#   by: Wardz | versi: 2.18 (Stable Crash Detection + Kaeru Style)
+#   Perbaikan: - Crash detection lebih robust (3x check sebelum crash)
+#              - Hilangkan thumbnail di embed status (hanya footer icon)
+#              - Proses crash monitor lebih stabil
 # ──────────────────────────────────────────────────────────────
 
 PKG1=""
@@ -221,14 +220,14 @@ get_system_stats() {
 }
 
 # ──────────────────────────────────────────────────────────────
-#   DISCORD WEBHOOK – LAYOUT KAERU + EMOJI
+#   DISCORD WEBHOOK – LAYOUT KAERU + EMOJI (tanpa thumbnail)
 # ──────────────────────────────────────────────────────────────
 
 get_pkg_status() {
     local pkg=$1
     local state_dir="${STATE_BASE_DIR}/rbx_state_${pkg}"
     local ip_file="${state_dir}/last_ip"
-    local pid=$(ps -A 2>/dev/null | grep "$pkg" | grep -v grep | awk '{print $2}' | head -1)
+    local pid=$(pgrep -f "$pkg" 2>/dev/null | head -1)
     local status="Offline"
     local uptime="N/A"
     local ram_mb="N/A"
@@ -302,15 +301,12 @@ send_status_update() {
     desc+="## 📦 Application Details\n"
     desc+="$app_details"
 
-    # Build embed
+    # Build embed - TANPA THUMBNAIL, hanya footer icon
     local embed=$(cat <<EOF
 {
   "title": "Sphinx Status Update",
   "description": "$desc",
   "color": 5814783,
-  "thumbnail": {
-    "url": "$BOT_AVATAR_URL"
-  },
   "footer": {
     "text": "$BOT_USERNAME",
     "icon_url": "$BOT_AVATAR_URL"
@@ -392,9 +388,6 @@ send_discord_notification() {
     "title": "$embed_title",
     "description": "$embed_description",
     "color": $embed_color,
-    "thumbnail": {
-      "url": "$BOT_AVATAR_URL"
-    },
     "fields": $fields,
     "footer": {
       "text": "$BOT_USERNAME",
@@ -1136,7 +1129,7 @@ join_server() {
 wait_ingame() {
     local pkg=$1
     log_pkg "$pkg" "👀 Menunggu INGAME..."
-    local pid=$(pgrep -f "$pkg" | head -1)
+    local pid=$(pgrep -f "$pkg" 2>/dev/null | head -1)
     if [ -z "$pid" ]; then
         log_pkg "$pkg" "⚠️ Proses tidak ditemukan, skip wait_ingame"
         return
@@ -1161,7 +1154,7 @@ verify_ingame_stable() {
     log_pkg "$pkg" "🔁 Tight-monitor 20s pasca-join (fase paling rawan crash)..."
     while [ $checks -lt 20 ]; do
         sleep 1
-        if ! ps -A 2>/dev/null | grep -q "$pkg"; then
+        if ! pgrep -f "$pkg" >/dev/null 2>&1; then
             log_pkg "$pkg" "💥 $pkg mati di fase join — rejoin paksa"
             sleep 2
             source "$cfg_file"
@@ -1183,7 +1176,7 @@ monitor_events() {
     log_pkg "$pkg" "🔍 Monitor aktif"
     local pid
     while true; do
-        pid=$(pgrep -f "$pkg" | head -1)
+        pid=$(pgrep -f "$pkg" 2>/dev/null | head -1)
         if [ -n "$pid" ]; then
             break
         fi
@@ -1217,18 +1210,28 @@ monitor_events() {
 crash_monitor() {
     local pkg=$1
     local cfg_file=$2
+    local missing_count=0
     while true; do
-        if ! ps -A 2>/dev/null | grep -q "$pkg"; then
-            log_pkg "$pkg" "💥 Crash detected"
-            send_discord_notification "crash" "App crashed" "$pkg"
-            sleep 3
-            source "$cfg_file"
-            local active_url=$(get_active_url "$MODE" "$URL")
-            join_server "$pkg" "$active_url" "$MODE"
-            wait_ingame "$pkg"
-            verify_ingame_stable "$pkg" "$cfg_file"
-            pkill -f "monitor_events $pkg" 2>/dev/null
-            monitor_events "$pkg" "$cfg_file" &
+        if pgrep -f "$pkg" >/dev/null 2>&1; then
+            # Proses ditemukan, reset counter
+            missing_count=0
+        else
+            # Proses tidak ditemukan, increment counter
+            missing_count=$((missing_count + 1))
+            # Tunggu 3 kali check (15 detik) sebelum declare crash
+            if [ $missing_count -ge 3 ]; then
+                log_pkg "$pkg" "💥 Crash detected"
+                send_discord_notification "crash" "App crashed" "$pkg"
+                sleep 3
+                source "$cfg_file"
+                local active_url=$(get_active_url "$MODE" "$URL")
+                join_server "$pkg" "$active_url" "$MODE"
+                wait_ingame "$pkg"
+                verify_ingame_stable "$pkg" "$cfg_file"
+                pkill -f "monitor_events $pkg" 2>/dev/null
+                monitor_events "$pkg" "$cfg_file" &
+                missing_count=0
+            fi
         fi
         sleep 5
     done
