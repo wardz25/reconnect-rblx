@@ -291,168 +291,184 @@ get_pkg_status() {
 }
 
 send_status_update() {
-    if [ "$DISCORD_ENABLED" != "1" ] || [ -z "$DISCORD_WEBHOOK" ]; then
-        return
-    fi
+    if [ "$DISCORD_ENABLED" != "1" ] || [ -z "$DISCORD_WEBHOOK" ]; then return; fi
 
-    # Hitung "Last Updated"
-    local now_epoch=$(date +%s)
-    if [ "$LAST_UPDATE_EPOCH" -eq 0 ]; then
-        LAST_UPDATE_EPOCH=$now_epoch
-    fi
-    local diff=$((now_epoch - LAST_UPDATE_EPOCH))
-    local last_update_str=$(date -d "@$LAST_UPDATE_EPOCH" "+%B %d, %Y %I:%M %p" 2>/dev/null)
-    if [ -z "$last_update_str" ]; then
-        last_update_str=$(date "+%B %d, %Y %I:%M %p")
-    fi
-    local ago_str=""
-    if [ $diff -lt 60 ]; then
-        ago_str="${diff} seconds ago"
-    elif [ $diff -lt 3600 ]; then
-        ago_str="$((diff / 60)) minutes ago"
-    elif [ $diff -lt 86400 ]; then
-        ago_str="$((diff / 3600)) hours ago"
-    else
-        ago_str="$((diff / 86400)) days ago"
-    fi
+    # ── Timestamp "Last Updated" ──────────────────────────────────────────
+    local now_epoch; now_epoch=$(date +%s)
+    [ "$LAST_UPDATE_EPOCH" -eq 0 ] && LAST_UPDATE_EPOCH=$now_epoch
+    local diff=$(( now_epoch - LAST_UPDATE_EPOCH ))
+    local last_str; last_str=$(date -d "@$LAST_UPDATE_EPOCH" "+%B %d, %Y %I:%M %p" 2>/dev/null \
+        || date "+%B %d, %Y %I:%M %p")
+    local ago_str
+    if   [ $diff -lt 60 ];    then ago_str="${diff} seconds ago"
+    elif [ $diff -lt 3600 ];  then ago_str="$((diff/60)) minutes ago"
+    elif [ $diff -lt 86400 ]; then ago_str="$((diff/3600)) hours ago"
+    else ago_str="$((diff/86400)) days ago"; fi
     LAST_UPDATE_EPOCH=$now_epoch
 
-    # System stats + temperature
-    IFS='|' read -r total_ram_mb used_ram_mb ram_percent cpu_load temp <<< "$(get_system_stats)"
+    # ── System stats ─────────────────────────────────────────────────────
+    IFS='|' read -r total_ram_mb used_ram_mb ram_percent cpu_load temp \
+        <<< "$(get_system_stats)"
+    local free_ram_mb=$(( total_ram_mb - used_ram_mb ))
+    local free_pct=$(( 100 - ${ram_percent%%.*} ))
 
-    # Status overview
-    local online_count=0
-    local offline_count=0
-    local app_details=""
+    # ── Per-package rows ──────────────────────────────────────────────────
+    local online_count=0 offline_count=0 app_lines=""
     for pkg in "${PKGS[@]}"; do
-        IFS='|' read -r status uptime ram_mb cpu ip ram_percent <<< "$(get_pkg_status "$pkg")"
+        IFS='|' read -r status uptime ram_mb cpu ip ram_percent2 \
+            <<< "$(get_pkg_status "$pkg")"
+        # Tampilkan nama package singkat (hapus "com.roblox.")
+        local short="${pkg#com.roblox.}"
         if [ "$status" = "Online" ]; then
-            online_count=$((online_count+1))
-            app_details+="- $pkg: 🕐 $uptime | 💾 ${ram_mb} MB (${ram_percent}%) | ⚡ ${cpu}%\n"
+            online_count=$(( online_count + 1 ))
+            app_lines+="🟢 \`${short}\`\n"
+            app_lines+="  ↳ 🕐 ${uptime}  |  💾 ${ram_mb} MB  |  ⚡ ${cpu}%\n"
         else
-            offline_count=$((offline_count+1))
-            app_details+="- $pkg: ❌ Offline\n"
+            offline_count=$(( offline_count + 1 ))
+            app_lines+="🔴 \`${short}\`  —  Offline\n"
         fi
     done
+    local total_pkg=${#PKGS[@]}
 
-    # Build description
-    local device=$(getprop ro.product.model 2>/dev/null || echo "Unknown")
-    local desc="## Sphinx Status Update\n\n"
-    desc+="**Last Updated:** $last_update_str ($ago_str)\n\n"
-    desc+="📱 **Device**: $device\n\n"
-    desc+="### 💻 System Stats\n"
-    desc+="- RAM: ${used_ram_mb}MB used (${ram_percent}%) / ${total_ram_mb}MB total\n"
-    desc+="- CPU: ${cpu_load}%\n"
-    desc+="- Temp: ${temp}°C\n\n"
-    desc+="### 📊 Status Overview\n"
-    desc+="- **Online**: $online_count\n- **Offline**: $offline_count\n- **Total**: ${#PKGS[@]}\n\n"
-    desc+="### 📦 Application Details\n"
-    desc+="$app_details"
+    # ── Device info ───────────────────────────────────────────────────────
+    local device_model; device_model=$(getprop ro.product.model 2>/dev/null || echo "Unknown")
+    local sphinx_ver="SPHINX-$(date +%Y%m)"
 
-    # Build embed - TANPA THUMBNAIL, hanya footer icon
-    local embed=$(cat <<EOF
+    # ── Embed description (mirip Kaeru layout) ────────────────────────────
+    local desc="**Last Updated:** ${last_str} (${ago_str})\n\n"
+    desc+="📱 **Device** \`${device_model}\`  ┊  🔰 **Version** \`${sphinx_ver}\`\n\n"
+    desc+="─────────────────────────\n"
+    desc+="💻 **System Stats**\n"
+    desc+="🐏 RAM: **${free_ram_mb}MB** free (${free_pct}%)\n"
+    desc+="⚡ CPU: **${cpu_load}%**\n"
+    desc+="🌡️ Temp: **${temp}°C**\n\n"
+    desc+="─────────────────────────\n"
+    desc+="📊 **Status Overview**\n"
+    desc+="🟢 Online: **${online_count}**  ┊  🔴 Offline: **${offline_count}**  ┊  👥 Total: **${total_pkg}**\n\n"
+    desc+="─────────────────────────\n"
+    desc+="📦 **Application Details**\n"
+    desc+="${app_lines}"
+
+    local mention=""
+    [ -n "$DISCORD_USER_ID" ] && mention="<@$DISCORD_USER_ID> "
+
+    local payload
+    payload=$(cat <<SPHINX_EOF
 {
-  "description": "$desc",
-  "color": 5814783,
-  "footer": {
-    "text": "$BOT_USERNAME",
-    "icon_url": "$BOT_AVATAR_URL"
-  },
-  "timestamp": "$(date -u +%Y-%m-%dT%H:%M:%S.000Z)"
+  "username": "${BOT_USERNAME}",
+  "avatar_url": "${BOT_AVATAR_URL}",
+  "content": "${mention}",
+  "embeds": [{
+    "title": "📡 Sphinx Status Update",
+    "description": "${desc}",
+    "color": 15105570,
+    "footer": {
+      "text": "Sphinx Monitor  •  ${device_model}",
+      "icon_url": "${BOT_AVATAR_URL}"
+    },
+    "timestamp": "$(date -u +%Y-%m-%dT%H:%M:%S.000Z)"
+  }]
 }
-EOF
+SPHINX_EOF
 )
-
     curl -s -X POST "$DISCORD_WEBHOOK" \
         -H "Content-Type: application/json" \
-        -d "{\"username\":\"$BOT_USERNAME\",\"avatar_url\":\"$BOT_AVATAR_URL\",\"embeds\":[$embed]}" > /dev/null 2>&1 &
-    echo "  📤 Status update sent"
+        -d "$payload" > /dev/null 2>&1 &
 }
 
 send_discord_notification() {
     local event_type=$1
     local details=$2
     local pkg=$3
-    if [ "$DISCORD_ENABLED" != "1" ] || [ -z "$DISCORD_WEBHOOK" ]; then
-        return
-    fi
-    local timestamp=$(date '+%Y-%m-%d %H:%M:%S')
-    local embed_color="16711680"
-    local embed_title="⚠️ Event"
-    local embed_description=""
-    local fields="[]"
+    if [ "$DISCORD_ENABLED" != "1" ] || [ -z "$DISCORD_WEBHOOK" ]; then return; fi
 
-    # Baca stats terakhir (jika ada)
-    IFS='|' read -r last_uptime last_ram last_cpu last_ram_percent <<< "$(get_last_stats "$pkg")"
+    local timestamp; timestamp=$(date '+%Y-%m-%d %H:%M:%S')
+    local short_pkg="${pkg#com.roblox.}"
+    local embed_color embed_title embed_desc fields
+
+    # Stats terakhir package yang bersangkutan
+    IFS='|' read -r last_uptime last_ram last_cpu last_rampct \
+        <<< "$(get_last_stats "$pkg")"
+
+    # System stats saat event
+    IFS='|' read -r total_ram_mb used_ram_mb ram_pct cpu_load temp \
+        <<< "$(get_system_stats)"
+    local device_model; device_model=$(getprop ro.product.model 2>/dev/null || echo "Unknown")
+    local free_ram=$(( total_ram_mb - used_ram_mb ))
 
     case $event_type in
         "disconnect")
             embed_title="❌ Disconnected"
-            embed_description="**Alasan:** $details\n**Waktu:** $timestamp\n\n**Stats terakhir sebelum DC:**\n🕐 Uptime: $last_uptime\n💾 RAM: ${last_ram} MB (${last_ram_percent}%)\n⚡ CPU: ${last_cpu}%"
-            embed_color="16711680"
-            fields="[{\"name\":\"Package\",\"value\":\"$pkg\",\"inline\":true}]"
+            embed_color=15548997
+            embed_desc="**Package:** \`${short_pkg}\`\n**Alasan:** ${details}\n**Waktu:** ${timestamp}\n\n"
+            embed_desc+="📊 **Stats sebelum DC**\n"
+            embed_desc+="🕐 Uptime: ${last_uptime}\n💾 RAM: ${last_ram} MB (${last_rampct}%)\n⚡ CPU: ${last_cpu}%"
             ;;
         "crash")
-            embed_title="💥 Crash"
-            embed_description="**Waktu:** $timestamp\n\n**Stats terakhir sebelum crash:**\n🕐 Uptime: $last_uptime\n💾 RAM: ${last_ram} MB (${last_ram_percent}%)\n⚡ CPU: ${last_cpu}%"
-            embed_color="16711680"
-            fields="[{\"name\":\"Package\",\"value\":\"$pkg\",\"inline\":true}]"
+            embed_title="💥 App Crash"
+            embed_color=15548997
+            embed_desc="**Package:** \`${short_pkg}\`\n**Info:** ${details}\n**Waktu:** ${timestamp}\n\n"
+            embed_desc+="📊 **Stats sebelum crash**\n"
+            embed_desc+="🕐 Uptime: ${last_uptime}\n💾 RAM: ${last_ram} MB\n⚡ CPU: ${last_cpu}%"
             ;;
         "relog")
             embed_title="🔄 Relog"
-            embed_description="**Waktu:** $timestamp"
-            embed_color="16776960"
-            fields="[{\"name\":\"Package\",\"value\":\"$pkg\",\"inline\":true}]"
+            embed_color=16776960
+            embed_desc="**Package:** \`${short_pkg}\`\n**Waktu:** ${timestamp}"
             ;;
         "reconnect_success")
-            embed_title="✅ Connected"
-            embed_description="**Server IP:** $details\n**Waktu:** $timestamp"
-            embed_color="65280"
-            IFS='|' read -r status uptime ram_mb cpu ip ram_percent <<< "$(get_pkg_status "$pkg")"
-            if [ "$status" = "Online" ]; then
-                fields="[{\"name\":\"Package\",\"value\":\"$pkg\",\"inline\":true},{\"name\":\"Uptime\",\"value\":\"🕐 $uptime\",\"inline\":true},{\"name\":\"RAM\",\"value\":\"💾 ${ram_mb} MB (${ram_percent}%)\",\"inline\":true},{\"name\":\"CPU\",\"value\":\"⚡ ${cpu}%\",\"inline\":true}]"
-            else
-                fields="[{\"name\":\"Package\",\"value\":\"$pkg\",\"inline\":true}]"
-            fi
+            embed_title="✅ Account Recovered"
+            embed_color=5763719
+            IFS='|' read -r s uptime ram_mb cpu ip rp <<< "$(get_pkg_status "$pkg")"
+            embed_desc="**Package:** \`${short_pkg}\`\n**Server:** ${details}\n**Waktu:** ${timestamp}\n\n"
+            embed_desc+="📊 **Stats sekarang**\n"
+            embed_desc+="🕐 Uptime: ${uptime}\n💾 RAM: ${ram_mb} MB (${rp}%)\n⚡ CPU: ${cpu}%"
             ;;
         "split")
             embed_title="📱 Split Screen"
-            embed_description="**2nd Package:** $details\n**Waktu:** $timestamp"
-            embed_color="255255"
-            fields="[{\"name\":\"Package\",\"value\":\"$pkg\",\"inline\":true}]"
+            embed_color=3447003
+            embed_desc="**Packages:** \`${short_pkg}\`\n**Waktu:** ${timestamp}"
             ;;
         "floating")
-            embed_title="🪟 Floating Window"
-            embed_description="**Package:** $details\n**Waktu:** $timestamp"
-            embed_color="16711935"
-            fields="[{\"name\":\"Package\",\"value\":\"$pkg\",\"inline\":true}]"
+            embed_title="🪟 Freeform Window"
+            embed_color=10181046
+            embed_desc="**Package:** \`${short_pkg}\`\n**Waktu:** ${timestamp}"
+            ;;
+        "lag")
+            embed_title="⚠️ Frame Drop"
+            embed_color=16776960
+            embed_desc="**Package:** \`${short_pkg}\`\n**Detail:** ${details}\n**Waktu:** ${timestamp}"
+            ;;
+        *)
+            embed_title="ℹ️ Info"
+            embed_color=9807270
+            embed_desc="**Package:** \`${short_pkg}\`\n**Detail:** ${details}\n**Waktu:** ${timestamp}"
             ;;
     esac
 
     local mention=""
-    if [ -n "$DISCORD_USER_ID" ]; then
-        mention="<@$DISCORD_USER_ID> "
-    fi
+    [ -n "$DISCORD_USER_ID" ] && mention="<@$DISCORD_USER_ID> "
 
-    # Semua notifikasi gunakan layout yang sama: footer icon, tanpa thumbnail besar
-    local payload=$(cat <<EOF
+    local sys_footer="📱 ${device_model}  |  🐏 RAM free: ${free_ram}MB  |  ⚡ CPU: ${cpu_load}%  |  🌡️ ${temp}°C"
+
+    local payload
+    payload=$(cat <<SPHINX_EOF
 {
-  "username": "$BOT_USERNAME",
-  "avatar_url": "$BOT_AVATAR_URL",
-  "content": "$mention",
+  "username": "${BOT_USERNAME}",
+  "avatar_url": "${BOT_AVATAR_URL}",
+  "content": "${mention}",
   "embeds": [{
-    "title": "$embed_title",
-    "description": "$embed_description",
-    "color": $embed_color,
-    "fields": $fields,
+    "title": "${embed_title}",
+    "description": "${embed_desc}",
+    "color": ${embed_color},
     "footer": {
-      "text": "$BOT_USERNAME",
-      "icon_url": "$BOT_AVATAR_URL"
+      "text": "${sys_footer}  •  Sphinx Monitor",
+      "icon_url": "${BOT_AVATAR_URL}"
     },
     "timestamp": "$(date -u +%Y-%m-%dT%H:%M:%S.000Z)"
   }]
 }
-EOF
+SPHINX_EOF
 )
     curl -s -X POST "$DISCORD_WEBHOOK" \
         -H "Content-Type: application/json" \
