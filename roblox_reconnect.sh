@@ -2,11 +2,10 @@
 
 # ─────────────────────────────────────────
 #   ROBLOX AUTO RECONNECT + AUTO RELOG
-#   by: Wardz | versi: 2.12 (Sphinx Dashboard - Full Stats)
-#   Perbaikan: - Title "Connected" jika ada online, "Disconnected" jika semua offline
-#              - Tampilkan RAM (MB & %), CPU, Uptime, IP per package
-#              - Bot username & avatar Sphinx Community
-#              - Log pengiriman status update
+#   by: Wardz | versi: 2.13 (Sphinx Dashboard + Connected with Stats)
+#   Perbaikan: - Status update pertama ditunda 15 detik
+#              - Notifikasi Connected memiliki format Sphinx + CPU/RAM
+#              - Thumbnail & footer Sphinx di semua embed
 # ─────────────────────────────────────────
 
 PKG1=""
@@ -117,7 +116,7 @@ check_clone_app() {
 }
 
 # ─────────────────────────────────────────
-#   DISCORD WEBHOOK
+#   DISCORD WEBHOOK (dengan format Sphinx untuk Connected)
 # ─────────────────────────────────────────
 
 send_discord_notification() {
@@ -132,6 +131,7 @@ send_discord_notification() {
     local embed_color="16711680"
     local embed_title="⚠️ Event"
     local embed_description=""
+    local fields="[]"
     case $event_type in
         "disconnect")
             embed_title="❌ Disconnected"
@@ -149,9 +149,16 @@ send_discord_notification() {
             embed_color="16776960"
             ;;
         "reconnect_success")
-            embed_title="✅ Connected"
+            embed_title="Connected ✅"
             embed_description="**Server IP:** $details\n**Waktu:** $timestamp"
             embed_color="65280"
+            # Ambil status CPU/RAM dari package
+            IFS='|' read -r status uptime ram_mb cpu ip ram_percent <<< "$(get_pkg_status "$pkg")"
+            if [ "$status" = "Online" ]; then
+                fields="[{\"name\":\"Package\",\"value\":\"$pkg\",\"inline\":true},{\"name\":\"Uptime\",\"value\":\"$uptime\",\"inline\":true},{\"name\":\"RAM\",\"value\":\"${ram_mb} MB (${ram_percent}%)\",\"inline\":true},{\"name\":\"CPU\",\"value\":\"${cpu}%\",\"inline\":true}]"
+            else
+                fields="[{\"name\":\"Package\",\"value\":\"$pkg\",\"inline\":true}]"
+            fi
             ;;
         "split")
             embed_title="📱 Split Screen"
@@ -168,7 +175,32 @@ send_discord_notification() {
     if [ -n "$DISCORD_USER_ID" ]; then
         mention="<@$DISCORD_USER_ID> "
     fi
-    local payload=$(cat <<EOF
+    local payload
+    if [ "$event_type" = "reconnect_success" ]; then
+        payload=$(cat <<EOF
+{
+  "username": "$BOT_USERNAME",
+  "avatar_url": "$BOT_AVATAR_URL",
+  "content": "$mention",
+  "embeds": [{
+    "title": "$embed_title",
+    "description": "$embed_description",
+    "color": $embed_color,
+    "thumbnail": {
+      "url": "$BOT_AVATAR_URL"
+    },
+    "fields": $fields,
+    "footer": {
+      "text": "$BOT_USERNAME",
+      "icon_url": "$BOT_AVATAR_URL"
+    },
+    "timestamp": "$(date -u +%Y-%m-%dT%H:%M:%S.000Z)"
+  }]
+}
+EOF
+)
+    else
+        payload=$(cat <<EOF
 {
   "username": "$BOT_USERNAME",
   "avatar_url": "$BOT_AVATAR_URL",
@@ -189,6 +221,7 @@ send_discord_notification() {
 }
 EOF
 )
+    fi
     curl -s -X POST "$DISCORD_WEBHOOK" \
         -H "Content-Type: application/json" \
         -d "$payload" > /dev/null 2>&1 &
@@ -256,7 +289,6 @@ send_status_update() {
     fields=${fields%,}
     local device=$(getprop ro.product.model 2>/dev/null || echo "Unknown")
     local timestamp=$(date -u +%Y-%m-%dT%H:%M:%S.000Z)
-    # Tentukan judul dan warna berdasarkan status koneksi
     local title=""
     local color=5814783
     if [ $online_count -gt 0 ]; then
@@ -283,7 +315,6 @@ send_status_update() {
 }
 EOF
 )
-    # Kirim dengan username & avatar
     curl -s -X POST "$DISCORD_WEBHOOK" \
         -H "Content-Type: application/json" \
         -d "{\"username\":\"$BOT_USERNAME\",\"avatar_url\":\"$BOT_AVATAR_URL\",\"embeds\":[$embed]}" > /dev/null 2>&1 &
@@ -735,12 +766,10 @@ setup_or_load_pkg() {
         return
     fi
 
-    # Jika mode semua package, langsung pakai config tanpa interaksi
     if [ "$USE_ALL_PKGS" = "1" ]; then
         return
     fi
 
-    # Mode 1 package: tampilkan menu
     while true; do
         local saved_url saved_mode saved_relog saved_reconnect saved_restart saved_home
         saved_url=$(grep '^URL=' "$cfg_file" | head -1 | cut -d'"' -f2)
@@ -933,7 +962,7 @@ open_second_package() {
 }
 
 # ─────────────────────────────────────────
-#   LOG & CORE (dengan filter PID)
+#   LOG & CORE
 # ─────────────────────────────────────────
 
 log_pkg() {
@@ -1093,10 +1122,6 @@ crash_monitor() {
     done
 }
 
-# ─────────────────────────────────────────
-#   START MONITORING UNTUK SATU PACKAGE
-# ─────────────────────────────────────────
-
 start_monitoring_pkg() {
     local pkg=$1
     local cfg_file="${CONFIG_BASE_DIR}/roblox_config_${pkg}.cfg"
@@ -1170,7 +1195,6 @@ for pkg in "${PKGS[@]}"; do
     setup_or_load_pkg "$pkg" 1
 done
 
-# Baca config pertama untuk mengambil Discord settings yang tersimpan
 PKG1_CFG="${CONFIG_BASE_DIR}/roblox_config_${PKGS[0]}.cfg"
 if [ -f "$PKG1_CFG" ]; then
     DISCORD_ENABLED=$(grep '^DISCORD_ENABLED=' "$PKG1_CFG" | head -1 | cut -d= -f2)
@@ -1213,13 +1237,11 @@ if [ "$SETUP_DISCORD" = "1" ]; then
     sleep 2
 fi
 
-# Simpan Discord settings ke semua config
 echo "  💾 Saving Discord settings to all configs..."
 for pkg in "${PKGS[@]}"; do
     persist_discord_settings "${CONFIG_BASE_DIR}/roblox_config_${pkg}.cfg" "$pkg"
 done
 
-# Start monitoring untuk setiap package
 for pkg in "${PKGS[@]}"; do
     start_monitoring_pkg "$pkg" &
     sleep 2
@@ -1230,8 +1252,10 @@ if [ "$USE_MULTI_PKG" = "1" ] && [ -n "$PKG2" ]; then
     open_second_package
 fi
 
+# Kirim status update pertama setelah semua package berkesempatan online (delay 15 detik)
 if [ "$DISCORD_ENABLED" = "1" ] && [ -n "$DISCORD_WEBHOOK" ]; then
-    # Kirim status awal
+    echo "  ⏳ Menunggu 15 detik sebelum mengirim status update pertama..."
+    sleep 15
     send_status_update
     while true; do
         sleep $STATUS_INTERVAL
