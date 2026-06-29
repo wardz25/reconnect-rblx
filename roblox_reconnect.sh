@@ -2,7 +2,7 @@
 
 # ──────────────────────────────────────────────────────────────
 #   ROBLOX AUTO RECONNECT + AUTO RELOG
-#   by: Wardz | versi: 2.19 (Stable + Kaeru Style)
+#   by: Wardz | versi: 2.19
 #   Perbaikan: - Judul "Sphinx Status Update" sebagai heading di description
 #              - Disconnected/Crash tampilkan stats terakhir
 #              - Layout konsisten antara Connected/Disconnected/Crash
@@ -249,7 +249,7 @@ get_last_stats() {
 }
 
 # ──────────────────────────────────────────────────────────────
-#   DISCORD WEBHOOK – LAYOUT KAERU (tanpa thumbnail besar)
+#   DISCORD WEBHOOK
 # ──────────────────────────────────────────────────────────────
 
 get_pkg_status() {
@@ -318,23 +318,22 @@ send_status_update() {
         fi
     done
 
-    # Build description (Kaeru style with heading)
+    # Build description
     local device=$(getprop ro.product.model 2>/dev/null || echo "Unknown")
     local desc="## Sphinx Status Update\n\n"
     desc+="**Last Updated:** $last_update_str ($ago_str)\n\n"
     desc+="📱 **Device**: $device\n\n"
-    desc+="## 💻 System Stats\n"
+    desc+="### 💻 System Stats\n"
     desc+="- RAM: ${used_ram_mb}MB used (${ram_percent}%) / ${total_ram_mb}MB total\n"
     desc+="- CPU: ${cpu_load}%\n\n"
-    desc+="## 📊 Status Overview\n"
+    desc+="### 📊 Status Overview\n"
     desc+="- **Online**: $online_count\n- **Offline**: $offline_count\n- **Total**: ${#PKGS[@]}\n\n"
-    desc+="## 📦 Application Details\n"
+    desc+="### 📦 Application Details\n"
     desc+="$app_details"
 
     # Build embed - TANPA THUMBNAIL, hanya footer icon
     local embed=$(cat <<EOF
 {
-  "title": "Sphinx Status Update",
   "description": "$desc",
   "color": 5814783,
   "footer": {
@@ -349,7 +348,7 @@ EOF
     curl -s -X POST "$DISCORD_WEBHOOK" \
         -H "Content-Type: application/json" \
         -d "{\"username\":\"$BOT_USERNAME\",\"avatar_url\":\"$BOT_AVATAR_URL\",\"embeds\":[$embed]}" > /dev/null 2>&1 &
-    echo "  📤 Status update sent (Kaeru style)"
+    echo "  📤 Status update sent"
 }
 
 send_discord_notification() {
