@@ -2,10 +2,11 @@
 
 # ──────────────────────────────────────────────────────────────
 #   ROBLOX AUTO RECONNECT + AUTO RELOG
-#   by: Wardz | versi: 2.16 (Sphinx Dashboard - Kaeru Style)
+#   by: Wardz | versi: 2.17 (Sphinx Dashboard - Kaeru Style + Emojis)
 #   Layout persis seperti Kaeru Monitor, tanpa License Key.
 #   Menampilkan Last Updated, Device, System Stats (RAM, CPU),
 #   Status Overview, Application Details (uptime | RAM | CPU).
+#   Dilengkapi emoji, nama package di Application Details.
 # ──────────────────────────────────────────────────────────────
 
 PKG1=""
@@ -208,7 +209,6 @@ get_system_stats() {
     local used_ram_kb=$((total_ram_kb - avail_ram_kb))
     local used_ram_mb=$(echo "scale=0; $used_ram_kb/1024" | bc)
     local ram_percent=$(echo "scale=1; $used_ram_kb*100/$total_ram_kb" | bc)
-    # CPU: coba top, fallback load average
     local cpu_load="N/A"
     if command -v top >/dev/null; then
         cpu_load=$(top -n 1 -b 2>/dev/null | grep -m1 "^CPU:" | awk '{print $2}' | cut -d'%' -f1)
@@ -221,7 +221,7 @@ get_system_stats() {
 }
 
 # ──────────────────────────────────────────────────────────────
-#   DISCORD WEBHOOK – LAYOUT KAERU
+#   DISCORD WEBHOOK – LAYOUT KAERU + EMOJI
 # ──────────────────────────────────────────────────────────────
 
 get_pkg_status() {
@@ -283,23 +283,23 @@ send_status_update() {
         IFS='|' read -r status uptime ram_mb cpu ip ram_percent <<< "$(get_pkg_status "$pkg")"
         if [ "$status" = "Online" ]; then
             online_count=$((online_count+1))
-            app_details+="- **$uptime** | **${ram_mb} MB (${ram_percent}%)** | **${cpu}%**\n"
+            app_details+="- **$pkg**: $uptime | ${ram_mb} MB (${ram_percent}%) | ${cpu}%\n"
         else
             offline_count=$((offline_count+1))
-            app_details+="- **Offline**\n"
+            app_details+="- **$pkg**: Offline\n"
         fi
     done
 
-    # Build description (Kaeru style)
+    # Build description (Kaeru style with emojis)
     local device=$(getprop ro.product.model 2>/dev/null || echo "Unknown")
-    local desc="Last Updated: $last_update_str ($ago_str)\n\n"
-    desc+="- **Device**: $device\n\n"
-    desc+="## System Stats\n"
+    local desc="**Last Updated:** $last_update_str ($ago_str)\n\n"
+    desc+="📱 **Device**: $device\n\n"
+    desc+="## 💻 System Stats\n"
     desc+="- RAM: ${used_ram_mb}MB used (${ram_percent}%) / ${total_ram_mb}MB total\n"
     desc+="- CPU: ${cpu_load}%\n\n"
-    desc+="## Status Overview\n"
+    desc+="## 📊 Status Overview\n"
     desc+="- **Online**: $online_count\n- **Offline**: $offline_count\n- **Total**: ${#PKGS[@]}\n\n"
-    desc+="## Application Details\n"
+    desc+="## 📦 Application Details\n"
     desc+="$app_details"
 
     # Build embed
@@ -356,7 +356,7 @@ send_discord_notification() {
             embed_color="16776960"
             ;;
         "reconnect_success")
-            embed_title="Connected ✅"
+            embed_title="✅ Connected"
             embed_description="**Server IP:** $details\n**Waktu:** $timestamp"
             embed_color="65280"
             IFS='|' read -r status uptime ram_mb cpu ip ram_percent <<< "$(get_pkg_status "$pkg")"
