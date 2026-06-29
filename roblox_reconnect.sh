@@ -2,11 +2,11 @@
 
 # ─────────────────────────────────────────
 #   ROBLOX AUTO RECONNECT + AUTO RELOG
-#   by: Wardz | versi: 2.9 (Sphinx Community Dashboard)
-#   Perbaikan: - Dashboard ala Kaeru dengan branding Sphinx
-#              - IP per package disimpan dan ditampilkan
-#              - Thumbnail & footer menggunakan gambar dari raw GitHub
-#              - Status update lebih informatif
+#   by: Wardz | versi: 2.11 (Sphinx Branding + Dynamic Status)
+#   Perbaikan: - Bot username & avatar Sphinx Community
+#              - Status update title: "Connected" jika ada online, "Disconnected" jika semua offline
+#              - Tambahan persentase RAM usage per package
+#              - Semua notifikasi menggunakan brand Sphinx
 # ─────────────────────────────────────────
 
 PKG1=""
@@ -38,13 +38,14 @@ DISCORD_ENABLED=0
 IS_CLONE_APP=""
 DETECTED_USER_ID=""
 
-USE_MULTI_PKG=0       # khusus split/freeform (tidak digunakan di opsi 2)
+USE_MULTI_PKG=0
 USE_ALL_PKGS=0
 PKGS=()
 STATUS_INTERVAL=3600
 
 # Sphinx branding
-SPHINX_ICON_URL="https://raw.githubusercontent.com/wardz25/updater/main/sphinx.png"
+BOT_USERNAME="Sphinx Community"
+BOT_AVATAR_URL="https://raw.githubusercontent.com/wardz25/updater/main/sphinx.png"
 
 # ─────────────────────────────────────────
 #   PATH PER-PACKAGE
@@ -169,6 +170,8 @@ send_discord_notification() {
     fi
     local payload=$(cat <<EOF
 {
+  "username": "$BOT_USERNAME",
+  "avatar_url": "$BOT_AVATAR_URL",
   "content": "$mention",
   "embeds": [{
     "title": "$embed_title",
@@ -192,7 +195,7 @@ EOF
 }
 
 # ─────────────────────────────────────────
-#   STATUS PERIODIK (Dashboard Sphinx)
+#   STATUS PERIODIK (Sphinx Dashboard)
 # ─────────────────────────────────────────
 
 get_pkg_status() {
@@ -202,9 +205,10 @@ get_pkg_status() {
     local pid=$(ps -A 2>/dev/null | grep "$pkg" | grep -v grep | awk '{print $2}' | head -1)
     local status="Offline"
     local uptime="N/A"
-    local ram="N/A"
+    local ram_mb="N/A"
     local cpu="N/A"
     local ip=""
+    local ram_percent="N/A"
     if [ -f "$ip_file" ]; then
         ip=$(cat "$ip_file")
     fi
@@ -213,14 +217,19 @@ get_pkg_status() {
         uptime=$(ps -o etime= -p $pid 2>/dev/null | tr -d ' ' | head -1)
         local rss_kb=$(ps -o rss= -p $pid 2>/dev/null | tr -d ' ' | head -1)
         if [ -n "$rss_kb" ] && [ "$rss_kb" -gt 0 ]; then
-            ram=$(echo "scale=1; $rss_kb/1024" | bc)
+            ram_mb=$(echo "scale=1; $rss_kb/1024" | bc)
+            # Dapatkan total RAM
+            local total_kb=$(grep MemTotal /proc/meminfo 2>/dev/null | awk '{print $2}')
+            if [ -n "$total_kb" ] && [ "$total_kb" -gt 0 ]; then
+                ram_percent=$(echo "scale=1; $rss_kb*100/$total_kb" | bc)
+            fi
         fi
         cpu=$(ps -o %cpu= -p $pid 2>/dev/null | tr -d ' ' | head -1)
         if [ -z "$cpu" ]; then
             cpu="N/A"
         fi
     fi
-    echo "$status|$uptime|$ram|$cpu|$ip"
+    echo "$status|$uptime|$ram_mb|$cpu|$ip|$ram_percent"
 }
 
 send_status_update() {
@@ -231,7 +240,7 @@ send_status_update() {
     local offline_count=0
     local fields=""
     for pkg in "${PKGS[@]}"; do
-        IFS='|' read -r status uptime ram cpu ip <<< "$(get_pkg_status "$pkg")"
+        IFS='|' read -r status uptime ram_mb cpu ip ram_percent <<< "$(get_pkg_status "$pkg")"
         if [ "$status" = "Online" ]; then
             online_count=$((online_count+1))
         else
@@ -239,7 +248,7 @@ send_status_update() {
         fi
         local field_value=""
         if [ "$status" = "Online" ]; then
-            field_value="**Status:** ✅ Online\n**Uptime:** $uptime\n**RAM:** ${ram} MB\n**CPU:** ${cpu}%\n**IP:** $ip"
+            field_value="**Status:** ✅ Online\n**Uptime:** $uptime\n**RAM:** ${ram_mb} MB (${ram_percent}%)\n**CPU:** ${cpu}%\n**IP:** $ip"
         else
             field_value="**Status:** ❌ Offline"
         fi
@@ -248,25 +257,33 @@ send_status_update() {
     fields=${fields%,}
     local device=$(getprop ro.product.model 2>/dev/null || echo "Unknown")
     local timestamp=$(date -u +%Y-%m-%dT%H:%M:%S.000Z)
+    # Tentukan judul berdasarkan status koneksi
+    local title=""
+    if [ $online_count -gt 0 ]; then
+        title="Connected"
+    else
+        title="Disconnected"
+    fi
     local embed=$(cat <<EOF
 {
-  "title": "Sphinx Status Update",
+  "title": "$title",
   "description": "**Device:** $device\n**Online:** $online_count | **Offline:** $offline_count | **Total:** ${#PKGS[@]}",
   "color": 5814783,
   "thumbnail": {
-    "url": "$SPHINX_ICON_URL"
+    "url": "$BOT_AVATAR_URL"
   },
   "fields": [$fields],
   "footer": {
-    "text": "Sphinx Community",
-    "icon_url": "$SPHINX_ICON_URL"
+    "text": "$BOT_USERNAME",
+    "icon_url": "$BOT_AVATAR_URL"
   },
   "timestamp": "$timestamp"
 }
 EOF
 )
-    curl -s -X POST "$DISCORD_WEBHOOK" -H "Content-Type: application/json" \
-        -d "{\"embeds\":[$embed]}" > /dev/null 2>&1 &
+    curl -s -X POST "$DISCORD_WEBHOOK" \
+        -H "Content-Type: application/json" \
+        -d "{\"username\":\"$BOT_USERNAME\",\"avatar_url\":\"$BOT_AVATAR_URL\",\"embeds\":[$embed]}" > /dev/null 2>&1 &
 }
 
 # ─────────────────────────────────────────
@@ -318,6 +335,7 @@ persist_discord_settings() {
     fi
     save_config "$cfg_file" "$pkg" "$saved_url" "$saved_mode" \
         "$saved_relog" "$saved_reconnect" "$saved_restart" "$saved_home"
+    echo "  ✅ Discord settings saved to $cfg_file"
 }
 
 # ─────────────────────────────────────────
@@ -1047,7 +1065,6 @@ monitor_events() {
             break
         fi
     done
-    # Restart monitor jika keluar dari loop
     log_pkg "$pkg" "🔄 Merestart monitor karena PID berubah atau logcat berhenti"
     monitor_events "$pkg" "$cfg_file" &
 }
@@ -1149,20 +1166,25 @@ for pkg in "${PKGS[@]}"; do
     setup_or_load_pkg "$pkg" 1
 done
 
+# Baca config pertama untuk mengambil Discord settings yang tersimpan
 PKG1_CFG="${CONFIG_BASE_DIR}/roblox_config_${PKGS[0]}.cfg"
 if [ -f "$PKG1_CFG" ]; then
     DISCORD_ENABLED=$(grep '^DISCORD_ENABLED=' "$PKG1_CFG" | head -1 | cut -d= -f2)
     DISCORD_WEBHOOK=$(grep '^DISCORD_WEBHOOK=' "$PKG1_CFG" | head -1 | cut -d'"' -f2)
     DISCORD_USER_ID=$(grep '^DISCORD_USER_ID=' "$PKG1_CFG" | head -1 | cut -d'"' -f2)
+    echo "  📥 Discord settings loaded from config: ENABLED=$DISCORD_ENABLED"
+else
+    echo "  ⚠ Config file not found, using defaults"
 fi
 
 clr
 header
 echo ""
-if [ "$DISCORD_ENABLED" = "1" ]; then
-    echo "  🔔 Discord webhook udah aktif dari setup sebelumnya."
+if [ "$DISCORD_ENABLED" = "1" ] && [ -n "$DISCORD_WEBHOOK" ]; then
+    echo "  🔔 Discord webhook sudah aktif (${DISCORD_WEBHOOK:0:30}...)"
     echo "  Mau ganti webhook/user ID?"
 else
+    echo "  🔔 Discord webhook belum diatur atau tidak aktif."
     echo "  Mau setup Discord webhook?"
 fi
 printf "  (1=YES, 0=NO/biarkan): "
@@ -1187,10 +1209,13 @@ if [ "$SETUP_DISCORD" = "1" ]; then
     sleep 2
 fi
 
+# Simpan Discord settings ke semua config
+echo "  💾 Saving Discord settings to all configs..."
 for pkg in "${PKGS[@]}"; do
     persist_discord_settings "${CONFIG_BASE_DIR}/roblox_config_${pkg}.cfg" "$pkg"
 done
 
+# Start monitoring untuk setiap package
 for pkg in "${PKGS[@]}"; do
     start_monitoring_pkg "$pkg" &
     sleep 2
