@@ -2,7 +2,10 @@
 
 # ─────────────────────────────────────────
 #   ROBLOX AUTO RECONNECT + AUTO RELOG
-#   by: Wardz | versi: 2.4 (Multi-Package Split + Discord)
+#   by: Wardz | versi: 2.4 (Multi-Package Split + Discord) - FIXED SPLIT/FREEFORM
+#   Perbaikan: - Menggunakan -n + activity untuk split/freeform
+#              - Deteksi windowingMode lebih akurat
+#              - Fungsi get_view_activity untuk resolve activity penangan URL
 # ─────────────────────────────────────────
 
 PKG1=""
@@ -28,14 +31,6 @@ MONITOR_PID=""
 LAST_VERBOSE=0
 VERBOSE_INTERVAL=600
 
-# Monitoring engine
-JOIN_TIMEOUT=90
-MONITOR_PID1=""
-MONITOR_PID2=""
-TIMEOUT_PID1=""
-TIMEOUT_PID2=""
-RECONNECT_MODE="stayps"   # stayps = selalu rejoin PS apapun | normal = cek doTeleport dulu
-
 # Discord
 DISCORD_WEBHOOK=""
 DISCORD_USER_ID=""
@@ -48,11 +43,6 @@ DETECTED_USER_ID=""
 # Split mode
 USE_MULTI_PKG=0
 SPLIT_ENABLED=0
-DISPLAY_MODE="none"
-FREEFORM_LAYOUT="column"
-FREEFORM_PKG_LIST=""
-USE_ALL_PKGS=0
-ALL_DETECTED_PKGS=()
 
 # ─────────────────────────────────────────
 #   PATH PER-PACKAGE
@@ -74,7 +64,7 @@ set_pkg_paths() {
 
 # ─────────────────────────────────────────
 #   DETEKSI CLONE APP
-# ────────────────────────────────���────────
+# ─────────────────────────────────────────
 
 detect_clone_app_method() {
     local pkg=$1
@@ -132,58 +122,6 @@ check_clone_app() {
 }
 
 # ─────────────────────────────────────────
-#   DEVICE & SYSTEM INFO
-# ─────────────────────────────────────────
-
-get_device_info() {
-    DEVICE_MODEL=$(getprop ro.product.model 2>/dev/null || echo "Unknown")
-    DEVICE_BRAND=$(getprop ro.product.brand 2>/dev/null || echo "Unknown")
-    ANDROID_VER=$(getprop ro.build.version.release 2>/dev/null || echo "?")
-}
-
-get_system_stats() {
-    # RAM dari /proc/meminfo
-    local mem_total mem_avail
-    mem_total=$(grep -i MemTotal /proc/meminfo 2>/dev/null | awk '{print $2}')
-    mem_avail=$(grep -i MemAvailable /proc/meminfo 2>/dev/null | awk '{print $2}')
-    mem_total="${mem_total:-0}"; mem_avail="${mem_avail:-0}"
-    RAM_TOTAL_MB=$(( mem_total / 1024 ))
-    RAM_FREE_MB=$(( mem_avail / 1024 ))
-    if [ "$mem_total" -gt 0 ]; then
-        RAM_USED_PCT=$(( (mem_total - mem_avail) * 100 / mem_total ))
-    else
-        RAM_USED_PCT=0
-    fi
-
-    # CPU: dua snapshot /proc/stat selang 0.5s
-    local c1_total c1_idle c2_total c2_idle
-    c1_total=$(awk '/^cpu /{t=$2+$3+$4+$5+$6+$7+$8; print t}' /proc/stat 2>/dev/null || echo 1)
-    c1_idle=$(awk '/^cpu /{print $5}' /proc/stat 2>/dev/null || echo 0)
-    sleep 0
-    c2_total=$(awk '/^cpu /{t=$2+$3+$4+$5+$6+$7+$8; print t}' /proc/stat 2>/dev/null || echo 1)
-    c2_idle=$(awk '/^cpu /{print $5}' /proc/stat 2>/dev/null || echo 0)
-    local diff_total=$(( c2_total - c1_total ))
-    local diff_idle=$(( c2_idle - c1_idle ))
-    if [ "$diff_total" -gt 0 ]; then
-        CPU_PCT=$(( (diff_total - diff_idle) * 100 / diff_total ))
-    else
-        CPU_PCT=0
-    fi
-
-    # Suhu thermal zone pertama yang tersedia
-    local temp_raw=0
-    for tz in /sys/class/thermal/thermal_zone*/temp; do
-        temp_raw=$(cat "$tz" 2>/dev/null || echo 0)
-        [ "$temp_raw" -gt 0 ] && break
-    done
-    if [ "$temp_raw" -gt 1000 ]; then
-        TEMP_C=$(echo "scale=1; $temp_raw / 1000" | bc 2>/dev/null || echo $(( temp_raw / 1000 )))
-    else
-        TEMP_C="$temp_raw"
-    fi
-}
-
-# ─────────────────────────────────────────
 #   DISCORD WEBHOOK
 # ─────────────────────────────────────────
 
@@ -191,18 +129,18 @@ send_discord_notification() {
     local event_type=$1
     local details=$2
     local pkg=$3
-
+    
     if [ "$DISCORD_ENABLED" != "1" ] || [ -z "$DISCORD_WEBHOOK" ]; then
         return
     fi
-
+    
     local timestamp
     timestamp=$(date '+%Y-%m-%d %H:%M:%S')
-
+    
     local embed_color="16711680"
     local embed_title="⚠️ Event"
     local embed_description=""
-
+    
     case $event_type in
         "disconnect")
             embed_title="❌ Disconnected"
@@ -211,7 +149,7 @@ send_discord_notification() {
             ;;
         "crash")
             embed_title="💥 Crash"
-            embed_description="**Info:** $details\n**Waktu:** $timestamp"
+            embed_description="**Waktu:** $timestamp"
             embed_color="16711680"
             ;;
         "relog")
@@ -221,30 +159,27 @@ send_discord_notification() {
             ;;
         "reconnect_success")
             embed_title="✅ Connected"
-            embed_description="**Server:** $details\n**Waktu:** $timestamp"
+            embed_description="**Server IP:** $details\n**Waktu:** $timestamp"
             embed_color="65280"
             ;;
         "split")
             embed_title="📱 Split Screen"
             embed_description="**2nd Package:** $details\n**Waktu:** $timestamp"
-            embed_color="3447003"
+            embed_color="255255"
             ;;
         "floating")
-            embed_title="🪟 Freeform Window"
+            embed_title="🪟 Floating Window"
             embed_description="**Package:** $details\n**Waktu:** $timestamp"
             embed_color="16711935"
             ;;
     esac
-
-    # Ambil info device dan system stats
-    get_device_info
-    get_system_stats
-
+    
     local mention=""
-    [ -n "$DISCORD_USER_ID" ] && mention="<@$DISCORD_USER_ID> "
-
-    local payload
-    payload=$(cat <<EOF
+    if [ -n "$DISCORD_USER_ID" ]; then
+        mention="<@$DISCORD_USER_ID> "
+    fi
+    
+    local payload=$(cat <<EOF
 {
   "content": "$mention",
   "embeds": [{
@@ -253,28 +188,17 @@ send_discord_notification() {
     "color": $embed_color,
     "fields": [
       {
-        "name": "📦 Package",
-        "value": "\`$pkg\`",
+        "name": "Package",
+        "value": "$pkg",
         "inline": true
-      },
-      {
-        "name": "📱 Device",
-        "value": "$DEVICE_BRAND $DEVICE_MODEL (Android $ANDROID_VER)",
-        "inline": true
-      },
-      {
-        "name": "🖥️ System",
-        "value": "RAM: ${RAM_FREE_MB}MB free (${RAM_USED_PCT}% used)\nCPU: ${CPU_PCT}%\nTemp: ${TEMP_C}°C",
-        "inline": false
       }
     ],
-    "footer": { "text": "Roblox Auto Reconnect" },
     "timestamp": "$(date -u +%Y-%m-%dT%H:%M:%S.000Z)"
   }]
 }
 EOF
 )
-
+    
     curl -s -X POST "$DISCORD_WEBHOOK" \
         -H "Content-Type: application/json" \
         -d "$payload" > /dev/null 2>&1 &
@@ -310,7 +234,6 @@ RELOG_SETIAP_JAM=$relog
 RECONNECT_OTOMATIS=$reconnect
 RESTART_KALAU_CRASH=$restart
 RECONNECT_SAAT_HOME=$home
-RECONNECT_MODE="${RECONNECT_MODE:-stayps}"
 DISCORD_ENABLED=$DISCORD_ENABLED
 DISCORD_WEBHOOK="$DISCORD_WEBHOOK"
 DISCORD_USER_ID="$DISCORD_USER_ID"
@@ -320,7 +243,7 @@ EOF
 persist_discord_settings() {
     local cfg_file=$1
     local pkg=$2
-    local saved_url saved_mode saved_relog saved_reconnect saved_restart saved_home saved_rmode
+    local saved_url saved_mode saved_relog saved_reconnect saved_restart saved_home
 
     if [ -f "$cfg_file" ]; then
         saved_url=$(grep '^URL=' "$cfg_file" | head -1 | cut -d'"' -f2)
@@ -329,8 +252,6 @@ persist_discord_settings() {
         saved_reconnect=$(grep '^RECONNECT_OTOMATIS=' "$cfg_file" | head -1 | cut -d= -f2)
         saved_restart=$(grep '^RESTART_KALAU_CRASH=' "$cfg_file" | head -1 | cut -d= -f2)
         saved_home=$(grep '^RECONNECT_SAAT_HOME=' "$cfg_file" | head -1 | cut -d= -f2)
-        saved_rmode=$(grep '^RECONNECT_MODE=' "$cfg_file" | head -1 | cut -d'"' -f2)
-        [ -n "$saved_rmode" ] && RECONNECT_MODE="$saved_rmode"
     fi
 
     save_config "$cfg_file" "$pkg" "$saved_url" "$saved_mode" \
@@ -375,25 +296,11 @@ get_mode_label() {
 # ─────────────────────────────────────────
 
 validate_discord_webhook() {
-    # Format asli Discord: https://discord.com/api/webhooks/{snowflake}/{token}
-    # - snowflake: 17-20 digit angka (Discord ID/snowflake, makin lama makin
-    #   panjang seiring waktu, jadi range bukan angka pasti)
-    # - token: 60-90 karakter alnum + underscore/hyphen (contoh asli: 68 char)
-    # - host bisa discord.com ATAU discordapp.com (alias lama, masih jalan)
-    # - boleh ada query string opsional (?thread_id=... buat forum channel)
     local url=$1
     echo "$url" | grep -qE '^https://(discord|discordapp)\.com/api/webhooks/[0-9]{17,20}/[A-Za-z0-9_-]{60,90}(\?[A-Za-z0-9_=&-]*)?$'
 }
 
 validate_private_server_url() {
-    # Terima DUA format link private/VIP server Roblox:
-    # 1) Format LAMA: games/{placeId}/{nama}?privateServerLinkCode=xxx
-    #    (juga terima accessCode= sebagai alias yang kadang dipakai)
-    # 2) Format BARU (default sejak Okt 2023): share?code=xxx&type=Server
-    #    Kalau cuma divalidasi pake regex format lama, link share yang
-    #    sekarang jadi default copy-paste dari tombol Share di app Roblox
-    #    bakal SELALU ditolak wizard — padahal build_join_url() udah bisa
-    #    nangenin format ini.
     local url=$1
 
     if echo "$url" | grep -qE '^https://www\.roblox\.com/games/[0-9]+/[^?]+\?(privateServerLinkCode|accessCode)=[A-Za-z0-9_-]+$'; then
@@ -408,9 +315,6 @@ validate_private_server_url() {
 }
 
 validate_public_server_url() {
-    # Link publik polos: games/{placeId}/{nama-slug}, TANPA query string.
-    # Di-anchor di akhir ($) biar gak ke-loloskan link yang sebenernya private
-    # server/share link yang nyasar masuk ke mode public.
     local url=$1
     echo "$url" | grep -qE '^https://www\.roblox\.com/games/[0-9]+/[A-Za-z0-9%_-]+/?$'
 }
@@ -442,15 +346,7 @@ detect_running_roblox_apps() {
 }
 
 detect_installed_roblox_packages() {
-    # sed 's/:.*//' buat strip suffix user ID (e.g. "com.roblox.client:10")
-    # yang muncul kalau ada package diinstall untuk multiple user/clone space.
-    # grep -E dengan + (bukan *) buat minimal 1 char setelah prefix com.roblox.
-    # Ini menangkap semua varian: client, nodey, nodez, clienu, clienv, clieny, dll.
-    pm list packages 2>/dev/null \
-        | sed -n 's/^package://p' \
-        | sed 's/:.*//' \
-        | grep -E "^com\.roblox\.[a-zA-Z0-9]+" \
-        | sort -u
+    pm list packages 2>/dev/null | sed -n 's/^package://p' | grep -E "^com\.roblox\.[a-zA-Z0-9]*$" | sort
 }
 
 detect_roblox_packages() {
@@ -488,7 +384,7 @@ detect_roblox_packages() {
 pilih_package() {
     local label=$1
     local var_name=$2
-
+    
     clr
     header
     echo ""
@@ -502,13 +398,13 @@ pilih_package() {
 
     if [ ${#PKGS[@]} -eq 0 ]; then
         echo "  ⚠ Tidak ada package Roblox terdeteksi."
-        printf -v "$var_name" '%s' "com.roblox.client"
+        eval "$var_name=com.roblox.client"
         sleep 2
         return
     fi
 
     if [ ${#PKGS[@]} -eq 1 ]; then
-        printf -v "$var_name" '%s' "${PKGS[0]}"
+        eval "$var_name=${PKGS[0]}"
         echo "  ℹ️  Package: ${PKGS[0]}"
         sleep 1
         return
@@ -516,37 +412,23 @@ pilih_package() {
 
     echo "  📦 Pilih package:"
     echo ""
-    echo "  0) Semua package yang ada (pakai config yang sama)"
     local i=1
     for p in "${PKGS[@]}"; do
         echo "  $i) $p"
         i=$((i+1))
     done
     echo ""
-    printf "  Pilih (0-${#PKGS[@]}): "
+    printf "  Pilih (1-${#PKGS[@]}): "
     read -r PILIH
 
-    if [ "$PILIH" = "0" ]; then
-        printf -v "$var_name" '%s' "${PKGS[0]}"
-        ALL_DETECTED_PKGS=("${PKGS[@]}")
-        USE_ALL_PKGS=1
-        echo ""
-        echo "  ✅ Semua package (${#PKGS[@]}) akan pakai config yang sama:"
-        for p in "${PKGS[@]}"; do echo "    - $p"; done
-        sleep 2
-        return
-    fi
-
     if [[ "$PILIH" =~ ^[0-9]+$ ]] && [ "$PILIH" -ge 1 ] && [ "$PILIH" -le "${#PKGS[@]}" ]; then
-        printf -v "$var_name" '%s' "${PKGS[$((PILIH-1))]}"
+        eval "$var_name=${PKGS[$((PILIH-1))]}"
     else
-        printf -v "$var_name" '%s' "${PKGS[0]}"
+        eval "$var_name=${PKGS[0]}"
     fi
-
+    
     echo ""
-    local _selected_pkg
-    printf -v _selected_pkg '%s' "${!var_name}"
-    echo "  ✅ Package: ${!var_name}"
+    echo "  ✅ Package: $(eval echo \$$var_name)"
     sleep 1
 }
 
@@ -592,8 +474,6 @@ setup_mode_and_url() {
                         continue
                     fi
                     if validate_private_server_url "$INPUT_URL"; then
-                        # printf -v menghindari bug eval pada bash versi Android/Termux
-                        # yang kadang set variabel di scope yang salah (bukan parent caller)
                         printf -v "$url_var" '%s' "$INPUT_URL"
                         echo "  ✅ Link valid!"
                         sleep 1
@@ -700,18 +580,10 @@ wizard_setup_pkg() {
     if [ "$restart" != "0" ]; then restart=1; fi
     
     echo ""
-    echo "  Reconnect saat home? (1=ON, 0=OFF, default: 1)"
+    echo "  Reconnect saat home? (1=ON, 0=OFF, default: 0)"
     printf "  > "
     read -r home
-    if [ "$home" = "0" ]; then home=0; else home=1; fi
-    
-    echo ""
-    echo "  Mode reconnect:"
-    echo "  1) Stay PS  - apapun yang terjadi (DC/teleport/kick) selalu rejoin PS"
-    echo "  2) Normal   - cek doTeleport dulu 3s sebelum reconnect"
-    printf "  > "
-    read -r rmode_input
-    if [ "$rmode_input" = "2" ]; then RECONNECT_MODE="normal"; else RECONNECT_MODE="stayps"; fi
+    if [ "$home" != "1" ]; then home=0; fi
     
     # Save
     local cfg_file="${CONFIG_BASE_DIR}/roblox_config_${pkg}.cfg"
@@ -723,8 +595,6 @@ wizard_setup_pkg() {
 }
 
 menu_ganti_url_mode_pkg() {
-    # Ganti mode & URL aja, setting lain (relog/reconnect/restart/home) tetap
-    # dipertahankan dari config yang udah ada — gak perlu jawab ulang semuanya.
     local pkg=$1
     local pkg_num=$2
     local cfg_file=$3
@@ -751,15 +621,13 @@ menu_edit_settings_pkg() {
     local cfg_file=$2
 
     while true; do
-        local cur_url cur_mode cur_relog cur_reconnect cur_restart cur_home cur_rmode
+        local cur_url cur_mode cur_relog cur_reconnect cur_restart cur_home
         cur_url=$(grep '^URL=' "$cfg_file" | head -1 | cut -d'"' -f2)
         cur_mode=$(grep '^MODE=' "$cfg_file" | head -1 | cut -d'"' -f2)
         cur_relog=$(grep '^RELOG_SETIAP_JAM=' "$cfg_file" | head -1 | cut -d= -f2)
         cur_reconnect=$(grep '^RECONNECT_OTOMATIS=' "$cfg_file" | head -1 | cut -d= -f2)
         cur_restart=$(grep '^RESTART_KALAU_CRASH=' "$cfg_file" | head -1 | cut -d= -f2)
         cur_home=$(grep '^RECONNECT_SAAT_HOME=' "$cfg_file" | head -1 | cut -d= -f2)
-        cur_rmode=$(grep '^RECONNECT_MODE=' "$cfg_file" | head -1 | cut -d'"' -f2)
-        cur_rmode="${cur_rmode:-stayps}"
 
         clr
         header
@@ -770,10 +638,9 @@ menu_edit_settings_pkg() {
         echo "  2) Reconnect otomatis    (sekarang: $(show_toggle $cur_reconnect))"
         echo "  3) Restart kalau crash   (sekarang: $(show_toggle $cur_restart))"
         echo "  4) Reconnect saat home   (sekarang: $(show_toggle $cur_home))"
-        echo "  5) Mode reconnect        (sekarang: $cur_rmode)"
-        echo "  6) Kembali"
+        echo "  5) Kembali"
         echo ""
-        printf "  Pilih (1-6): "
+        printf "  Pilih (1-5): "
         read -r PILIHAN
 
         case $PILIHAN in
@@ -798,43 +665,23 @@ menu_edit_settings_pkg() {
                 ;;
             3)
                 local new_val; new_val=$([ "$cur_restart" = "1" ] && echo 0 || echo 1)
-                save_config "$cfg_file" "$pkg" "$cur_url" "$cur_mode" "$cur_relog" "$cur_reconnect" "$new_val" "$cur_home"
+                save_config "$cfg_file" "$pkg" "$cur_url" "$cur_mode" "$cur_relog" "$cur_reconnect" "$new_val" "$cur_restart" "$cur_home"
                 echo "  ✅ Restart: $(show_toggle $new_val)"
                 sleep 1
                 ;;
             4)
                 local new_val; new_val=$([ "$cur_home" = "1" ] && echo 0 || echo 1)
-                save_config "$cfg_file" "$pkg" "$cur_url" "$cur_mode" "$cur_relog" "$cur_reconnect" "$cur_restart" "$new_val"
+                save_config "$cfg_file" "$pkg" "$cur_url" "$cur_mode" "$cur_relog" "$cur_reconnect" "$cur_restart" "$new_val" "$cur_home"
                 echo "  ✅ Home RC: $(show_toggle $new_val)"
                 sleep 1
                 ;;
-            5)
-                echo ""
-                echo "  Mode reconnect:"
-                echo "  1) stayps — selalu rejoin PS (doTeleport/DC/kick apapun)"
-                echo "  2) normal — cek doTeleport 3s, kick code 267 force rejoin, selain itu tunggu"
-                printf "  > "
-                read -r V
-                if [ "$V" = "2" ]; then
-                    RECONNECT_MODE="normal"
-                else
-                    RECONNECT_MODE="stayps"
-                fi
-                save_config "$cfg_file" "$pkg" "$cur_url" "$cur_mode" "$cur_relog" "$cur_reconnect" "$cur_restart" "$cur_home"
-                echo "  ✅ Mode: $RECONNECT_MODE"
-                sleep 1
-                ;;
-            6) return ;;
-            *) echo "  ⚠ Pilih 1-6"; sleep 1 ;;
+            5) return ;;
+            *) echo "  ⚠ Pilih 1-5"; sleep 1 ;;
         esac
     done
 }
 
 setup_or_load_pkg() {
-    # Cek dulu apakah config buat package ini udah ada. Kalau ada, masuk ke
-    # MAIN MENU — bukan cuma 2 pilihan run/setup-ulang doang. Dari sini bisa
-    # langsung jalan, edit URL/mode aja, edit setting lain aja, setup ulang
-    # total, atau keluar. Loop terus sampai user pilih "jalan" atau "keluar".
     local pkg=$1
     local pkg_num=$2
     local cfg_file="${CONFIG_BASE_DIR}/roblox_config_${pkg}.cfg"
@@ -885,10 +732,6 @@ setup_or_load_pkg() {
                 exit 0
                 ;;
             *)
-                # 1 atau default/kosong → pakai config tersimpan, validasi dulu
-                # Kalau mode butuh URL (main/public) tapi URL kosong, jangan
-                # biarkan lanjut — itu penyebab "Join URL: (kosong)" di log
-                # dan crash langsung. Paksa ke Ganti URL dulu sebelum bisa jalan.
                 local needs_url=0
                 [ "$saved_mode" = "main" ] || [ "$saved_mode" = "public" ] && needs_url=1
                 if [ "$needs_url" = "1" ] && [ -z "$saved_url" ]; then
@@ -955,262 +798,91 @@ menu_setup_discord() {
 }
 
 # ─────────────────────────────────────────
-#   SPLIT SCREEN / FLOATING
+#   SPLIT SCREEN / FLOATING (FIXED)
 # ─────────────────────────────────────────
 
-# ─────────────────────────────────────────
-#   SPLIT SCREEN / FREEFORM ENGINE
-# ─────────────────────────────────────────
+# Fungsi untuk mendapatkan activity yang menangani intent VIEW untuk package tertentu
+get_view_activity() {
+    local pkg="$1"
+    local url="$2"
+    local activity=""
 
-get_screen_size() {
-    # Kembalikan SCREEN_W dan SCREEN_H sebagai variabel global
-    local size
-    size=$(wm size 2>/dev/null | grep -oE "[0-9]+x[0-9]+" | head -1)
-    SCREEN_W=$(echo "$size" | cut -dx -f1)
-    SCREEN_H=$(echo "$size" | cut -dx -f2)
-    # Fallback ke ukuran umum kalau gagal baca
-    SCREEN_W="${SCREEN_W:-1080}"
-    SCREEN_H="${SCREEN_H:-2400}"
+    # Coba resolve-activity dengan cmd package (Android 8+)
+    if command -v cmd >/dev/null 2>&1; then
+        activity=$(cmd package resolve-activity --brief -a android.intent.action.VIEW -d "$url" 2>/dev/null | grep "$pkg/" | head -1)
+        if [ -n "$activity" ]; then
+            echo "$activity"
+            return
+        fi
+    fi
+
+    # Fallback: cari dari dumpsys package
+    activity=$(dumpsys package "$pkg" 2>/dev/null | grep -A20 "android.intent.action.VIEW" | grep -oE "$pkg/[^ ]+" | head -1)
+    if [ -n "$activity" ]; then
+        echo "$activity"
+        return
+    fi
+
+    # Fallback hardcoded (activity umum Roblox)
+    echo "$pkg/com.roblox.client.RobloxActivity"
 }
 
 check_windowing_mode() {
-    # Samsung One UI dan AOSP punya format dumpsys yang berbeda.
-    # Fungsi ini coba beberapa pattern sekaligus biar kompatibel dengan keduanya.
     local pkg=$1
-    local dump
-    dump=$(dumpsys activity activities 2>/dev/null)
-
-    # Pattern 1: AOSP standard — "windowingMode=3"
-    local r
-    r=$(echo "$dump" | grep -A8 "$pkg" | grep -oE "windowingMode=[0-9]+" | head -1)
-    [ -n "$r" ] && echo "$r" && return
-
-    # Pattern 2: Samsung One UI — "mWindowingMode=3"
-    r=$(echo "$dump" | grep -A8 "$pkg" | grep -oE "mWindowingMode=[0-9]+" | head -1 | sed 's/m//')
-    [ -n "$r" ] && echo "$r" && return
-
-    # Pattern 3: Samsung string form — "WINDOWING_MODE_SPLIT_SCREEN_PRIMARY"
-    r=$(echo "$dump" | grep -A8 "$pkg" | grep -oE "WINDOWING_MODE_[A-Z_]+" | head -1)
-    if echo "$r" | grep -q "SPLIT_SCREEN_PRIMARY";   then echo "windowingMode=3" && return; fi
-    if echo "$r" | grep -q "SPLIT_SCREEN_SECONDARY"; then echo "windowingMode=4" && return; fi
-    if echo "$r" | grep -q "FREEFORM";               then echo "windowingMode=5" && return; fi
-    if echo "$r" | grep -q "MULTI_WINDOW";           then echo "windowingMode=6" && return; fi
-
-    # Pattern 4: stack-based check — Samsung kadang pakai stack=2 buat split primary
-    local stack
-    stack=$(echo "$dump" | grep -B2 -A2 "packageName=$pkg\|pkg=$pkg" | grep -oE "stack=[0-9]+" | head -1)
-    if echo "$stack" | grep -q "stack=2"; then echo "windowingMode=3" && return; fi
-    if echo "$stack" | grep -q "stack=3"; then echo "windowingMode=4" && return; fi
-
-    echo ""
+    # Ambil windowingMode dari dumpsys dengan konteks yang lebih akurat
+    dumpsys activity activities 2>/dev/null | grep -A10 "package=$pkg" | grep -oE "windowingMode=[0-9]+" | head -1
 }
 
-init_split_screen() {
-    local pkg1=$1 url1=$2 pkg2=$3 url2=$4
+try_split_screen() {
+    local pkg2=$1
+    local url2=$2
 
-    log "📱 Inisialisasi Split Screen..."
-    log "   PKG1 (Primary, mode 3): $pkg1"
-    log "   PKG2 (Secondary, mode 4): $pkg2"
+    log "📱 Mencoba split screen (windowingMode=4) untuk: $pkg2"
 
-    # Enable multi-window secara global dulu — wajib di Samsung One UI
-    # kalau tidak di-set ini, --windowingMode 3/4 di-ignore oleh window manager
-    settings put global multi_window_on 1 2>/dev/null
-    settings put secure multi_window_recents_enabled 1 2>/dev/null
+    local activity
+    activity=$(get_view_activity "$pkg2" "$url2")
+    log "🔍 Menggunakan activity: $activity"
 
-    am force-stop "$pkg1" 2>/dev/null
-    am force-stop "$pkg2" 2>/dev/null
-    sleep 2
+    am start -a android.intent.action.VIEW -d "$url2" -n "$activity" -f 0x10000000 --windowingMode 4 2>/dev/null
+    sleep 3
 
-    # ── STEP 1: Launch PKG1 ke SPLIT_SCREEN_PRIMARY ──────────────────────
-    am start -a android.intent.action.VIEW -d "$url1" \
-        --windowingMode 3 "$pkg1" 2>/dev/null
+    local actual_mode
+    actual_mode=$(check_windowing_mode "$pkg2")
 
-    # Samsung butuh lebih lama untuk window manager update state-nya
-    local _w=0 mode1=""
-    while [ "$_w" -lt 10 ]; do
-        sleep 1
-        mode1=$(check_windowing_mode "$pkg1")
-        echo "$mode1" | grep -qE "windowingMode=3|windowingMode=6" && break
-        _w=$((_w+1))
-    done
-
-    if ! echo "$mode1" | grep -qE "windowingMode=3|windowingMode=6"; then
-        # Fallback Samsung: start normal dulu, lalu move task ke split via task ID
-        log "⚠️ --windowingMode 3 tidak langsung diterima ($mode1) — coba move-task..."
-
-        # Start normal terlebih dahulu kalau belum running
-        am start -a android.intent.action.VIEW -d "$url1" "$pkg1" 2>/dev/null
-        sleep 3
-
-        local task_id
-        task_id=$(dumpsys activity activities 2>/dev/null | grep -A3 "packageName=$pkg1\|pkg=$pkg1" \
-            | grep -oE "taskId=[0-9]+" | head -1 | grep -oE "[0-9]+")
-
-        if [ -n "$task_id" ]; then
-            log "   Task ID PKG1: $task_id — pindah ke split primary..."
-            am start-activity --start-task "$task_id" --windowingMode 3 2>/dev/null
-            sleep 3
-            mode1=$(check_windowing_mode "$pkg1")
-        fi
-
-        if ! echo "$mode1" | grep -qE "windowingMode=3|windowingMode=6"; then
-            log "⚠️ Split primary gagal ($mode1) — fallback freeform 2-column"
-            DISPLAY_MODE="freeform"; FREEFORM_LAYOUT="column"; FREEFORM_PKG_LIST="$pkg2"
-            init_freeform_windows "$pkg1" "$url1"
-            return 1
-        fi
-    fi
-
-    log "✅ PKG1 split primary OK ($mode1)"
-
-    # ── STEP 2: Launch PKG2 ke SPLIT_SCREEN_SECONDARY ────────────────────
-    am start -a android.intent.action.VIEW -d "$url2" \
-        --windowingMode 4 "$pkg2" 2>/dev/null
-
-    local _w2=0 mode2=""
-    while [ "$_w2" -lt 10 ]; do
-        sleep 1
-        mode2=$(check_windowing_mode "$pkg2")
-        echo "$mode2" | grep -qE "windowingMode=4|windowingMode=6" && break
-        _w2=$((_w2+1))
-    done
-
-    if ! echo "$mode2" | grep -qE "windowingMode=4|windowingMode=6"; then
-        local task_id2
-        task_id2=$(dumpsys activity activities 2>/dev/null | grep -A3 "packageName=$pkg2\|pkg=$pkg2" \
-            | grep -oE "taskId=[0-9]+" | head -1 | grep -oE "[0-9]+")
-        if [ -n "$task_id2" ]; then
-            am start-activity --start-task "$task_id2" --windowingMode 4 2>/dev/null
-            sleep 3
-            mode2=$(check_windowing_mode "$pkg2")
-        fi
-    fi
-
-    if echo "$mode2" | grep -qE "windowingMode=4|windowingMode=6"; then
-        log "✅ Split screen berhasil (PKG1=$mode1 PKG2=$mode2)"
-        send_discord_notification "split" "$pkg2" "$pkg1"
+    if echo "$actual_mode" | grep -q "windowingMode=4"; then
+        log "✅ Split screen berhasil ($actual_mode)"
+        send_discord_notification "split" "$pkg2" "$PKG1"
         SPLIT_ENABLED=1
         return 0
     fi
 
-    log "⚠️ Split secondary gagal ($mode2) — fallback freeform"
-    DISPLAY_MODE="freeform"; FREEFORM_LAYOUT="column"; FREEFORM_PKG_LIST="$pkg2"
-    init_freeform_windows "$pkg1" "$url1"
+    log "⚠️ Split screen gagal/tidak didukung (status: ${actual_mode:-tidak terdeteksi})"
     return 1
 }
 
-init_freeform_windows() {
-    # Freeform dengan auto-grid bounds berdasarkan FREEFORM_LAYOUT dan
-    # FREEFORM_PKG_LIST. PKG1 selalu window pertama.
-    # Layout column = windows berjajar kiri-kanan (dibagi lebar layar).
-    # Layout row    = windows berjajar atas-bawah (dibagi tinggi layar).
-    # Bounds dikirim via --launch-bounds ke am start agar windows gak
-    # numpuk di titik yang sama seperti sebelumnya.
-    local pkg1=$1
-    local url1=$2
+try_floating_window() {
+    local pkg2=$1
+    local url2=$2
 
-    get_screen_size
+    log "🪟 Fallback: freeform window (windowingMode=5) untuk $pkg2"
 
-    # Bangun array semua package (PKG1 + FREEFORM_PKG_LIST)
-    local ALL_PKGS=("$pkg1")
-    local ALL_URLS=("$url1")
+    local activity
+    activity=$(get_view_activity "$pkg2" "$url2")
 
-    for extra_pkg in $FREEFORM_PKG_LIST; do
-        local extra_cfg="${CONFIG_BASE_DIR}/roblox_config_${extra_pkg}.cfg"
-        local extra_url extra_mode
-        if [ -f "$extra_cfg" ]; then
-            extra_mode=$(grep '^MODE=' "$extra_cfg" | head -1 | cut -d'"' -f2)
-            extra_url_raw=$(grep '^URL=' "$extra_cfg" | head -1 | cut -d'"' -f2)
-            extra_url=$(get_active_url "$extra_mode" "$extra_url_raw")
-        else
-            extra_url=$(get_active_url "market" "")
-        fi
-        ALL_PKGS+=("$extra_pkg")
-        ALL_URLS+=("$extra_url")
-    done
+    am start -a android.intent.action.VIEW -d "$url2" -n "$activity" -f 0x10000000 --windowingMode 5 2>/dev/null
+    sleep 3
 
-    local N=${#ALL_PKGS[@]}
-    log "🪟 Freeform auto-grid: $N window, layout=$FREEFORM_LAYOUT (${SCREEN_W}x${SCREEN_H})"
+    local actual_mode
+    actual_mode=$(check_windowing_mode "$pkg2")
 
-    local i=0
-    for pkg in "${ALL_PKGS[@]}"; do
-        local url="${ALL_URLS[$i]}"
-        local left top right bottom
-
-        if [ "$FREEFORM_LAYOUT" = "row" ]; then
-            local win_h=$((SCREEN_H / N))
-            left=0
-            top=$((i * win_h))
-            right=$SCREEN_W
-            bottom=$(( (i+1) * win_h ))
-        else
-            # default: column
-            local win_w=$((SCREEN_W / N))
-            left=$((i * win_w))
-            top=0
-            right=$(( (i+1) * win_w ))
-            bottom=$SCREEN_H
-        fi
-
-        log "   [$((i+1))/$N] $pkg → bounds [${left},${top},${right},${bottom}]"
-
-        am force-stop "$pkg" 2>/dev/null
-        sleep 1
-        am start -a android.intent.action.VIEW -d "$url" \
-            --windowingMode 5 \
-            --launch-bounds "$left $top $right $bottom" \
-            "$pkg" 2>/dev/null
-        sleep 2
-
-        local actual
-        actual=$(check_windowing_mode "$pkg")
-        if echo "$actual" | grep -q "windowingMode=5"; then
-            log "   ✅ $pkg freeform OK"
-        else
-            log "   ⚠️ $pkg: $actual (launch-bounds mungkin tidak didukung ROM ini)"
-        fi
-
-        send_discord_notification "floating" "$pkg" "$pkg1"
-        i=$((i+1))
-    done
-
-    log "✅ Freeform grid selesai"
-}
-
-open_second_package() {
-    if [ "$USE_MULTI_PKG" != "1" ] || [ -z "$PKG2" ]; then
-        return
-    fi
-
-    local cfg2="${CONFIG_BASE_DIR}/roblox_config_${PKG2}.cfg"
-    local mode2 url2_raw url2
-
-    if [ -f "$cfg2" ]; then
-        mode2=$(grep '^MODE=' "$cfg2" | head -1 | cut -d'"' -f2)
-        url2_raw=$(grep '^URL=' "$cfg2" | head -1 | cut -d'"' -f2)
+    if echo "$actual_mode" | grep -q "windowingMode=5"; then
+        log "✅ Freeform window berhasil ($actual_mode)"
     else
-        mode2="market"
-        url2_raw=""
+        log "⚠️ Device tidak support freeform — $pkg2 kemungkinan terbuka fullscreen (status: ${actual_mode:-tidak terdeteksi})"
     fi
-    url2=$(get_active_url "$mode2" "$url2_raw")
 
-    if [ "$DISPLAY_MODE" = "split" ]; then
-        local cfg1="${CONFIG_BASE_DIR}/roblox_config_${PKG1}.cfg"
-        local url1_raw url1 mode1
-        mode1=$(grep '^MODE=' "$cfg1" 2>/dev/null | head -1 | cut -d'"' -f2)
-        url1_raw=$(grep '^URL=' "$cfg1" 2>/dev/null | head -1 | cut -d'"' -f2)
-        url1=$(get_active_url "${mode1:-market}" "$url1_raw")
-        init_split_screen "$PKG1" "$url1" "$PKG2" "$url2"
-    elif [ "$DISPLAY_MODE" = "freeform" ]; then
-        # PKG1 sudah berjalan, init_freeform_windows akan handle semua window
-        # termasuk PKG1 (diposisikan ulang) dan FREEFORM_PKG_LIST
-        local cfg1="${CONFIG_BASE_DIR}/roblox_config_${PKG1}.cfg"
-        local url1_raw url1 mode1
-        mode1=$(grep '^MODE=' "$cfg1" 2>/dev/null | head -1 | cut -d'"' -f2)
-        url1_raw=$(grep '^URL=' "$cfg1" 2>/dev/null | head -1 | cut -d'"' -f2)
-        url1=$(get_active_url "${mode1:-market}" "$url1_raw")
-        init_freeform_windows "$PKG1" "$url1"
-    fi
+    send_discord_notification "floating" "$pkg2" "$PKG1"
+    return 0
 }
 
 # ─────────────────────────────────────────
@@ -1226,18 +898,9 @@ log() {
 }
 
 build_join_url() {
-    # Convert link "biasa" jadi link DIRECT-JOIN biar Roblox langsung
-    # connect ke server tanpa nyangkut di halaman Game Details.
     local url=$1
     local place_id query code type
 
-    # Format BARU Roblox (default sejak Okt 2023) buat private/VIP server:
-    #   https://www.roblox.com/share?code=XXXX&type=Server
-    # Link ini OPAQUE — placeId & kode server-nya gak ada di URL, jadi gak
-    # bisa diparse jadi /games/start kayak link lama. Kalau dibuka via am
-    # start biasa, Roblox gagal resolve kodenya dan jatuh ke server PUBLIC
-    # (bukan private server yang dimaksud). Harus pake custom scheme internal
-    # yang dipakai app sendiri buat resolve share link:
     if echo "$url" | grep -qE 'roblox\.com/share\?'; then
         code=$(echo "$url" | grep -oE 'code=[^&]+' | head -1 | cut -d= -f2)
         type=$(echo "$url" | grep -oE 'type=[^&]+' | head -1 | cut -d= -f2)
@@ -1248,27 +911,18 @@ build_join_url() {
         fi
     fi
 
-    # Format LAMA: https://www.roblox.com/games/ID/Nama-Game[?privateServerLinkCode=...]
     place_id=$(echo "$url" | grep -oE '/games/[0-9]+' | grep -oE '[0-9]+' | head -1)
 
     if [ -z "$place_id" ]; then
-        # Format gak dikenal, biarin apa adanya
         echo "$url"
         return
     fi
 
-    # Ambil query string yang udah ada (privateServerLinkCode, accessCode, dll)
     query=$(echo "$url" | grep -oE '\?.*' | sed 's/^?//')
 
     if [ -n "$query" ]; then
-        # Private server link (ada privateServerLinkCode) — kirim MENTAH,
-        # sama kayak sistem versi lama. Link jenis ini udah auto-join langsung
-        # dari dulu, gak perlu dikonversi ke games/start.
         echo "$url"
     else
-        # Link publik polos (market/gag2/public, tanpa query) — ini yang
-        # nyangkut di halaman Game Details kalau dikirim mentah, jadi tetap
-        # dikonversi ke format direct-join.
         echo "https://www.roblox.com/games/start?placeId=${place_id}"
     fi
 }
@@ -1288,378 +942,137 @@ join_server() {
     local pkg=$1
     local url=$2
     local mode=$3
-    local state_dir=$4
-
+    
     log "🚀 Jalanin: $pkg"
     log "🔗 Join URL: $url"
-
-    # Reset state sebelum launch
-    if [ -n "$state_dir" ]; then
-        echo "0" > "$state_dir/ingame"
-        echo "0" > "$state_dir/joining"
-        echo "0" > "$state_dir/lag"
-        echo "0" > "$state_dir/left_game"
-        local RC
-        RC=$(cat "$state_dir/rc_count" 2>/dev/null || echo 0)
-        echo $((RC+1)) > "$state_dir/rc_count"
-        echo "$(date +%s)" > "$state_dir/last_relog"
-    fi
-
     am force-stop "$pkg"
     sleep 3
     am start -a android.intent.action.VIEW -d "$url" "$pkg"
     log "✅ Launched"
 }
 
-update_pid() {
+wait_ingame() {
     local pkg=$1
-    local state_dir=$2
-    local PID
-    PID=$(pidof "$pkg" 2>/dev/null | awk '{print $1}')
-    echo "${PID:-0}" > "$state_dir/pid"
+    log "👀 Menunggu INGAME..."
+    local found=0
+    
+    timeout 90 logcat -v time 2>/dev/null | grep --line-buffered -i "Connection accepted from" | head -1 > /dev/null
+    if [ $? -eq 0 ]; then
+        found=1
+        IP=$(logcat -v time 2>/dev/null | grep -oE "([0-9]{1,3}\.){3}[0-9]{1,3}" | head -1)
+        log "✅ INGAME! IP: $IP"
+        send_discord_notification "reconnect_success" "$IP" "$pkg"
+    else
+        log "⏱️ Timeout"
+    fi
 }
 
-get_pid() {
-    cat "$1/pid" 2>/dev/null || echo "0"
-}
-
-bring_to_foreground() {
+verify_ingame_stable() {
     local pkg=$1
-    sleep 4
-    am start -n "$pkg/com.roblox.client.ActivityNativeMain" 2>/dev/null
-}
+    local cfg_file=$2
+    local checks=0
 
-start_join_timeout() {
-    local pkg=$1
-    local state_dir=$2
-    local cfg_file=$3
-
-    local OLD_TPID
-    OLD_TPID=$(cat "$state_dir/timeout_pid" 2>/dev/null)
-    [[ "$OLD_TPID" =~ ^[1-9][0-9]*$ ]] && kill "$OLD_TPID" 2>/dev/null
-
-    echo "1" > "$state_dir/joining"
-    (
-        sleep "$JOIN_TIMEOUT"
-        local INGAME JOINING
-        INGAME=$(cat "$state_dir/ingame" 2>/dev/null || echo 0)
-        JOINING=$(cat "$state_dir/joining" 2>/dev/null || echo 0)
-        if [ "$JOINING" = "1" ] && [ "$INGAME" != "1" ]; then
-            log "⏱️ [$pkg] Join timeout ${JOIN_TIMEOUT}s — reconnect paksa"
-            send_discord_notification "disconnect" "Join timeout" "$pkg"
-            source "$cfg_file" 2>/dev/null
-            local DC
-            DC=$(cat "$state_dir/dc_count" 2>/dev/null || echo 0)
-            echo $((DC+1)) > "$state_dir/dc_count"
+    log "🔁 Tight-monitor 20s pasca-join (fase paling rawan crash)..."
+    while [ $checks -lt 20 ]; do
+        sleep 1
+        if ! ps -A 2>/dev/null | grep -q "$pkg"; then
+            log "💥 $pkg mati di fase join (keluar dari jendela crash_monitor biasa) — rejoin paksa"
+            sleep 2
+            source "$cfg_file"
             local active_url
             active_url=$(get_active_url "$MODE" "$URL")
-            join_server "$pkg" "$active_url" "$MODE" "$state_dir"
-            echo "reconnect" > "$state_dir/monitor_signal"
+            join_server "$pkg" "$active_url" "$MODE"
+            wait_ingame "$pkg"
+            checks=0
+            continue
         fi
-    ) &
-    echo $! > "$state_dir/timeout_pid"
+        checks=$((checks + 1))
+    done
+    log "✅ Stabil pasca-join"
 }
 
-monitor_instance() {
+monitor_events() {
     local pkg=$1
     local cfg_file=$2
-    local state_dir=$3
-
-    log "🔍 [$pkg] Monitor aktif (PID-filtered)"
-    echo "0" > "$state_dir/in_background"
-    echo "0" > "$state_dir/lag"
-    echo "0" > "$state_dir/left_game"
-
-    # Tunggu sampai Roblox benar-benar running (max 60s).
-    # Kalau langsung mulai logcat --pid=0 (Roblox belum start),
-    # logcat langsung exit → loop restart 2 detik terus-terusan seperti di screenshot.
-    local _pw=0 CURRENT_PID="0"
-    while [ "$CURRENT_PID" = "0" ] && [ "$_pw" -lt 60 ]; do
-        update_pid "$pkg" "$state_dir"
-        CURRENT_PID=$(get_pid "$state_dir")
-        if [ "$CURRENT_PID" = "0" ]; then
-            sleep 1
-            _pw=$((_pw+1))
-        fi
-    done
-
-    if [ "$CURRENT_PID" = "0" ]; then
-        log "⚠️ [$pkg] PID tidak ditemukan setelah 60s — monitor exit"
-        return 1
-    fi
-
-    log "📌 [$pkg] PID=$CURRENT_PID — mulai logcat"
-
-    logcat --pid="$CURRENT_PID" -v time 2>/dev/null | while read -r line; do
-
-        # ── INGAME CONFIRM ───────────────────────────────────────────────
-        # Lebih akurat dari "Connection accepted" — ini momen Roblox benar-
-        # benar selesai loading dan karakter sudah masuk dunia game.
-        if echo "$line" | grep -q "onGameLoaded.*SessionReporterState_GameLoaded"; then
-            log "✅ [$pkg] INGAME!"
-            echo "1" > "$state_dir/ingame"
-            echo "0" > "$state_dir/joining"
-            local OLD_TPID
-            OLD_TPID=$(cat "$state_dir/timeout_pid" 2>/dev/null)
-            [ -n "$OLD_TPID" ] && kill "$OLD_TPID" 2>/dev/null
-            local RC DC
-            RC=$(cat "$state_dir/rc_count" 2>/dev/null || echo 0)
-            DC=$(cat "$state_dir/dc_count" 2>/dev/null || echo 0)
-            local IP
-            IP=$(cat "$state_dir/server_ip" 2>/dev/null || echo "?")
-            send_discord_notification "reconnect_success" "$IP (RC:$RC DC:$DC)" "$pkg"
-            continue
-        fi
-
-        # ── JOIN DIMULAI ─────────────────────────────────────────────────
-        if echo "$line" | grep -qE "! Joining game|launchGameWithParams"; then
-            local IP
-            IP=$(echo "$line" | grep -oE "([0-9]{1,3}\.){3}[0-9]{1,3}" | head -1)
-            [ -n "$IP" ] && echo "$IP" > "$state_dir/server_ip"
-            log "🔗 [$pkg] Join dimulai — timeout ${JOIN_TIMEOUT}s"
-            echo "0" > "$state_dir/ingame"
-            start_join_timeout "$pkg" "$state_dir" "$cfg_file"
-            continue
-        fi
-
-        # ── LAG DETECTION ────────────────────────────────────────────────
-        if echo "$line" | grep -q "Davey! duration="; then
-            local DUR
-            DUR=$(echo "$line" | grep -oE "duration=[0-9]+" | cut -d= -f2)
-            if [ -n "$DUR" ] && [ "$DUR" -gt 500 ]; then
-                echo "1" > "$state_dir/lag"
+    
+    log "🔍 Monitor aktif"
+    
+    while read -r line; do
+        
+        if echo "$line" | grep -qi "Sending disconnect with reason\|Connection lost\|Lost connection\|Disconnected from server"; then
+            local reason
+            if echo "$line" | grep -qi "Sending disconnect"; then
+                reason="Sending disconnect"
+            elif echo "$line" | grep -qi "Connection lost"; then
+                reason="Connection lost"
             else
-                echo "0" > "$state_dir/lag"
+                reason="Disconnected"
             fi
-            continue
+            
+            log "❌ DC: $reason"
+            send_discord_notification "disconnect" "$reason" "$pkg"
+            
+            sleep 3
+            source "$cfg_file"
+            local active_url=$(get_active_url "$MODE" "$URL")
+            join_server "$pkg" "$active_url" "$MODE"
+            wait_ingame "$pkg"
+            verify_ingame_stable "$pkg" "$cfg_file"
         fi
-
-        # ── BACKGROUND / FOREGROUND ──────────────────────────────────────
-        if echo "$line" | grep -q "Detected application backgrounding"; then
-            echo "1" > "$state_dir/in_background"
-            log "🌙 [$pkg] Background"
-            if [ "$RECONNECT_SAAT_HOME" = "0" ]; then
-                (
-                    sleep 5
-                    local STILL_BG
-                    STILL_BG=$(cat "$state_dir/in_background" 2>/dev/null || echo 0)
-                    if [ "$STILL_BG" = "1" ]; then
-                        log "↩️ [$pkg] Masih BG 5s — tarik ke foreground"
-                        bring_to_foreground "$pkg"
-                    fi
-                ) &
-            fi
-            continue
-        fi
-
-        if echo "$line" | grep -q "Detected application foregrounding"; then
-            echo "0" > "$state_dir/in_background"
-            local LEFT_AT_FG
-            LEFT_AT_FG=$(cat "$state_dir/left_game" 2>/dev/null || echo 0)
-            if [ "$LEFT_AT_FG" = "1" ]; then
-                log "🔙 [$pkg] FG setelah leave — force rejoin PS"
-                echo "0" > "$state_dir/left_game"
-                echo "0" > "$state_dir/ingame"
-                local DC
-                DC=$(cat "$state_dir/dc_count" 2>/dev/null || echo 0)
-                echo $((DC+1)) > "$state_dir/dc_count"
-                send_discord_notification "disconnect" "FG setelah leave" "$pkg"
-                source "$cfg_file"
-                local active_url
-                active_url=$(get_active_url "$MODE" "$URL")
-                join_server "$pkg" "$active_url" "$MODE" "$state_dir"
-                update_pid "$pkg" "$state_dir"
-                CURRENT_PID=$(get_pid "$state_dir")
-                break
-            fi
-            log "☀️ [$pkg] Foreground"
-            continue
-        fi
-
-        # ── LEAVE MANUAL ─────────────────────────────────────────────────
-        # leaveUGCGameInternal + "Roblox has entered APP mode" = dua-langkah
-        # konfirmasi user beneran leave (bukan cold start atau teleport).
-        if echo "$line" | grep -q "leaveUGCGameInternal"; then
-            echo "1" > "$state_dir/left_game"
-            log "🚪 [$pkg] leaveUGCGame — tunggu konfirmasi APP mode"
-            continue
-        fi
-
-        if echo "$line" | grep -q "Roblox has entered APP mode"; then
-            local LEFT
-            LEFT=$(cat "$state_dir/left_game" 2>/dev/null || echo 0)
-            if [ "$LEFT" = "1" ]; then
-                log "🏠 [$pkg] Confirmed leave+APP mode — force rejoin PS"
-                echo "0" > "$state_dir/left_game"
-                echo "0" > "$state_dir/ingame"
-                local DC
-                DC=$(cat "$state_dir/dc_count" 2>/dev/null || echo 0)
-                echo $((DC+1)) > "$state_dir/dc_count"
-                send_discord_notification "disconnect" "Manual leave" "$pkg"
-                source "$cfg_file"
-                local active_url
-                active_url=$(get_active_url "$MODE" "$URL")
-                join_server "$pkg" "$active_url" "$MODE" "$state_dir"
-                update_pid "$pkg" "$state_dir"
-                CURRENT_PID=$(get_pid "$state_dir")
-                break
-            else
-                log "ℹ️ [$pkg] APP mode tanpa leave — skip (cold start)"
-            fi
-            continue
-        fi
-
-        # ── STAYPS MODE ──────────────────────────────────────────────────
-        # Selalu force rejoin ke PS untuk ANY doTeleport atau disconnect.
-        if [ "$RECONNECT_MODE" = "stayps" ]; then
-            if echo "$line" | grep -qE "doTeleport|Lost connection with reason"; then
-                log "🔄 [$pkg] [STAYPS] DC/Teleport — force rejoin PS"
-                local DC
-                DC=$(cat "$state_dir/dc_count" 2>/dev/null || echo 0)
-                echo $((DC+1)) > "$state_dir/dc_count"
-                send_discord_notification "disconnect" "DC/Teleport (stayps)" "$pkg"
-                source "$cfg_file"
-                local active_url
-                active_url=$(get_active_url "$MODE" "$URL")
-                join_server "$pkg" "$active_url" "$MODE" "$state_dir"
-                update_pid "$pkg" "$state_dir"
-                CURRENT_PID=$(get_pid "$state_dir")
-                break
-            fi
-
-            if echo "$line" | grep -q "Sending disconnect with reason:"; then
-                local REASON
-                REASON=$(echo "$line" | grep -oE "reason: [0-9]+" | grep -oE "[0-9]+")
-                log "❌ [$pkg] [STAYPS] Disconnect reason:${REASON} — force rejoin PS"
-                local DC
-                DC=$(cat "$state_dir/dc_count" 2>/dev/null || echo 0)
-                echo $((DC+1)) > "$state_dir/dc_count"
-                send_discord_notification "disconnect" "Reason:${REASON}" "$pkg"
-                source "$cfg_file"
-                local active_url
-                active_url=$(get_active_url "$MODE" "$URL")
-                join_server "$pkg" "$active_url" "$MODE" "$state_dir"
-                update_pid "$pkg" "$state_dir"
-                CURRENT_PID=$(get_pid "$state_dir")
-                break
-            fi
-        fi
-
-        # ── NORMAL MODE ───────────────────────────────────────────────────
-        # Cek doTeleport 3s sebelum memutuskan reconnect, biar gak salah
-        # kick user yang lagi teleport ke server lain yang legitimate.
-        if [ "$RECONNECT_MODE" = "normal" ]; then
-            if echo "$line" | grep -q "Lost connection with reason"; then
-                log "⚠️ [$pkg] [NORMAL] Lost connection — tunggu 3s cek doTeleport"
-                echo "WAITING" > "$state_dir/dc_state"
-                (
-                    sleep 3
-                    local STATE
-                    STATE=$(cat "$state_dir/dc_state" 2>/dev/null)
-                    if [ "$STATE" = "WAITING" ]; then
-                        log "❌ [$pkg] [NORMAL] Tidak ada doTeleport — reconnect ke PS"
-                        local DC
-                        DC=$(cat "$state_dir/dc_count" 2>/dev/null || echo 0)
-                        echo $((DC+1)) > "$state_dir/dc_count"
-                        echo "DONE" > "$state_dir/dc_state"
-                        send_discord_notification "disconnect" "Lost connection (normal)" "$pkg"
-                        source "$cfg_file"
-                        local active_url
-                        active_url=$(get_active_url "$MODE" "$URL")
-                        join_server "$pkg" "$active_url" "$MODE" "$state_dir"
-                        echo "reconnect" > "$state_dir/monitor_signal"
-                    fi
-                ) &
-                continue
-            fi
-
-            if echo "$line" | grep -q "doTeleport"; then
-                local STATE
-                STATE=$(cat "$state_dir/dc_state" 2>/dev/null)
-                if [ "$STATE" = "WAITING" ]; then
-                    log "🌀 [$pkg] [NORMAL] doTeleport terdeteksi — pantau ${JOIN_TIMEOUT}s"
-                    echo "DONE" > "$state_dir/dc_state"
-                fi
-                continue
-            fi
-
-            if echo "$line" | grep -q "Sending disconnect with reason:"; then
-                local REASON
-                REASON=$(echo "$line" | grep -oE "reason: [0-9]+" | grep -oE "[0-9]+")
-                if [ "$REASON" = "267" ]; then
-                    # reason 267 = kicked dari server, selalu force rejoin
-                    log "🦵 [$pkg] [NORMAL] Kicked (reason:267) — force rejoin PS"
-                    local DC
-                    DC=$(cat "$state_dir/dc_count" 2>/dev/null || echo 0)
-                    echo $((DC+1)) > "$state_dir/dc_count"
-                    echo "DONE" > "$state_dir/dc_state"
-                    send_discord_notification "disconnect" "Kicked reason:267" "$pkg"
-                    source "$cfg_file"
-                    local active_url
-                    active_url=$(get_active_url "$MODE" "$URL")
-                    join_server "$pkg" "$active_url" "$MODE" "$state_dir"
-                    echo "reconnect" > "$state_dir/monitor_signal"
-                    break
-                fi
-                log "ℹ️ [$pkg] [NORMAL] Disconnect reason:${REASON} — skip (bukan 267)"
-                continue
-            fi
-        fi
-
-        # ── CRASH VIA LOGCAT ─────────────────────────────────────────────
-        # Lebih reliable dari polling ps karena System.exit tercatat di logcat
-        # proses itu sendiri sebelum proses benar-benar mati.
-        if echo "$line" | grep -q "System.exit called"; then
-            log "💥 [$pkg] Crash! (System.exit)"
-            echo "0" > "$state_dir/ingame"
-            echo "0" > "$state_dir/joining"
-            send_discord_notification "crash" "System.exit" "$pkg"
-            if [ "$RESTART_KALAU_CRASH" = "1" ]; then
-                local DC
-                DC=$(cat "$state_dir/dc_count" 2>/dev/null || echo 0)
-                echo $((DC+1)) > "$state_dir/dc_count"
-                sleep 3
-                source "$cfg_file"
-                local active_url
-                active_url=$(get_active_url "$MODE" "$URL")
-                join_server "$pkg" "$active_url" "$MODE" "$state_dir"
-                update_pid "$pkg" "$state_dir"
-                CURRENT_PID=$(get_pid "$state_dir")
-                break
-            fi
-        fi
-
-    done
-
-    log "🔚 [$pkg] Monitor session ended"
+        
+    done < <(logcat -v time 2>/dev/null | grep --line-buffered -iE "Sending disconnect|Connection lost|Lost connection|Disconnected from server")
 }
 
-start_monitor() {
+crash_monitor() {
     local pkg=$1
     local cfg_file=$2
-    local state_dir=$3
+    
+    while true; do
+        if ! ps -A 2>/dev/null | grep -q "$pkg"; then
+            log "💥 Crash detected"
+            send_discord_notification "crash" "App crashed" "$pkg"
+            
+            sleep 3
+            source "$cfg_file"
+            local active_url=$(get_active_url "$MODE" "$URL")
+            join_server "$pkg" "$active_url" "$MODE"
+            wait_ingame "$pkg"
+            verify_ingame_stable "$pkg" "$cfg_file"
+            
+            open_second_package
+        fi
+        sleep 5
+    done
+}
 
-    # Kill monitor lama kalau masih jalan
-    local OLD_PID
-    OLD_PID=$(cat "$state_dir/monitor_pid" 2>/dev/null)
-    if [[ "$OLD_PID" =~ ^[1-9][0-9]*$ ]]; then
-        kill -- -"$OLD_PID" 2>/dev/null || kill "$OLD_PID" 2>/dev/null
-        sleep 1
+# ─────────────────────────────────────────
+#   OPEN SECOND PACKAGE (menggunakan perbaikan)
+# ─────────────────────────────────────────
+
+open_second_package() {
+    if [ "$USE_MULTI_PKG" != "1" ] || [ -z "$PKG2" ]; then
+        return
     fi
-    rm -f "$state_dir/monitor_signal" "$state_dir/monitor_stop"
-
-    (
-        while true; do
-            [ -f "$state_dir/monitor_stop" ] && break
-            monitor_instance "$pkg" "$cfg_file" "$state_dir"
-            [ -f "$state_dir/monitor_stop" ] && break
-            log "🔁 [$pkg] Monitor loop restart..."
-            sleep 2
-            update_pid "$pkg" "$state_dir"
-        done
-    ) &
-    local NEW_PID=$!
-    echo "$NEW_PID" > "$state_dir/monitor_pid"
+    
+    local mode2 url2
+    local cfg2="${CONFIG_BASE_DIR}/roblox_config_${PKG2}.cfg"
+    
+    if [ -f "$cfg2" ]; then
+        source "$cfg2"
+        mode2="$MODE"
+        url2="$URL"
+    else
+        mode2="market"
+        url2="$URL_MARKET"
+    fi
+    
+    local active_url2
+    active_url2=$(get_active_url "$mode2" "$url2")
+    
+    # Try split, fallback to floating
+    if ! try_split_screen "$PKG2" "$active_url2"; then
+        try_floating_window "$PKG2" "$active_url2"
+    fi
 }
 
 # ─────────────────────────────────────────
@@ -1680,44 +1093,16 @@ echo ""
 echo "  Mau setup untuk berapa package?"
 echo ""
 echo "  1) 1 Package"
-  echo "  2) 2 Package - Split Screen"
-  echo "  3) Freeform Windows (2-4 Package, auto-grid)"
-  echo "  4) Keluar"
+echo "  2) 2 Package (Split + Floating)"
 echo ""
 printf "  Pilih: "
 read -r SETUP_CHOICE
 
-case "$SETUP_CHOICE" in
-    2)
-        USE_MULTI_PKG=1
-        DISPLAY_MODE="split"
-        ;;
-    3)
-        USE_MULTI_PKG=1
-        DISPLAY_MODE="freeform"
-        clr; header
-        echo ""
-        echo "  Layout freeform:"
-        echo "  1) Column (berdampingan kiri-kanan)"
-        echo "  2) Row (atas-bawah)"
-        printf "  Pilih (1-2, default 1): "
-        read -r _LAYOUT
-        [ "$_LAYOUT" = "2" ] && FREEFORM_LAYOUT="row" || FREEFORM_LAYOUT="column"
-        echo ""
-        echo "  Berapa package? (2-4)"
-        printf "  > "
-        read -r _NPKG
-        [[ "$_NPKG" =~ ^[2-4]$ ]] || _NPKG=2
-        FREEFORM_NPKG=$_NPKG
-        ;;
-    4)
-        echo ""; echo "  Sampai jumpa."; exit 0
-        ;;
-    *)
-        USE_MULTI_PKG=0
-        DISPLAY_MODE="none"
-        ;;
-esac
+if [ "$SETUP_CHOICE" = "2" ]; then
+    USE_MULTI_PKG=1
+else
+    USE_MULTI_PKG=0
+fi
 
 # Setup Package 1
 echo ""
@@ -1733,35 +1118,9 @@ if [ "$USE_MULTI_PKG" = "1" ]; then
     set_pkg_paths "$PKG2" "PKG2"
     check_clone_app "$PKG2"
     setup_or_load_pkg "$PKG2" 2
-
-    # Freeform: setup package tambahan (PKG3, PKG4) jika diminta
-    if [ "$DISPLAY_MODE" = "freeform" ] && [ "${FREEFORM_NPKG:-2}" -gt 2 ]; then
-        _EXTRA_PKGS="$PKG2"
-        _PKGN=3
-        while [ "$_PKGN" -le "${FREEFORM_NPKG:-2}" ]; do
-            echo ""
-            _EXTRA_PKG=""
-            pilih_package "📦 PILIH PACKAGE $_PKGN (Freeform)" _EXTRA_PKG
-            if [ -n "$_EXTRA_PKG" ]; then
-                set_pkg_paths "$_EXTRA_PKG" "PKGX"
-                check_clone_app "$_EXTRA_PKG"
-                setup_or_load_pkg "$_EXTRA_PKG" "$_PKGN"
-                _EXTRA_PKGS="$_EXTRA_PKGS $_EXTRA_PKG"
-            fi
-            _PKGN=$((_PKGN+1))
-        done
-        # Simpan list extra pkg (PKG2..PKGn) ke FREEFORM_PKG_LIST untuk init_freeform_windows
-        FREEFORM_PKG_LIST="$_EXTRA_PKGS"
-    else
-        FREEFORM_PKG_LIST="$PKG2"
-    fi
 fi
 
-# Load Discord settings lama (kalau ada) SEBELUM nanya — kalau nggak,
-# variable global DISCORD_ENABLED/WEBHOOK/USER_ID bakal balik ke default
-# kosong/OFF tiap script dijalanin, dan kalau user jawab "tidak" di prompt
-# bawah ini, settingan Discord yang udah ON dari run sebelumnya bakal
-# ketulis ulang jadi OFF oleh persist_discord_settings.
+# Load Discord settings lama
 PKG1_CFG="${CONFIG_BASE_DIR}/roblox_config_${PKG1}.cfg"
 if [ -f "$PKG1_CFG" ]; then
     DISCORD_ENABLED=$(grep '^DISCORD_ENABLED=' "$PKG1_CFG" | head -1 | cut -d= -f2)
@@ -1801,9 +1160,7 @@ if [ "$SETUP_DISCORD" = "1" ]; then
     sleep 2
 fi
 
-# Simpen setting Discord yang baru diisi ke file config tiap package,
-# SEBELUM file itu di-source ulang di bawah (kalau nggak, bakal ketimpa
-# balik ke nilai lama dan status Discord jadi salah/OFF terus).
+# Simpan setting Discord ke config
 persist_discord_settings "${CONFIG_BASE_DIR}/roblox_config_${PKG1}.cfg" "$PKG1"
 if [ "$USE_MULTI_PKG" = "1" ]; then
     persist_discord_settings "${CONFIG_BASE_DIR}/roblox_config_${PKG2}.cfg" "$PKG2"
@@ -1811,17 +1168,9 @@ fi
 
 # Load config
 source "${CONFIG_BASE_DIR}/roblox_config_${PKG1}.cfg" 2>/dev/null
-# Load RECONNECT_MODE dari config (bisa dioverride di sini)
-_RMODE=$(grep '^RECONNECT_MODE=' "${CONFIG_BASE_DIR}/roblox_config_${PKG1}.cfg" 2>/dev/null | head -1 | cut -d'"' -f2)
-[ -n "$_RMODE" ] && RECONNECT_MODE="$_RMODE"
 
-# START — init state files PKG1
+# START
 mkdir -p "$PKG1_STATE_DIR"
-for _F in ingame joining in_background dc_count rc_count lag dc_state left_game; do
-    echo "0" > "$PKG1_STATE_DIR/$_F"
-done
-echo "$(date +%s)" > "$PKG1_STATE_DIR/last_relog"
-echo "" > "$PKG1_STATE_DIR/server_ip"
 
 clr
 echo "=========================================" | tee -a "$PKG1_LOG_FILE"
@@ -1829,15 +1178,10 @@ echo "   ROBLOX AUTO RECONNECT + AUTO RELOG"    | tee -a "$PKG1_LOG_FILE"
 echo "=========================================" | tee -a "$PKG1_LOG_FILE"
 log "Package 1        : $PKG1"
 log "Mode             : $(get_mode_label $MODE)"
-log "Reconnect Mode   : $RECONNECT_MODE"
-if [ "$USE_ALL_PKGS" = "1" ]; then
-    log "Multi Package    : ALL (${#ALL_DETECTED_PKGS[@]} packages)"
-    for _ap in "${ALL_DETECTED_PKGS[@]}"; do log "  → $_ap"; done
-elif [ "$USE_MULTI_PKG" = "1" ]; then
-    log "Multi Package    : ON"
+log "Multi Package    : $(show_toggle $USE_MULTI_PKG)"
+if [ "$USE_MULTI_PKG" = "1" ]; then
     log "Package 2        : $PKG2"
 fi
-log "Display Mode     : $DISPLAY_MODE"
 log "Discord          : $(show_toggle $DISCORD_ENABLED)"
 echo "=========================================" | tee -a "$PKG1_LOG_FILE"
 echo ""
@@ -1845,109 +1189,33 @@ echo ""
 # Get active URL
 PKG1_ACTIVE_URL=$(get_active_url "$MODE" "$URL")
 
+# Guard: URL kosong
 if [ -z "$PKG1_ACTIVE_URL" ] && { [ "$MODE" = "main" ] || [ "$MODE" = "public" ]; }; then
-    log "❌ FATAL: URL kosong untuk mode $MODE"
-    log "   Hapus config: rm ${CONFIG_BASE_DIR}/roblox_config_${PKG1}.cfg"
+    log "❌ FATAL: URL kosong untuk mode $MODE — config rusak atau URL belum pernah diisi"
+    log "   Hapus config dan jalankan ulang: rm ${CONFIG_BASE_DIR}/roblox_config_${PKG1}.cfg"
     exit 1
 fi
 
-# ── SEMUA PACKAGE MODE ────────────────────────────────────────────────────
-if [ "$USE_ALL_PKGS" = "1" ]; then
-    # Semua package pakai config PKG1 yang sama
-    log "🚀 Mode All-Packages: join ${#ALL_DETECTED_PKGS[@]} package..."
-    _ALL_STATE_DIRS=()
-    _ALL_CFGS=()
-    local _api=0
-    for _apkg in "${ALL_DETECTED_PKGS[@]}"; do
-        local _astate="${CONFIG_BASE_DIR}/state_${_apkg}"
-        local _acfg="${CONFIG_BASE_DIR}/roblox_config_${PKG1}.cfg"
-        mkdir -p "$_astate"
-        for _F in ingame joining in_background dc_count rc_count lag dc_state left_game; do
-            echo "0" > "$_astate/$_F"
-        done
-        echo "$(date +%s)" > "$_astate/last_relog"
-        echo "" > "$_astate/server_ip"
-        _ALL_STATE_DIRS+=("$_astate")
-        _ALL_CFGS+=("$_acfg")
-        sleep $((_api > 0 ? 2 : 0))
-        join_server "$_apkg" "$PKG1_ACTIVE_URL" "$MODE" "$_astate"
-        _api=$((_api+1))
-    done
-    sleep 3
-    log "🚀 Ready untuk monitoring (${#ALL_DETECTED_PKGS[@]} package)"
-    _ami=0
-    for _apkg in "${ALL_DETECTED_PKGS[@]}"; do
-        start_monitor "$_apkg" "${_ALL_CFGS[$_ami]}" "${_ALL_STATE_DIRS[$_ami]}"
-        log "📡 [$_apkg] Monitor dimulai"
-        start_join_timeout "$_apkg" "${_ALL_STATE_DIRS[$_ami]}" "${_ALL_CFGS[$_ami]}"
-        _ami=$((_ami+1))
-        sleep 1
-    done
-    # Relog loop untuk all-packages mode
-    while true; do
-        if [ "${RELOG_SETIAP_JAM:-0}" != "0" ]; then
-            local _rami=0
-            for _apkg in "${ALL_DETECTED_PKGS[@]}"; do
-                local _rastate="${_ALL_STATE_DIRS[$_rami]}"
-                _NOW=$(date +%s)
-                _LAST=$(cat "$_rastate/last_relog" 2>/dev/null | grep -oE "[0-9]+" | head -1)
-                _LAST="${_LAST:-0}"
-                if [ $((_NOW - _LAST)) -ge $((RELOG_SETIAP_JAM * 3600)) ]; then
-                    log "🔄 [$_apkg] Relog..."
-                    join_server "$_apkg" "$PKG1_ACTIVE_URL" "$MODE" "$_rastate"
-                    start_monitor "$_apkg" "${_ALL_CFGS[$_rami]}" "$_rastate"
-                    start_join_timeout "$_apkg" "$_rastate" "${_ALL_CFGS[$_rami]}"
-                fi
-                _rami=$((_rami+1))
-            done
-        fi
-        sleep "$CHECK_INTERVAL"
-    done
-fi
+# Join first package
+join_server "$PKG1" "$PKG1_ACTIVE_URL" "$MODE"
+wait_ingame "$PKG1"
+verify_ingame_stable "$PKG1" "${CONFIG_BASE_DIR}/roblox_config_${PKG1}.cfg"
 
-# ── MODE NORMAL (1 / 2 PACKAGE) ──────────────────────────────────────────
-join_server "$PKG1" "$PKG1_ACTIVE_URL" "$MODE" "$PKG1_STATE_DIR"
-start_join_timeout "$PKG1" "$PKG1_STATE_DIR" "${CONFIG_BASE_DIR}/roblox_config_${PKG1}.cfg"
-
+# Open second package if enabled
 if [ "$USE_MULTI_PKG" = "1" ]; then
     sleep 2
     open_second_package
-    if [ -n "$PKG2_STATE_DIR" ]; then
-        mkdir -p "$PKG2_STATE_DIR"
-        for _F in ingame joining in_background dc_count rc_count lag dc_state left_game; do
-            echo "0" > "$PKG2_STATE_DIR/$_F"
-        done
-        echo "$(date +%s)" > "$PKG2_STATE_DIR/last_relog"
-        echo "" > "$PKG2_STATE_DIR/server_ip"
-    fi
 fi
 
 log "🚀 Ready untuk monitoring"
 echo ""
 
-start_monitor "$PKG1" "${CONFIG_BASE_DIR}/roblox_config_${PKG1}.cfg" "$PKG1_STATE_DIR"
-log "📡 [$PKG1] Monitor dimulai"
+# Start monitors
+monitor_events "$PKG1" "${CONFIG_BASE_DIR}/roblox_config_${PKG1}.cfg" &
+MONITOR_PID=$!
 
-if [ "$USE_MULTI_PKG" = "1" ] && [ -n "$PKG2_STATE_DIR" ]; then
-    sleep 2
-    start_monitor "$PKG2" "${CONFIG_BASE_DIR}/roblox_config_${PKG2}.cfg" "$PKG2_STATE_DIR"
-    log "📡 [$PKG2] Monitor dimulai"
-fi
+crash_monitor "$PKG1" "${CONFIG_BASE_DIR}/roblox_config_${PKG1}.cfg" &
+CRASH_PID=$!
 
-# Relog periodic loop
-while true; do
-    if [ "${RELOG_SETIAP_JAM:-0}" != "0" ]; then
-        _NOW=$(date +%s)
-        _LAST=$(cat "$PKG1_STATE_DIR/last_relog" 2>/dev/null | grep -oE "[0-9]+" | head -1)
-        _LAST="${_LAST:-0}"
-        if [ $((_NOW - _LAST)) -ge $((RELOG_SETIAP_JAM * 3600)) ]; then
-            log "🔄 [$PKG1] Relog..."
-            source "${CONFIG_BASE_DIR}/roblox_config_${PKG1}.cfg" 2>/dev/null
-            _URL=$(get_active_url "$MODE" "$URL")
-            join_server "$PKG1" "$_URL" "$MODE" "$PKG1_STATE_DIR"
-            start_monitor "$PKG1" "${CONFIG_BASE_DIR}/roblox_config_${PKG1}.cfg" "$PKG1_STATE_DIR"
-            start_join_timeout "$PKG1" "$PKG1_STATE_DIR" "${CONFIG_BASE_DIR}/roblox_config_${PKG1}.cfg"
-        fi
-    fi
-    sleep "$CHECK_INTERVAL"
-done
+# Keep alive
+wait
