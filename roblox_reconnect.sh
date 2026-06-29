@@ -2,11 +2,10 @@
 
 # ──────────────────────────────────────────────────────────────
 #   ROBLOX AUTO RECONNECT + AUTO RELOG
-#   by: Wardz | versi: 2.19
-#   Perbaikan: - Judul "Sphinx Status Update" sebagai heading di description
-#              - Disconnected/Crash tampilkan stats terakhir
-#              - Layout konsisten antara Connected/Disconnected/Crash
-#              - Hilangkan thumbnail besar, hanya footer icon
+#   by: Wardz | versi: 2.20
+#   Perbaikan: - Tambahan Temperatur di System Stats
+#              - Application Details: nama package, uptime (🕐), RAM (💾), CPU (⚡)
+#              - Layout Kaeru style dengan emoji
 # ──────────────────────────────────────────────────────────────
 
 PKG1=""
@@ -196,8 +195,25 @@ get_proc_stats() {
 }
 
 # ──────────────────────────────────────────────────────────────
-#   FUNGSI UNTUK STATISTIK SISTEM
+#   FUNGSI UNTUK STATISTIK SISTEM + TEMPERATUR
 # ──────────────────────────────────────────────────────────────
+
+get_temperature() {
+    local temp="N/A"
+    # Coba thermal zone yang umum
+    if [ -r "/sys/class/thermal/thermal_zone0/temp" ]; then
+        temp=$(cat /sys/class/thermal/thermal_zone0/temp 2>/dev/null | awk '{print int($1/1000)}')
+    fi
+    if [ -z "$temp" ] || [ "$temp" = "N/A" ] || [ "$temp" -eq 0 ]; then
+        if [ -r "/sys/class/thermal/thermal_zone1/temp" ]; then
+            temp=$(cat /sys/class/thermal/thermal_zone1/temp 2>/dev/null | awk '{print int($1/1000)}')
+        fi
+    fi
+    if [ -z "$temp" ] || [ "$temp" = "N/A" ] || [ "$temp" -eq 0 ]; then
+        temp="N/A"
+    fi
+    echo "$temp"
+}
 
 get_system_stats() {
     local total_ram_kb=$(grep MemTotal /proc/meminfo 2>/dev/null | awk '{print $2}')
@@ -217,7 +233,8 @@ get_system_stats() {
         cpu_load=$(awk '{print $1*100}' /proc/loadavg 2>/dev/null | cut -d. -f1)
         if [ -z "$cpu_load" ]; then cpu_load="N/A"; fi
     fi
-    echo "$total_ram_mb|$used_ram_mb|$ram_percent|$cpu_load"
+    local temp=$(get_temperature)
+    echo "$total_ram_mb|$used_ram_mb|$ram_percent|$cpu_load|$temp"
 }
 
 # ──────────────────────────────────────────────────────────────
@@ -300,8 +317,8 @@ send_status_update() {
     fi
     LAST_UPDATE_EPOCH=$now_epoch
 
-    # System stats
-    IFS='|' read -r total_ram_mb used_ram_mb ram_percent cpu_load <<< "$(get_system_stats)"
+    # System stats + temperature
+    IFS='|' read -r total_ram_mb used_ram_mb ram_percent cpu_load temp <<< "$(get_system_stats)"
 
     # Status overview
     local online_count=0
@@ -311,10 +328,10 @@ send_status_update() {
         IFS='|' read -r status uptime ram_mb cpu ip ram_percent <<< "$(get_pkg_status "$pkg")"
         if [ "$status" = "Online" ]; then
             online_count=$((online_count+1))
-            app_details+="- **$pkg**: $uptime | ${ram_mb} MB (${ram_percent}%) | ${cpu}%\n"
+            app_details+="- $pkg: 🕐 $uptime | 💾 ${ram_mb} MB (${ram_percent}%) | ⚡ ${cpu}%\n"
         else
             offline_count=$((offline_count+1))
-            app_details+="- **$pkg**: Offline\n"
+            app_details+="- $pkg: ❌ Offline\n"
         fi
     done
 
@@ -325,7 +342,8 @@ send_status_update() {
     desc+="📱 **Device**: $device\n\n"
     desc+="### 💻 System Stats\n"
     desc+="- RAM: ${used_ram_mb}MB used (${ram_percent}%) / ${total_ram_mb}MB total\n"
-    desc+="- CPU: ${cpu_load}%\n\n"
+    desc+="- CPU: ${cpu_load}%\n"
+    desc+="- Temp: ${temp}°C\n\n"
     desc+="### 📊 Status Overview\n"
     desc+="- **Online**: $online_count\n- **Offline**: $offline_count\n- **Total**: ${#PKGS[@]}\n\n"
     desc+="### 📦 Application Details\n"
@@ -370,13 +388,13 @@ send_discord_notification() {
     case $event_type in
         "disconnect")
             embed_title="❌ Disconnected"
-            embed_description="**Alasan:** $details\n**Waktu:** $timestamp\n\n**Stats terakhir sebelum DC:**\nUptime: $last_uptime\nRAM: ${last_ram} MB (${last_ram_percent}%)\nCPU: ${last_cpu}%"
+            embed_description="**Alasan:** $details\n**Waktu:** $timestamp\n\n**Stats terakhir sebelum DC:**\n🕐 Uptime: $last_uptime\n💾 RAM: ${last_ram} MB (${last_ram_percent}%)\n⚡ CPU: ${last_cpu}%"
             embed_color="16711680"
             fields="[{\"name\":\"Package\",\"value\":\"$pkg\",\"inline\":true}]"
             ;;
         "crash")
             embed_title="💥 Crash"
-            embed_description="**Waktu:** $timestamp\n\n**Stats terakhir sebelum crash:**\nUptime: $last_uptime\nRAM: ${last_ram} MB (${last_ram_percent}%)\nCPU: ${last_cpu}%"
+            embed_description="**Waktu:** $timestamp\n\n**Stats terakhir sebelum crash:**\n🕐 Uptime: $last_uptime\n💾 RAM: ${last_ram} MB (${last_ram_percent}%)\n⚡ CPU: ${last_cpu}%"
             embed_color="16711680"
             fields="[{\"name\":\"Package\",\"value\":\"$pkg\",\"inline\":true}]"
             ;;
@@ -392,7 +410,7 @@ send_discord_notification() {
             embed_color="65280"
             IFS='|' read -r status uptime ram_mb cpu ip ram_percent <<< "$(get_pkg_status "$pkg")"
             if [ "$status" = "Online" ]; then
-                fields="[{\"name\":\"Package\",\"value\":\"$pkg\",\"inline\":true},{\"name\":\"Uptime\",\"value\":\"$uptime\",\"inline\":true},{\"name\":\"RAM\",\"value\":\"${ram_mb} MB (${ram_percent}%)\",\"inline\":true},{\"name\":\"CPU\",\"value\":\"${cpu}%\",\"inline\":true}]"
+                fields="[{\"name\":\"Package\",\"value\":\"$pkg\",\"inline\":true},{\"name\":\"Uptime\",\"value\":\"🕐 $uptime\",\"inline\":true},{\"name\":\"RAM\",\"value\":\"💾 ${ram_mb} MB (${ram_percent}%)\",\"inline\":true},{\"name\":\"CPU\",\"value\":\"⚡ ${cpu}%\",\"inline\":true}]"
             else
                 fields="[{\"name\":\"Package\",\"value\":\"$pkg\",\"inline\":true}]"
             fi
