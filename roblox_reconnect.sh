@@ -2,10 +2,10 @@
 
 # ─────────────────────────────────────────
 #   ROBLOX AUTO RECONNECT + AUTO RELOG
-#   by: Wardz | versi: 2.4 (Multi-Package Split + Discord) - FIXED SPLIT/FREEFORM
-#   Perbaikan: - Menggunakan -n + activity untuk split/freeform
-#              - Deteksi windowingMode lebih akurat
-#              - Fungsi get_view_activity untuk resolve activity penangan URL
+#   by: Wardz | versi: 2.5 (All Packages + Discord Status Dashboard)
+#   Perbaikan: - Opsi untuk semua package yang terdeteksi
+#              - Status periodik ke Discord (CPU/RAM/uptime per package)
+#              - Tampilan seperti dashboard Kaeru
 # ─────────────────────────────────────────
 
 PKG1=""
@@ -44,8 +44,13 @@ DETECTED_USER_ID=""
 USE_MULTI_PKG=0
 SPLIT_ENABLED=0
 
+# All packages mode
+USE_ALL_PKGS=0
+PKGS=()                     # array of all packages
+STATUS_INTERVAL=3600        # 1 jam
+
 # ─────────────────────────────────────────
-#   PATH PER-PACKAGE
+#   PATH PER-PACKAGE (dynamic)
 # ─────────────────────────────────────────
 
 set_pkg_paths() {
@@ -113,10 +118,10 @@ check_clone_app() {
     if [ "$IS_CLONE_APP" = "true" ]; then
         local reason
         reason=$(echo "$detection_result" | cut -d'|' -f2)
-        log "⚠️ CLONE APP: $reason"
+        log_pkg "$pkg" "⚠️ CLONE APP: $reason"
         return 0
     else
-        log "✅ Direct install detected"
+        log_pkg "$pkg" "✅ Direct install detected"
         return 1
     fi
 }
@@ -205,6 +210,71 @@ EOF
 }
 
 # ─────────────────────────────────────────
+#   STATUS PERIODIK (Dashboard seperti Kaeru)
+# ─────────────────────────────────────────
+
+get_pkg_status() {
+    local pkg=$1
+    local pid=$(ps -A 2>/dev/null | grep "$pkg" | grep -v grep | awk '{print $2}' | head -1)
+    local status="Offline"
+    local uptime="N/A"
+    local ram="N/A"
+    local cpu="N/A"
+    if [ -n "$pid" ]; then
+        status="Online"
+        # uptime (elapsed time)
+        uptime=$(ps -o etime= -p $pid 2>/dev/null | tr -d ' ' | head -1)
+        # RAM in MB (rss in KB)
+        local rss_kb=$(ps -o rss= -p $pid 2>/dev/null | tr -d ' ' | head -1)
+        if [ -n "$rss_kb" ] && [ "$rss_kb" -gt 0 ]; then
+            ram=$(echo "scale=1; $rss_kb/1024" | bc)
+        fi
+        # CPU % from ps (approximate)
+        cpu=$(ps -o %cpu= -p $pid 2>/dev/null | tr -d ' ' | head -1)
+        if [ -z "$cpu" ]; then
+            cpu="N/A"
+        fi
+    fi
+    echo "$status|$uptime|$ram|$cpu"
+}
+
+send_status_update() {
+    if [ "$DISCORD_ENABLED" != "1" ] || [ -z "$DISCORD_WEBHOOK" ]; then
+        return
+    fi
+    local online_count=0
+    local offline_count=0
+    local fields=""
+    for pkg in "${PKGS[@]}"; do
+        IFS='|' read -r status uptime ram cpu <<< "$(get_pkg_status "$pkg")"
+        if [ "$status" = "Online" ]; then
+            online_count=$((online_count+1))
+        else
+            offline_count=$((offline_count+1))
+        fi
+        # Format field
+        local field_value="**Uptime:** $uptime\n**RAM:** ${ram} MB\n**CPU:** ${cpu}%"
+        fields+="{\"name\":\"$pkg\",\"value\":\"$field_value\",\"inline\":true},"
+    done
+    # Remove trailing comma
+    fields=${fields%,}
+    local device=$(getprop ro.product.model 2>/dev/null || echo "Unknown")
+    local timestamp=$(date -u +%Y-%m-%dT%H:%M:%S.000Z)
+    local embed=$(cat <<EOF
+{
+  "title": "Kaeru Status Update",
+  "description": "**Device:** $device\n**Online:** $online_count | **Offline:** $offline_count | **Total:** ${#PKGS[@]}",
+  "color": 5814783,
+  "fields": [$fields],
+  "timestamp": "$timestamp"
+}
+EOF
+)
+    curl -s -X POST "$DISCORD_WEBHOOK" -H "Content-Type: application/json" \
+        -d "{\"embeds\":[$embed]}" > /dev/null 2>&1 &
+}
+
+# ─────────────────────────────────────────
 #   CONFIG FUNCTIONS
 # ─────────────────────────────────────────
 
@@ -267,7 +337,9 @@ clr() { clear 2>/dev/null || printf '\033[2J\033[H'; }
 header() {
     echo "========================================="
     echo "   ROBLOX AUTO RECONNECT + AUTO RELOG"
-    if [ -n "$PKG1" ]; then
+    if [ "${#PKGS[@]}" -gt 0 ]; then
+        echo "   Packages: ${PKGS[*]}"
+    elif [ -n "$PKG1" ]; then
         echo "   Package 1: $PKG1"
     fi
     if [ -n "$PKG2" ] && [ "$USE_MULTI_PKG" = "1" ]; then
@@ -391,21 +463,21 @@ pilih_package() {
     echo "  $label"
     echo ""
 
-    local PKGS=()
+    local PKGS_LIST=()
     while IFS= read -r line; do
-        [ -n "$line" ] && PKGS+=("$line")
+        [ -n "$line" ] && PKGS_LIST+=("$line")
     done < <(detect_roblox_packages)
 
-    if [ ${#PKGS[@]} -eq 0 ]; then
+    if [ ${#PKGS_LIST[@]} -eq 0 ]; then
         echo "  ⚠ Tidak ada package Roblox terdeteksi."
         eval "$var_name=com.roblox.client"
         sleep 2
         return
     fi
 
-    if [ ${#PKGS[@]} -eq 1 ]; then
-        eval "$var_name=${PKGS[0]}"
-        echo "  ℹ️  Package: ${PKGS[0]}"
+    if [ ${#PKGS_LIST[@]} -eq 1 ]; then
+        eval "$var_name=${PKGS_LIST[0]}"
+        echo "  ℹ️  Package: ${PKGS_LIST[0]}"
         sleep 1
         return
     fi
@@ -413,18 +485,24 @@ pilih_package() {
     echo "  📦 Pilih package:"
     echo ""
     local i=1
-    for p in "${PKGS[@]}"; do
+    for p in "${PKGS_LIST[@]}"; do
         echo "  $i) $p"
         i=$((i+1))
     done
     echo ""
-    printf "  Pilih (1-${#PKGS[@]}): "
+    printf "  Pilih (1-${#PKGS_LIST[@]}) atau 'all' untuk semua: "
     read -r PILIH
 
-    if [[ "$PILIH" =~ ^[0-9]+$ ]] && [ "$PILIH" -ge 1 ] && [ "$PILIH" -le "${#PKGS[@]}" ]; then
-        eval "$var_name=${PKGS[$((PILIH-1))]}"
+    if [ "$PILIH" = "all" ]; then
+        # Return all packages as space-separated string via variable
+        eval "$var_name=\"${PKGS_LIST[*]}\""
+        return
+    fi
+
+    if [[ "$PILIH" =~ ^[0-9]+$ ]] && [ "$PILIH" -ge 1 ] && [ "$PILIH" -le "${#PKGS_LIST[@]}" ]; then
+        eval "$var_name=${PKGS_LIST[$((PILIH-1))]}"
     else
-        eval "$var_name=${PKGS[0]}"
+        eval "$var_name=${PKGS_LIST[0]}"
     fi
     
     echo ""
@@ -665,7 +743,7 @@ menu_edit_settings_pkg() {
                 ;;
             3)
                 local new_val; new_val=$([ "$cur_restart" = "1" ] && echo 0 || echo 1)
-                save_config "$cfg_file" "$pkg" "$cur_url" "$cur_mode" "$cur_relog" "$cur_reconnect" "$new_val" "$cur_restart" "$cur_home"
+                save_config "$cfg_file" "$pkg" "$cur_url" "$cur_mode" "$cur_relog" "$cur_reconnect" "$new_val" "$cur_home"
                 echo "  ✅ Restart: $(show_toggle $new_val)"
                 sleep 1
                 ;;
@@ -801,13 +879,11 @@ menu_setup_discord() {
 #   SPLIT SCREEN / FLOATING (FIXED)
 # ─────────────────────────────────────────
 
-# Fungsi untuk mendapatkan activity yang menangani intent VIEW untuk package tertentu
 get_view_activity() {
     local pkg="$1"
     local url="$2"
     local activity=""
 
-    # Coba resolve-activity dengan cmd package (Android 8+)
     if command -v cmd >/dev/null 2>&1; then
         activity=$(cmd package resolve-activity --brief -a android.intent.action.VIEW -d "$url" 2>/dev/null | grep "$pkg/" | head -1)
         if [ -n "$activity" ]; then
@@ -816,20 +892,17 @@ get_view_activity() {
         fi
     fi
 
-    # Fallback: cari dari dumpsys package
     activity=$(dumpsys package "$pkg" 2>/dev/null | grep -A20 "android.intent.action.VIEW" | grep -oE "$pkg/[^ ]+" | head -1)
     if [ -n "$activity" ]; then
         echo "$activity"
         return
     fi
 
-    # Fallback hardcoded (activity umum Roblox)
     echo "$pkg/com.roblox.client.RobloxActivity"
 }
 
 check_windowing_mode() {
     local pkg=$1
-    # Ambil windowingMode dari dumpsys dengan konteks yang lebih akurat
     dumpsys activity activities 2>/dev/null | grep -A10 "package=$pkg" | grep -oE "windowingMode=[0-9]+" | head -1
 }
 
@@ -837,11 +910,11 @@ try_split_screen() {
     local pkg2=$1
     local url2=$2
 
-    log "📱 Mencoba split screen (windowingMode=4) untuk: $pkg2"
+    log_pkg "$pkg2" "📱 Mencoba split screen (windowingMode=4) untuk: $pkg2"
 
     local activity
     activity=$(get_view_activity "$pkg2" "$url2")
-    log "🔍 Menggunakan activity: $activity"
+    log_pkg "$pkg2" "🔍 Menggunakan activity: $activity"
 
     am start -a android.intent.action.VIEW -d "$url2" -n "$activity" -f 0x10000000 --windowingMode 4 2>/dev/null
     sleep 3
@@ -850,13 +923,13 @@ try_split_screen() {
     actual_mode=$(check_windowing_mode "$pkg2")
 
     if echo "$actual_mode" | grep -q "windowingMode=4"; then
-        log "✅ Split screen berhasil ($actual_mode)"
+        log_pkg "$pkg2" "✅ Split screen berhasil ($actual_mode)"
         send_discord_notification "split" "$pkg2" "$PKG1"
         SPLIT_ENABLED=1
         return 0
     fi
 
-    log "⚠️ Split screen gagal/tidak didukung (status: ${actual_mode:-tidak terdeteksi})"
+    log_pkg "$pkg2" "⚠️ Split screen gagal/tidak didukung (status: ${actual_mode:-tidak terdeteksi})"
     return 1
 }
 
@@ -864,7 +937,7 @@ try_floating_window() {
     local pkg2=$1
     local url2=$2
 
-    log "🪟 Fallback: freeform window (windowingMode=5) untuk $pkg2"
+    log_pkg "$pkg2" "🪟 Fallback: freeform window (windowingMode=5) untuk $pkg2"
 
     local activity
     activity=$(get_view_activity "$pkg2" "$url2")
@@ -876,9 +949,9 @@ try_floating_window() {
     actual_mode=$(check_windowing_mode "$pkg2")
 
     if echo "$actual_mode" | grep -q "windowingMode=5"; then
-        log "✅ Freeform window berhasil ($actual_mode)"
+        log_pkg "$pkg2" "✅ Freeform window berhasil ($actual_mode)"
     else
-        log "⚠️ Device tidak support freeform — $pkg2 kemungkinan terbuka fullscreen (status: ${actual_mode:-tidak terdeteksi})"
+        log_pkg "$pkg2" "⚠️ Device tidak support freeform — $pkg2 kemungkinan terbuka fullscreen (status: ${actual_mode:-tidak terdeteksi})"
     fi
 
     send_discord_notification "floating" "$pkg2" "$PKG1"
@@ -886,15 +959,21 @@ try_floating_window() {
 }
 
 # ─────────────────────────────────────────
-#   LOG & CORE
+#   LOG & CORE (dengan dukungan per-package)
 # ─────────────────────────────────────────
 
+log_pkg() {
+    local pkg=$1
+    local msg=$2
+    echo "[$pkg] [$(date +%H:%M:%S)] $msg"
+    # Log ke file per-package
+    local logfile="${LOG_BASE_DIR}/roblox_reconnect_${pkg}.log"
+    echo "[$(date +%H:%M:%S)] $msg" >> "$logfile"
+}
+
+# Untuk kompatibilitas dengan fungsi lama yang menggunakan log()
 log() {
-    local msg=$1
-    echo "[$PKG1] [$(date +%H:%M:%S)] $msg"
-    if [ -f "$PKG1_LOG_FILE" ]; then
-        echo "[$(date +%H:%M:%S)] $msg" >> "$PKG1_LOG_FILE"
-    fi
+    log_pkg "$PKG1" "$1"
 }
 
 build_join_url() {
@@ -943,27 +1022,27 @@ join_server() {
     local url=$2
     local mode=$3
     
-    log "🚀 Jalanin: $pkg"
-    log "🔗 Join URL: $url"
+    log_pkg "$pkg" "🚀 Jalanin: $pkg"
+    log_pkg "$pkg" "🔗 Join URL: $url"
     am force-stop "$pkg"
     sleep 3
     am start -a android.intent.action.VIEW -d "$url" "$pkg"
-    log "✅ Launched"
+    log_pkg "$pkg" "✅ Launched"
 }
 
 wait_ingame() {
     local pkg=$1
-    log "👀 Menunggu INGAME..."
+    log_pkg "$pkg" "👀 Menunggu INGAME..."
     local found=0
     
     timeout 90 logcat -v time 2>/dev/null | grep --line-buffered -i "Connection accepted from" | head -1 > /dev/null
     if [ $? -eq 0 ]; then
         found=1
         IP=$(logcat -v time 2>/dev/null | grep -oE "([0-9]{1,3}\.){3}[0-9]{1,3}" | head -1)
-        log "✅ INGAME! IP: $IP"
+        log_pkg "$pkg" "✅ INGAME! IP: $IP"
         send_discord_notification "reconnect_success" "$IP" "$pkg"
     else
-        log "⏱️ Timeout"
+        log_pkg "$pkg" "⏱️ Timeout"
     fi
 }
 
@@ -972,11 +1051,11 @@ verify_ingame_stable() {
     local cfg_file=$2
     local checks=0
 
-    log "🔁 Tight-monitor 20s pasca-join (fase paling rawan crash)..."
+    log_pkg "$pkg" "🔁 Tight-monitor 20s pasca-join (fase paling rawan crash)..."
     while [ $checks -lt 20 ]; do
         sleep 1
         if ! ps -A 2>/dev/null | grep -q "$pkg"; then
-            log "💥 $pkg mati di fase join (keluar dari jendela crash_monitor biasa) — rejoin paksa"
+            log_pkg "$pkg" "💥 $pkg mati di fase join — rejoin paksa"
             sleep 2
             source "$cfg_file"
             local active_url
@@ -988,14 +1067,14 @@ verify_ingame_stable() {
         fi
         checks=$((checks + 1))
     done
-    log "✅ Stabil pasca-join"
+    log_pkg "$pkg" "✅ Stabil pasca-join"
 }
 
 monitor_events() {
     local pkg=$1
     local cfg_file=$2
     
-    log "🔍 Monitor aktif"
+    log_pkg "$pkg" "🔍 Monitor aktif"
     
     while read -r line; do
         
@@ -1009,7 +1088,7 @@ monitor_events() {
                 reason="Disconnected"
             fi
             
-            log "❌ DC: $reason"
+            log_pkg "$pkg" "❌ DC: $reason"
             send_discord_notification "disconnect" "$reason" "$pkg"
             
             sleep 3
@@ -1029,7 +1108,7 @@ crash_monitor() {
     
     while true; do
         if ! ps -A 2>/dev/null | grep -q "$pkg"; then
-            log "💥 Crash detected"
+            log_pkg "$pkg" "💥 Crash detected"
             send_discord_notification "crash" "App crashed" "$pkg"
             
             sleep 3
@@ -1039,14 +1118,17 @@ crash_monitor() {
             wait_ingame "$pkg"
             verify_ingame_stable "$pkg" "$cfg_file"
             
-            open_second_package
+            # Jika mode multi-package (2 pkg) dan pkg ini adalah PKG1, buka PKG2 lagi
+            if [ "$USE_MULTI_PKG" = "1" ] && [ "$pkg" = "$PKG1" ]; then
+                open_second_package
+            fi
         fi
         sleep 5
     done
 }
 
 # ─────────────────────────────────────────
-#   OPEN SECOND PACKAGE (menggunakan perbaikan)
+#   OPEN SECOND PACKAGE (untuk mode 2 package)
 # ─────────────────────────────────────────
 
 open_second_package() {
@@ -1069,10 +1151,50 @@ open_second_package() {
     local active_url2
     active_url2=$(get_active_url "$mode2" "$url2")
     
-    # Try split, fallback to floating
     if ! try_split_screen "$PKG2" "$active_url2"; then
         try_floating_window "$PKG2" "$active_url2"
     fi
+}
+
+# ─────────────────────────────────────────
+#   START MONITORING UNTUK SATU PACKAGE
+# ─────────────────────────────────────────
+
+start_monitoring_pkg() {
+    local pkg=$1
+    local cfg_file="${CONFIG_BASE_DIR}/roblox_config_${pkg}.cfg"
+    
+    # Pastikan config ada
+    if [ ! -f "$cfg_file" ]; then
+        log_pkg "$pkg" "❌ Config tidak ditemukan, skip"
+        return
+    fi
+    
+    source "$cfg_file"
+    local active_url=$(get_active_url "$MODE" "$URL")
+    
+    # Guard URL kosong
+    if [ -z "$active_url" ] && { [ "$MODE" = "main" ] || [ "$MODE" = "public" ]; }; then
+        log_pkg "$pkg" "❌ URL kosong untuk mode $MODE — skip"
+        return
+    fi
+    
+    # Setup state dir
+    local state_dir="${STATE_BASE_DIR}/rbx_state_${pkg}"
+    mkdir -p "$state_dir"
+    
+    log_pkg "$pkg" "🚀 Memulai monitoring untuk $pkg (mode: $MODE)"
+    
+    # Join server
+    join_server "$pkg" "$active_url" "$MODE"
+    wait_ingame "$pkg"
+    verify_ingame_stable "$pkg" "$cfg_file"
+    
+    # Jalankan monitor event dan crash monitor di background
+    monitor_events "$pkg" "$cfg_file" &
+    crash_monitor "$pkg" "$cfg_file" &
+    
+    log_pkg "$pkg" "✅ Monitoring aktif"
 }
 
 # ─────────────────────────────────────────
@@ -1094,34 +1216,76 @@ echo "  Mau setup untuk berapa package?"
 echo ""
 echo "  1) 1 Package"
 echo "  2) 2 Package (Split + Floating)"
+echo "  3) Semua package yang terdeteksi"
 echo ""
 printf "  Pilih: "
 read -r SETUP_CHOICE
 
 if [ "$SETUP_CHOICE" = "2" ]; then
     USE_MULTI_PKG=1
+    USE_ALL_PKGS=0
+elif [ "$SETUP_CHOICE" = "3" ]; then
+    USE_ALL_PKGS=1
+    USE_MULTI_PKG=0
 else
     USE_MULTI_PKG=0
+    USE_ALL_PKGS=0
 fi
 
-# Setup Package 1
-echo ""
-pilih_package "📦 PILIH PACKAGE 1" PKG1
-set_pkg_paths "$PKG1" "PKG1"
-check_clone_app "$PKG1"
-setup_or_load_pkg "$PKG1" 1
+# Kumpulkan semua package yang terdeteksi
+ALL_DETECTED=()
+while IFS= read -r line; do
+    [ -n "$line" ] && ALL_DETECTED+=("$line")
+done < <(detect_roblox_packages)
 
-# Setup Package 2 (jika dipilih)
-if [ "$USE_MULTI_PKG" = "1" ]; then
+if [ ${#ALL_DETECTED[@]} -eq 0 ]; then
+    echo "  ⚠ Tidak ada package Roblox terdeteksi. Keluar."
+    exit 1
+fi
+
+if [ "$USE_ALL_PKGS" = "1" ]; then
+    PKGS=("${ALL_DETECTED[@]}")
+    echo "  📦 Memilih semua package: ${PKGS[*]}"
+    sleep 2
+else
+    # Pilih package 1
     echo ""
-    pilih_package "📦 PILIH PACKAGE 2" PKG2
-    set_pkg_paths "$PKG2" "PKG2"
-    check_clone_app "$PKG2"
-    setup_or_load_pkg "$PKG2" 2
+    pilih_package "📦 PILIH PACKAGE 1" PKG1
+    # Jika user memilih 'all' saat memilih package 1, maka kita set semua
+    if [[ "$PKG1" == *" "* ]]; then
+        # User memilih all, set PKGS dari hasil pilih_package
+        PKGS=($PKG1)
+        USE_ALL_PKGS=1
+    else
+        # Single package
+        PKGS=("$PKG1")
+    fi
+    if [ "$USE_MULTI_PKG" = "1" ] && [ ${#PKGS[@]} -eq 1 ]; then
+        # Pilih package 2
+        echo ""
+        pilih_package "📦 PILIH PACKAGE 2" PKG2
+        if [[ "$PKG2" != *" "* ]]; then
+            PKGS+=("$PKG2")
+        else
+            # user pilih all untuk PKG2, kita ambil semua yang tersisa
+            # Tapi kita bisa langsung set semua package dari ALL_DETECTED
+            PKGS=("${ALL_DETECTED[@]}")
+            USE_ALL_PKGS=1
+            USE_MULTI_PKG=0
+        fi
+    fi
 fi
 
-# Load Discord settings lama
-PKG1_CFG="${CONFIG_BASE_DIR}/roblox_config_${PKG1}.cfg"
+# Setup config untuk setiap package
+for pkg in "${PKGS[@]}"; do
+    # Set paths (gunakan pkg sebagai base)
+    set_pkg_paths "$pkg" "TMP"  # not used, kita panggil langsung
+    check_clone_app "$pkg"
+    setup_or_load_pkg "$pkg" 1   # pkg_num tidak penting karena kita loop
+done
+
+# Load Discord settings dari package pertama
+PKG1_CFG="${CONFIG_BASE_DIR}/roblox_config_${PKGS[0]}.cfg"
 if [ -f "$PKG1_CFG" ]; then
     DISCORD_ENABLED=$(grep '^DISCORD_ENABLED=' "$PKG1_CFG" | head -1 | cut -d= -f2)
     DISCORD_WEBHOOK=$(grep '^DISCORD_WEBHOOK=' "$PKG1_CFG" | head -1 | cut -d'"' -f2)
@@ -1160,62 +1324,26 @@ if [ "$SETUP_DISCORD" = "1" ]; then
     sleep 2
 fi
 
-# Simpan setting Discord ke config
-persist_discord_settings "${CONFIG_BASE_DIR}/roblox_config_${PKG1}.cfg" "$PKG1"
-if [ "$USE_MULTI_PKG" = "1" ]; then
-    persist_discord_settings "${CONFIG_BASE_DIR}/roblox_config_${PKG2}.cfg" "$PKG2"
+# Simpan Discord settings ke semua config
+for pkg in "${PKGS[@]}"; do
+    persist_discord_settings "${CONFIG_BASE_DIR}/roblox_config_${pkg}.cfg" "$pkg"
+done
+
+# Start monitoring untuk setiap package
+for pkg in "${PKGS[@]}"; do
+    start_monitoring_pkg "$pkg" &
+done
+
+# Start periodic status update jika Discord enabled
+if [ "$DISCORD_ENABLED" = "1" ] && [ -n "$DISCORD_WEBHOOK" ]; then
+    # Kirim status awal segera
+    send_status_update
+    # Loop periodik
+    while true; do
+        sleep $STATUS_INTERVAL
+        send_status_update
+    done &
 fi
-
-# Load config
-source "${CONFIG_BASE_DIR}/roblox_config_${PKG1}.cfg" 2>/dev/null
-
-# START
-mkdir -p "$PKG1_STATE_DIR"
-
-clr
-echo "=========================================" | tee -a "$PKG1_LOG_FILE"
-echo "   ROBLOX AUTO RECONNECT + AUTO RELOG"    | tee -a "$PKG1_LOG_FILE"
-echo "=========================================" | tee -a "$PKG1_LOG_FILE"
-log "Package 1        : $PKG1"
-log "Mode             : $(get_mode_label $MODE)"
-log "Multi Package    : $(show_toggle $USE_MULTI_PKG)"
-if [ "$USE_MULTI_PKG" = "1" ]; then
-    log "Package 2        : $PKG2"
-fi
-log "Discord          : $(show_toggle $DISCORD_ENABLED)"
-echo "=========================================" | tee -a "$PKG1_LOG_FILE"
-echo ""
-
-# Get active URL
-PKG1_ACTIVE_URL=$(get_active_url "$MODE" "$URL")
-
-# Guard: URL kosong
-if [ -z "$PKG1_ACTIVE_URL" ] && { [ "$MODE" = "main" ] || [ "$MODE" = "public" ]; }; then
-    log "❌ FATAL: URL kosong untuk mode $MODE — config rusak atau URL belum pernah diisi"
-    log "   Hapus config dan jalankan ulang: rm ${CONFIG_BASE_DIR}/roblox_config_${PKG1}.cfg"
-    exit 1
-fi
-
-# Join first package
-join_server "$PKG1" "$PKG1_ACTIVE_URL" "$MODE"
-wait_ingame "$PKG1"
-verify_ingame_stable "$PKG1" "${CONFIG_BASE_DIR}/roblox_config_${PKG1}.cfg"
-
-# Open second package if enabled
-if [ "$USE_MULTI_PKG" = "1" ]; then
-    sleep 2
-    open_second_package
-fi
-
-log "🚀 Ready untuk monitoring"
-echo ""
-
-# Start monitors
-monitor_events "$PKG1" "${CONFIG_BASE_DIR}/roblox_config_${PKG1}.cfg" &
-MONITOR_PID=$!
-
-crash_monitor "$PKG1" "${CONFIG_BASE_DIR}/roblox_config_${PKG1}.cfg" &
-CRASH_PID=$!
 
 # Keep alive
 wait
