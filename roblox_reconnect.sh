@@ -2,10 +2,9 @@
 
 # ─────────────────────────────────────────
 #   ROBLOX AUTO RECONNECT + AUTO RELOG
-#   by: Wardz | versi: 2.14 (Sphinx Dashboard - Real Stats)
-#   Perbaikan: - Data CPU, RAM, Uptime diambil dari /proc dan ps secara robust
-#              - Tampilkan persentase RAM, CPU, Uptime di status update
-#              - Connected notification juga menampilkan stats
+#   by: Wardz | versi: 2.15 (Sphinx Dashboard - Kaeru Style)
+#   Layout mengikuti Kaeru Monitor, tanpa license key
+#   Branding Sphinx Community
 # ─────────────────────────────────────────
 
 PKG1=""
@@ -128,7 +127,6 @@ get_proc_stats() {
 
     # 1. Coba dengan ps -o (toybox/toolbox)
     if command -v ps >/dev/null; then
-        # Coba format etime,rss,pcpu
         local ps_data=$(ps -p $pid -o etime,rss,pcpu --no-headers 2>/dev/null)
         if [ -z "$ps_data" ]; then
             ps_data=$(ps -o etime,rss,pcpu -p $pid 2>/dev/null | tail -1)
@@ -149,7 +147,6 @@ get_proc_stats() {
 
     # 2. Jika gagal, ambil dari /proc (lebih andal)
     if [ "$uptime" = "N/A" ] || [ "$ram_mb" = "N/A" ] || [ "$cpu" = "N/A" ]; then
-        # Uptime: hitung dari starttime (field 22) di /proc/$pid/stat
         if [ -r "/proc/$pid/stat" ]; then
             local stat=$(cat /proc/$pid/stat)
             local starttime=$(echo "$stat" | awk '{print $22}')
@@ -169,7 +166,6 @@ get_proc_stats() {
                     fi
                 fi
             fi
-            # RAM: VmRSS dari /proc/$pid/status
             if [ -r "/proc/$pid/status" ]; then
                 local rss_kb=$(grep VmRSS /proc/$pid/status 2>/dev/null | awk '{print $2}')
                 if [ -n "$rss_kb" ] && [ "$rss_kb" -gt 0 ]; then
@@ -181,17 +177,13 @@ get_proc_stats() {
                 fi
             fi
         fi
-        # CPU: coba top jika tersedia
         if [ "$cpu" = "N/A" ]; then
             if command -v top >/dev/null; then
                 local top_data=$(top -n 1 -b -p $pid 2>/dev/null | grep -E "^$pid" | head -1)
                 if [ -n "$top_data" ]; then
-                    # format top: PID USER PR NI VIRT RES SHR S %CPU %MEM TIME+ COMMAND
                     cpu=$(echo "$top_data" | awk '{print $9}')
                 fi
             fi
-            # Jika masih N/A, coba dari /proc/$pid/stat (perhitungan dengan interval)
-            # Untuk sederhana, kita skip karena butuh dua pengukuran.
         fi
     fi
 
@@ -199,8 +191,88 @@ get_proc_stats() {
 }
 
 # ─────────────────────────────────────────
-#   DISCORD WEBHOOK
+#   DISCORD WEBHOOK - LAYOUT KAERU STYLE
 # ─────────────────────────────────────────
+
+get_pkg_status() {
+    local pkg=$1
+    local state_dir="${STATE_BASE_DIR}/rbx_state_${pkg}"
+    local ip_file="${state_dir}/last_ip"
+    local pid=$(ps -A 2>/dev/null | grep "$pkg" | grep -v grep | awk '{print $2}' | head -1)
+    local status="Offline"
+    local uptime="N/A"
+    local ram_mb="N/A"
+    local cpu="N/A"
+    local ip=""
+    local ram_percent="N/A"
+    if [ -f "$ip_file" ]; then
+        ip=$(cat "$ip_file")
+    fi
+    if [ -n "$pid" ]; then
+        status="Online"
+        IFS='|' read -r uptime ram_mb cpu ram_percent <<< "$(get_proc_stats "$pid")"
+    fi
+    echo "$status|$uptime|$ram_mb|$cpu|$ip|$ram_percent"
+}
+
+send_status_update() {
+    if [ "$DISCORD_ENABLED" != "1" ] || [ -z "$DISCORD_WEBHOOK" ]; then
+        return
+    fi
+    local online_count=0
+    local offline_count=0
+    local fields=""
+    for pkg in "${PKGS[@]}"; do
+        IFS='|' read -r status uptime ram_mb cpu ip ram_percent <<< "$(get_pkg_status "$pkg")"
+        if [ "$status" = "Online" ]; then
+            online_count=$((online_count+1))
+        else
+            offline_count=$((offline_count+1))
+        fi
+        local field_value=""
+        if [ "$status" = "Online" ]; then
+            field_value="**Status:** ✅ Online\n**Uptime:** $uptime\n**RAM:** ${ram_mb} MB (${ram_percent}%)\n**CPU:** ${cpu}%\n**IP:** $ip"
+        else
+            field_value="**Status:** ❌ Offline"
+        fi
+        fields+="{\"name\":\"$pkg\",\"value\":\"$field_value\",\"inline\":true},"
+    done
+    fields=${fields%,}
+    local device=$(getprop ro.product.model 2>/dev/null || echo "Unknown")
+    local timestamp=$(date -u +%Y-%m-%dT%H:%M:%S.000Z)
+    local title=""
+    local color=5814783
+    if [ $online_count -gt 0 ]; then
+        title="Connected ✅"
+        color=65280
+    else
+        title="Disconnected ❌"
+        color=16711680
+    fi
+
+    # Layout ala Kaeru Monitor
+    local embed=$(cat <<EOF
+{
+  "title": "Sphinx Status Update",
+  "description": "**Device:** $device\n**Online:** $online_count | **Offline:** $offline_count | **Total:** ${#PKGS[@]}",
+  "color": $color,
+  "thumbnail": {
+    "url": "$BOT_AVATAR_URL"
+  },
+  "fields": [$fields],
+  "footer": {
+    "text": "$BOT_USERNAME",
+    "icon_url": "$BOT_AVATAR_URL"
+  },
+  "timestamp": "$timestamp"
+}
+EOF
+)
+    curl -s -X POST "$DISCORD_WEBHOOK" \
+        -H "Content-Type: application/json" \
+        -d "{\"username\":\"$BOT_USERNAME\",\"avatar_url\":\"$BOT_AVATAR_URL\",\"embeds\":[$embed]}" > /dev/null 2>&1 &
+    echo "  📤 Status update sent: $title ($online_count online, $offline_count offline)"
+}
 
 send_discord_notification() {
     local event_type=$1
@@ -235,7 +307,7 @@ send_discord_notification() {
             embed_title="Connected ✅"
             embed_description="**Server IP:** $details\n**Waktu:** $timestamp"
             embed_color="65280"
-            # Ambil status CPU/RAM dari package
+            # Ambil status lengkap
             IFS='|' read -r status uptime ram_mb cpu ip ram_percent <<< "$(get_pkg_status "$pkg")"
             if [ "$status" = "Online" ]; then
                 fields="[{\"name\":\"Package\",\"value\":\"$pkg\",\"inline\":true},{\"name\":\"Uptime\",\"value\":\"$uptime\",\"inline\":true},{\"name\":\"RAM\",\"value\":\"${ram_mb} MB (${ram_percent}%)\",\"inline\":true},{\"name\":\"CPU\",\"value\":\"${cpu}%\",\"inline\":true}]"
@@ -308,88 +380,6 @@ EOF
     curl -s -X POST "$DISCORD_WEBHOOK" \
         -H "Content-Type: application/json" \
         -d "$payload" > /dev/null 2>&1 &
-}
-
-# ─────────────────────────────────────────
-#   STATUS PERIODIK (Sphinx Dashboard)
-# ─────────────────────────────────────────
-
-get_pkg_status() {
-    local pkg=$1
-    local state_dir="${STATE_BASE_DIR}/rbx_state_${pkg}"
-    local ip_file="${state_dir}/last_ip"
-    local pid=$(ps -A 2>/dev/null | grep "$pkg" | grep -v grep | awk '{print $2}' | head -1)
-    local status="Offline"
-    local uptime="N/A"
-    local ram_mb="N/A"
-    local cpu="N/A"
-    local ip=""
-    local ram_percent="N/A"
-    if [ -f "$ip_file" ]; then
-        ip=$(cat "$ip_file")
-    fi
-    if [ -n "$pid" ]; then
-        status="Online"
-        IFS='|' read -r uptime ram_mb cpu ram_percent <<< "$(get_proc_stats "$pid")"
-    fi
-    echo "$status|$uptime|$ram_mb|$cpu|$ip|$ram_percent"
-}
-
-send_status_update() {
-    if [ "$DISCORD_ENABLED" != "1" ] || [ -z "$DISCORD_WEBHOOK" ]; then
-        return
-    fi
-    local online_count=0
-    local offline_count=0
-    local fields=""
-    for pkg in "${PKGS[@]}"; do
-        IFS='|' read -r status uptime ram_mb cpu ip ram_percent <<< "$(get_pkg_status "$pkg")"
-        if [ "$status" = "Online" ]; then
-            online_count=$((online_count+1))
-        else
-            offline_count=$((offline_count+1))
-        fi
-        local field_value=""
-        if [ "$status" = "Online" ]; then
-            field_value="**Status:** ✅ Online\n**Uptime:** $uptime\n**RAM:** ${ram_mb} MB (${ram_percent}%)\n**CPU:** ${cpu}%\n**IP:** $ip"
-        else
-            field_value="**Status:** ❌ Offline"
-        fi
-        fields+="{\"name\":\"$pkg\",\"value\":\"$field_value\",\"inline\":true},"
-    done
-    fields=${fields%,}
-    local device=$(getprop ro.product.model 2>/dev/null || echo "Unknown")
-    local timestamp=$(date -u +%Y-%m-%dT%H:%M:%S.000Z)
-    local title=""
-    local color=5814783
-    if [ $online_count -gt 0 ]; then
-        title="Connected ✅"
-        color=65280
-    else
-        title="Disconnected ❌"
-        color=16711680
-    fi
-    local embed=$(cat <<EOF
-{
-  "title": "$title",
-  "description": "**Device:** $device\n**Online:** $online_count | **Offline:** $offline_count | **Total:** ${#PKGS[@]}",
-  "color": $color,
-  "thumbnail": {
-    "url": "$BOT_AVATAR_URL"
-  },
-  "fields": [$fields],
-  "footer": {
-    "text": "$BOT_USERNAME",
-    "icon_url": "$BOT_AVATAR_URL"
-  },
-  "timestamp": "$timestamp"
-}
-EOF
-)
-    curl -s -X POST "$DISCORD_WEBHOOK" \
-        -H "Content-Type: application/json" \
-        -d "{\"username\":\"$BOT_USERNAME\",\"avatar_url\":\"$BOT_AVATAR_URL\",\"embeds\":[$embed]}" > /dev/null 2>&1 &
-    echo "  📤 Status update sent: $title ($online_count online, $offline_count offline)"
 }
 
 # ─────────────────────────────────────────
@@ -944,7 +934,7 @@ menu_setup_discord() {
 }
 
 # ─────────────────────────────────────────
-#   SPLIT SCREEN / FLOATING (tidak dipakai di mode semua package)
+#   SPLIT SCREEN / FLOATING
 # ─────────────────────────────────────────
 
 get_view_activity() {
