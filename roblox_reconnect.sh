@@ -994,51 +994,63 @@ verify_ingame_stable() {
 monitor_events() {
     local pkg=$1
     local cfg_file=$2
-    
-    log "🔍 Monitor aktif"
-    
-    while read -r line; do
-        
-        if echo "$line" | grep -qi "Sending disconnect with reason\|Connection lost\|Lost connection\|Disconnected from server"; then
-            local reason
-            if echo "$line" | grep -qi "Sending disconnect"; then
-                reason="Sending disconnect"
-            elif echo "$line" | grep -qi "Connection lost"; then
-                reason="Connection lost"
-            else
-                reason="Disconnected"
+
+    # Outer loop: restart otomatis kalau logcat pipe tutup (disconnect,
+    # Android kill proses logcat, dll). Sebelumnya fungsi ini langsung
+    # return saat pipe selesai → background process mati → wait di MAIN
+    # kehabisan job → script exit ke Termux shell.
+    while true; do
+        log "🔍 Monitor aktif"
+
+        while read -r line; do
+            if echo "$line" | grep -qi "Sending disconnect with reason\|Connection lost\|Lost connection\|Disconnected from server"; then
+                local reason
+                if echo "$line" | grep -qi "Sending disconnect"; then
+                    reason="Sending disconnect"
+                elif echo "$line" | grep -qi "Connection lost"; then
+                    reason="Connection lost"
+                else
+                    reason="Disconnected"
+                fi
+
+                log "❌ DC: $reason"
+                send_discord_notification "disconnect" "$reason" "$pkg"
+
+                sleep 3
+                source "$cfg_file" 2>/dev/null
+                local active_url=$(get_active_url "$MODE" "$URL")
+                join_server "$pkg" "$active_url" "$MODE"
+                wait_ingame "$pkg"
+                verify_ingame_stable "$pkg" "$cfg_file"
             fi
-            
-            log "❌ DC: $reason"
-            send_discord_notification "disconnect" "$reason" "$pkg"
-            
-            sleep 3
-            source "$cfg_file"
-            local active_url=$(get_active_url "$MODE" "$URL")
-            join_server "$pkg" "$active_url" "$MODE"
-            wait_ingame "$pkg"
-            verify_ingame_stable "$pkg" "$cfg_file"
-        fi
-        
-    done < <(logcat -v time 2>/dev/null | grep --line-buffered -iE "Sending disconnect|Connection lost|Lost connection|Disconnected from server")
+
+        done < <(logcat -v time 2>/dev/null | grep --line-buffered -iE "Sending disconnect|Connection lost|Lost connection|Disconnected from server")
+
+        log "⚠️ logcat pipe tutup — restart monitor dalam 3s..."
+        sleep 3
+    done
 }
 
 crash_monitor() {
     local pkg=$1
     local cfg_file=$2
-    
+
+    # Loop ini TIDAK BOLEH pernah exit — kalau crash_monitor mati,
+    # `wait` di MAIN kehilangan job terakhirnya dan script exit ke shell.
+    # Tambahkan trap lokal dan outer loop sebagai safety net.
     while true; do
         if ! ps -A 2>/dev/null | grep -q "$pkg"; then
             log "💥 Crash detected"
             send_discord_notification "crash" "App crashed" "$pkg"
-            
+
             sleep 3
-            source "$cfg_file"
+            # source dengan 2>/dev/null biar tidak exit kalau file tidak ada
+            source "$cfg_file" 2>/dev/null || true
             local active_url=$(get_active_url "$MODE" "$URL")
             join_server "$pkg" "$active_url" "$MODE"
             wait_ingame "$pkg"
             verify_ingame_stable "$pkg" "$cfg_file"
-            
+
             open_second_package
         fi
         sleep 5
@@ -1217,5 +1229,25 @@ MONITOR_PID=$!
 crash_monitor "$PKG1" "${CONFIG_BASE_DIR}/roblox_config_${PKG1}.cfg" &
 CRASH_PID=$!
 
-# Keep alive
-wait
+# Keep alive — loop ini TIDAK BOLEH selesai.
+# Bug sebelumnya: bare `wait` — begitu semua background job mati
+# (misal monitor_events exit karena logcat pipe tutup), `wait` return
+# dan script selesai → balik ke Termux shell ("Welcome to Termux!").
+# Fix: infinite loop yang juga restart monitor kalau mati.
+while true; do
+    # Restart monitor_events jika prosesnya tidak ada lagi
+    if ! kill -0 "$MONITOR_PID" 2>/dev/null; then
+        log "⚠️ monitor_events mati — restart otomatis"
+        monitor_events "$PKG1" "${CONFIG_BASE_DIR}/roblox_config_${PKG1}.cfg" &
+        MONITOR_PID=$!
+    fi
+
+    # Restart crash_monitor jika prosesnya tidak ada lagi
+    if ! kill -0 "$CRASH_PID" 2>/dev/null; then
+        log "⚠️ crash_monitor mati — restart otomatis"
+        crash_monitor "$PKG1" "${CONFIG_BASE_DIR}/roblox_config_${PKG1}.cfg" &
+        CRASH_PID=$!
+    fi
+
+    sleep "$CHECK_INTERVAL"
+done
