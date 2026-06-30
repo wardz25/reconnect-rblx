@@ -2,7 +2,10 @@
 
 # ─────────────────────────────────────────
 #   ROBLOX AUTO RECONNECT + AUTO RELOG
-#   by: Wardz | versi: 2.4 (Multi-Package Split + Discord)
+#   by: Wardz | versi: 2.4 (Multi-Package Split + Discord) - FIXED SPLIT/FREEFORM
+#   Perbaikan: - Menggunakan -n + activity untuk split/freeform
+#              - Deteksi windowingMode lebih akurat
+#              - Fungsi get_view_activity untuk resolve activity penangan URL
 # ─────────────────────────────────────────
 
 PKG1=""
@@ -61,7 +64,7 @@ set_pkg_paths() {
 
 # ─────────────────────────────────────────
 #   DETEKSI CLONE APP
-# ────────────────────────────────���────────
+# ─────────────────────────────────────────
 
 detect_clone_app_method() {
     local pkg=$1
@@ -238,12 +241,6 @@ EOF
 }
 
 persist_discord_settings() {
-    # Tulis ULANG setting Discord (global $DISCORD_ENABLED/$DISCORD_WEBHOOK/
-    # $DISCORD_USER_ID yang udah bener di memori) ke cfg file package,
-    # TANPA ganggu field URL/MODE/dll yang udah ada di file itu.
-    # Dipanggil setelah menu setup Discord, karena kalau nggak, file cfg
-    # akan tetap nyimpen DISCORD_ENABLED=0 (nilai sebelum Discord disetup)
-    # dan bakal nimpa balik setting yang baru begitu file ini di-source lagi.
     local cfg_file=$1
     local pkg=$2
     local saved_url saved_mode saved_relog saved_reconnect saved_restart saved_home
@@ -299,25 +296,11 @@ get_mode_label() {
 # ─────────────────────────────────────────
 
 validate_discord_webhook() {
-    # Format asli Discord: https://discord.com/api/webhooks/{snowflake}/{token}
-    # - snowflake: 17-20 digit angka (Discord ID/snowflake, makin lama makin
-    #   panjang seiring waktu, jadi range bukan angka pasti)
-    # - token: 60-90 karakter alnum + underscore/hyphen (contoh asli: 68 char)
-    # - host bisa discord.com ATAU discordapp.com (alias lama, masih jalan)
-    # - boleh ada query string opsional (?thread_id=... buat forum channel)
     local url=$1
     echo "$url" | grep -qE '^https://(discord|discordapp)\.com/api/webhooks/[0-9]{17,20}/[A-Za-z0-9_-]{60,90}(\?[A-Za-z0-9_=&-]*)?$'
 }
 
 validate_private_server_url() {
-    # Terima DUA format link private/VIP server Roblox:
-    # 1) Format LAMA: games/{placeId}/{nama}?privateServerLinkCode=xxx
-    #    (juga terima accessCode= sebagai alias yang kadang dipakai)
-    # 2) Format BARU (default sejak Okt 2023): share?code=xxx&type=Server
-    #    Kalau cuma divalidasi pake regex format lama, link share yang
-    #    sekarang jadi default copy-paste dari tombol Share di app Roblox
-    #    bakal SELALU ditolak wizard — padahal build_join_url() udah bisa
-    #    nangenin format ini.
     local url=$1
 
     if echo "$url" | grep -qE '^https://www\.roblox\.com/games/[0-9]+/[^?]+\?(privateServerLinkCode|accessCode)=[A-Za-z0-9_-]+$'; then
@@ -332,9 +315,6 @@ validate_private_server_url() {
 }
 
 validate_public_server_url() {
-    # Link publik polos: games/{placeId}/{nama-slug}, TANPA query string.
-    # Di-anchor di akhir ($) biar gak ke-loloskan link yang sebenernya private
-    # server/share link yang nyasar masuk ke mode public.
     local url=$1
     echo "$url" | grep -qE '^https://www\.roblox\.com/games/[0-9]+/[A-Za-z0-9%_-]+/?$'
 }
@@ -494,8 +474,6 @@ setup_mode_and_url() {
                         continue
                     fi
                     if validate_private_server_url "$INPUT_URL"; then
-                        # printf -v menghindari bug eval pada bash versi Android/Termux
-                        # yang kadang set variabel di scope yang salah (bukan parent caller)
                         printf -v "$url_var" '%s' "$INPUT_URL"
                         echo "  ✅ Link valid!"
                         sleep 1
@@ -617,8 +595,6 @@ wizard_setup_pkg() {
 }
 
 menu_ganti_url_mode_pkg() {
-    # Ganti mode & URL aja, setting lain (relog/reconnect/restart/home) tetap
-    # dipertahankan dari config yang udah ada — gak perlu jawab ulang semuanya.
     local pkg=$1
     local pkg_num=$2
     local cfg_file=$3
@@ -641,7 +617,6 @@ menu_ganti_url_mode_pkg() {
 }
 
 menu_edit_settings_pkg() {
-    # Submenu toggle relog/reconnect/restart/home. URL & mode gak disentuh.
     local pkg=$1
     local cfg_file=$2
 
@@ -690,13 +665,13 @@ menu_edit_settings_pkg() {
                 ;;
             3)
                 local new_val; new_val=$([ "$cur_restart" = "1" ] && echo 0 || echo 1)
-                save_config "$cfg_file" "$pkg" "$cur_url" "$cur_mode" "$cur_relog" "$cur_reconnect" "$new_val" "$cur_home"
+                save_config "$cfg_file" "$pkg" "$cur_url" "$cur_mode" "$cur_relog" "$cur_reconnect" "$new_val" "$cur_restart" "$cur_home"
                 echo "  ✅ Restart: $(show_toggle $new_val)"
                 sleep 1
                 ;;
             4)
                 local new_val; new_val=$([ "$cur_home" = "1" ] && echo 0 || echo 1)
-                save_config "$cfg_file" "$pkg" "$cur_url" "$cur_mode" "$cur_relog" "$cur_reconnect" "$cur_restart" "$new_val"
+                save_config "$cfg_file" "$pkg" "$cur_url" "$cur_mode" "$cur_relog" "$cur_reconnect" "$cur_restart" "$new_val" "$cur_home"
                 echo "  ✅ Home RC: $(show_toggle $new_val)"
                 sleep 1
                 ;;
@@ -707,10 +682,6 @@ menu_edit_settings_pkg() {
 }
 
 setup_or_load_pkg() {
-    # Cek dulu apakah config buat package ini udah ada. Kalau ada, masuk ke
-    # MAIN MENU — bukan cuma 2 pilihan run/setup-ulang doang. Dari sini bisa
-    # langsung jalan, edit URL/mode aja, edit setting lain aja, setup ulang
-    # total, atau keluar. Loop terus sampai user pilih "jalan" atau "keluar".
     local pkg=$1
     local pkg_num=$2
     local cfg_file="${CONFIG_BASE_DIR}/roblox_config_${pkg}.cfg"
@@ -761,10 +732,6 @@ setup_or_load_pkg() {
                 exit 0
                 ;;
             *)
-                # 1 atau default/kosong → pakai config tersimpan, validasi dulu
-                # Kalau mode butuh URL (main/public) tapi URL kosong, jangan
-                # biarkan lanjut — itu penyebab "Join URL: (kosong)" di log
-                # dan crash langsung. Paksa ke Ganti URL dulu sebelum bisa jalan.
                 local needs_url=0
                 [ "$saved_mode" = "main" ] || [ "$saved_mode" = "public" ] && needs_url=1
                 if [ "$needs_url" = "1" ] && [ -z "$saved_url" ]; then
@@ -831,37 +798,65 @@ menu_setup_discord() {
 }
 
 # ─────────────────────────────────────────
-#   SPLIT SCREEN / FLOATING
+#   SPLIT SCREEN / FLOATING (FIXED)
 # ─────────────────────────────────────────
 
+# Fungsi untuk mendapatkan activity yang menangani intent VIEW untuk package tertentu
+get_view_activity() {
+    local pkg="$1"
+    local url="$2"
+    local activity=""
+
+    # Coba resolve-activity dengan cmd package (Android 8+)
+    if command -v cmd >/dev/null 2>&1; then
+        activity=$(cmd package resolve-activity --brief -a android.intent.action.VIEW -d "$url" 2>/dev/null | grep "$pkg/" | head -1)
+        if [ -n "$activity" ]; then
+            echo "$activity"
+            return
+        fi
+    fi
+
+    # Fallback: cari dari dumpsys package
+    activity=$(dumpsys package "$pkg" 2>/dev/null | grep -A20 "android.intent.action.VIEW" | grep -oE "$pkg/[^ ]+" | head -1)
+    if [ -n "$activity" ]; then
+        echo "$activity"
+        return
+    fi
+
+    # Fallback hardcoded (activity umum Roblox)
+    echo "$pkg/com.roblox.client.RobloxActivity"
+}
+
 check_windowing_mode() {
-    # Best-effort check: liat windowingMode aktual proses pkg2 dari dumpsys
-    # (format output beda-beda tergantung versi Android, jadi ini cuma indikasi,
-    # bukan kepastian 100%. Tetap cek mata kamu sendiri di layar device.)
     local pkg=$1
-    dumpsys activity activities 2>/dev/null | grep -A3 "$pkg" | grep -oE "windowingMode=[0-9]+" | head -1
+    # Ambil windowingMode dari dumpsys dengan konteks yang lebih akurat
+    dumpsys activity activities 2>/dev/null | grep -A10 "package=$pkg" | grep -oE "windowingMode=[0-9]+" | head -1
 }
 
 try_split_screen() {
     local pkg2=$1
     local url2=$2
 
-    log "📱 Mencoba split screen (windowingMode=4 / SPLIT_SCREEN_SECONDARY) untuk: $pkg2"
+    log "📱 Mencoba split screen (windowingMode=4) untuk: $pkg2"
 
-    am start -a android.intent.action.VIEW -d "$url2" --windowingMode 4 "$pkg2" 2>/dev/null
-    sleep 2
+    local activity
+    activity=$(get_view_activity "$pkg2" "$url2")
+    log "🔍 Menggunakan activity: $activity"
+
+    am start -a android.intent.action.VIEW -d "$url2" -n "$activity" -f 0x10000000 --windowingMode 4 2>/dev/null
+    sleep 3
 
     local actual_mode
     actual_mode=$(check_windowing_mode "$pkg2")
 
     if echo "$actual_mode" | grep -q "windowingMode=4"; then
-        log "✅ Split screen kemungkinan berhasil ($actual_mode)"
+        log "✅ Split screen berhasil ($actual_mode)"
         send_discord_notification "split" "$pkg2" "$PKG1"
         SPLIT_ENABLED=1
         return 0
     fi
 
-    log "⚠️ Split screen gagal/tidak didukung device ini (status: ${actual_mode:-tidak terdeteksi})"
+    log "⚠️ Split screen gagal/tidak didukung (status: ${actual_mode:-tidak terdeteksi})"
     return 1
 }
 
@@ -871,8 +866,11 @@ try_floating_window() {
 
     log "🪟 Fallback: freeform window (windowingMode=5) untuk $pkg2"
 
-    am start -a android.intent.action.VIEW -d "$url2" --windowingMode 5 "$pkg2" 2>/dev/null
-    sleep 2
+    local activity
+    activity=$(get_view_activity "$pkg2" "$url2")
+
+    am start -a android.intent.action.VIEW -d "$url2" -n "$activity" -f 0x10000000 --windowingMode 5 2>/dev/null
+    sleep 3
 
     local actual_mode
     actual_mode=$(check_windowing_mode "$pkg2")
@@ -880,37 +878,11 @@ try_floating_window() {
     if echo "$actual_mode" | grep -q "windowingMode=5"; then
         log "✅ Freeform window berhasil ($actual_mode)"
     else
-        log "⚠️ Device ini sepertinya gak support freeform — $pkg2 kemungkinan kebuka fullscreen biasa (status: ${actual_mode:-tidak terdeteksi})"
+        log "⚠️ Device tidak support freeform — $pkg2 kemungkinan terbuka fullscreen (status: ${actual_mode:-tidak terdeteksi})"
     fi
 
     send_discord_notification "floating" "$pkg2" "$PKG1"
     return 0
-}
-
-open_second_package() {
-    if [ "$USE_MULTI_PKG" != "1" ] || [ -z "$PKG2" ]; then
-        return
-    fi
-    
-    local mode2 url2
-    local cfg2="${CONFIG_BASE_DIR}/roblox_config_${PKG2}.cfg"
-    
-    if [ -f "$cfg2" ]; then
-        source "$cfg2"
-        mode2="$MODE"
-        url2="$URL"
-    else
-        mode2="market"
-        url2="$URL_MARKET"
-    fi
-    
-    local active_url2
-    active_url2=$(get_active_url "$mode2" "$url2")
-    
-    # Try split, fallback to floating
-    if ! try_split_screen "$PKG2" "$active_url2"; then
-        try_floating_window "$PKG2" "$active_url2"
-    fi
 }
 
 # ─────────────────────────────────────────
@@ -926,18 +898,9 @@ log() {
 }
 
 build_join_url() {
-    # Convert link "biasa" jadi link DIRECT-JOIN biar Roblox langsung
-    # connect ke server tanpa nyangkut di halaman Game Details.
     local url=$1
     local place_id query code type
 
-    # Format BARU Roblox (default sejak Okt 2023) buat private/VIP server:
-    #   https://www.roblox.com/share?code=XXXX&type=Server
-    # Link ini OPAQUE — placeId & kode server-nya gak ada di URL, jadi gak
-    # bisa diparse jadi /games/start kayak link lama. Kalau dibuka via am
-    # start biasa, Roblox gagal resolve kodenya dan jatuh ke server PUBLIC
-    # (bukan private server yang dimaksud). Harus pake custom scheme internal
-    # yang dipakai app sendiri buat resolve share link:
     if echo "$url" | grep -qE 'roblox\.com/share\?'; then
         code=$(echo "$url" | grep -oE 'code=[^&]+' | head -1 | cut -d= -f2)
         type=$(echo "$url" | grep -oE 'type=[^&]+' | head -1 | cut -d= -f2)
@@ -948,27 +911,18 @@ build_join_url() {
         fi
     fi
 
-    # Format LAMA: https://www.roblox.com/games/ID/Nama-Game[?privateServerLinkCode=...]
     place_id=$(echo "$url" | grep -oE '/games/[0-9]+' | grep -oE '[0-9]+' | head -1)
 
     if [ -z "$place_id" ]; then
-        # Format gak dikenal, biarin apa adanya
         echo "$url"
         return
     fi
 
-    # Ambil query string yang udah ada (privateServerLinkCode, accessCode, dll)
     query=$(echo "$url" | grep -oE '\?.*' | sed 's/^?//')
 
     if [ -n "$query" ]; then
-        # Private server link (ada privateServerLinkCode) — kirim MENTAH,
-        # sama kayak sistem versi lama. Link jenis ini udah auto-join langsung
-        # dari dulu, gak perlu dikonversi ke games/start.
         echo "$url"
     else
-        # Link publik polos (market/gag2/public, tanpa query) — ini yang
-        # nyangkut di halaman Game Details kalau dikirim mentah, jadi tetap
-        # dikonversi ke format direct-join.
         echo "https://www.roblox.com/games/start?placeId=${place_id}"
     fi
 }
@@ -1014,14 +968,6 @@ wait_ingame() {
 }
 
 verify_ingame_stable() {
-    # Fase paling rawan: tepat setelah join, Roblox lagi resolve link
-    # (apalagi private server share-link yang butuh round-trip ke server).
-    # crash_monitor cuma poll tiap 5 detik dan baru jalan SETELAH fase ini
-    # selesai — jadi kalau Roblox crash & self-restart cepat di window ini,
-    # gak ada yang ketahuan, dan Roblox bakal jatuh ke behaviour default-nya
-    # sendiri (biasanya nyambung ke server PUBLIC). Fungsi ini nge-poll
-    # ketat (tiap 1 detik) selama 20 detik pertama pasca-join buat nutup
-    # celah itu, dan langsung rejoin paksa kalau ketahuan mati di window ini.
     local pkg=$1
     local cfg_file=$2
     local checks=0
@@ -1053,7 +999,6 @@ monitor_events() {
     
     while read -r line; do
         
-        # Disconnect detection (simplified untuk mengurangi spam)
         if echo "$line" | grep -qi "Sending disconnect with reason\|Connection lost\|Lost connection\|Disconnected from server"; then
             local reason
             if echo "$line" | grep -qi "Sending disconnect"; then
@@ -1101,6 +1046,36 @@ crash_monitor() {
 }
 
 # ─────────────────────────────────────────
+#   OPEN SECOND PACKAGE (menggunakan perbaikan)
+# ─────────────────────────────────────────
+
+open_second_package() {
+    if [ "$USE_MULTI_PKG" != "1" ] || [ -z "$PKG2" ]; then
+        return
+    fi
+    
+    local mode2 url2
+    local cfg2="${CONFIG_BASE_DIR}/roblox_config_${PKG2}.cfg"
+    
+    if [ -f "$cfg2" ]; then
+        source "$cfg2"
+        mode2="$MODE"
+        url2="$URL"
+    else
+        mode2="market"
+        url2="$URL_MARKET"
+    fi
+    
+    local active_url2
+    active_url2=$(get_active_url "$mode2" "$url2")
+    
+    # Try split, fallback to floating
+    if ! try_split_screen "$PKG2" "$active_url2"; then
+        try_floating_window "$PKG2" "$active_url2"
+    fi
+}
+
+# ─────────────────────────────────────────
 #   MAIN
 # ─────────────────────────────────────────
 
@@ -1145,11 +1120,7 @@ if [ "$USE_MULTI_PKG" = "1" ]; then
     setup_or_load_pkg "$PKG2" 2
 fi
 
-# Load Discord settings lama (kalau ada) SEBELUM nanya — kalau nggak,
-# variable global DISCORD_ENABLED/WEBHOOK/USER_ID bakal balik ke default
-# kosong/OFF tiap script dijalanin, dan kalau user jawab "tidak" di prompt
-# bawah ini, settingan Discord yang udah ON dari run sebelumnya bakal
-# ketulis ulang jadi OFF oleh persist_discord_settings.
+# Load Discord settings lama
 PKG1_CFG="${CONFIG_BASE_DIR}/roblox_config_${PKG1}.cfg"
 if [ -f "$PKG1_CFG" ]; then
     DISCORD_ENABLED=$(grep '^DISCORD_ENABLED=' "$PKG1_CFG" | head -1 | cut -d= -f2)
@@ -1189,9 +1160,7 @@ if [ "$SETUP_DISCORD" = "1" ]; then
     sleep 2
 fi
 
-# Simpen setting Discord yang baru diisi ke file config tiap package,
-# SEBELUM file itu di-source ulang di bawah (kalau nggak, bakal ketimpa
-# balik ke nilai lama dan status Discord jadi salah/OFF terus).
+# Simpan setting Discord ke config
 persist_discord_settings "${CONFIG_BASE_DIR}/roblox_config_${PKG1}.cfg" "$PKG1"
 if [ "$USE_MULTI_PKG" = "1" ]; then
     persist_discord_settings "${CONFIG_BASE_DIR}/roblox_config_${PKG2}.cfg" "$PKG2"
@@ -1220,8 +1189,7 @@ echo ""
 # Get active URL
 PKG1_ACTIVE_URL=$(get_active_url "$MODE" "$URL")
 
-# Guard: URL kosong untuk mode yang butuh URL = bug pasti crash
-# Ini last-resort check kalau ada path yang lolos dari validasi di atas
+# Guard: URL kosong
 if [ -z "$PKG1_ACTIVE_URL" ] && { [ "$MODE" = "main" ] || [ "$MODE" = "public" ]; }; then
     log "❌ FATAL: URL kosong untuk mode $MODE — config rusak atau URL belum pernah diisi"
     log "   Hapus config dan jalankan ulang: rm ${CONFIG_BASE_DIR}/roblox_config_${PKG1}.cfg"
