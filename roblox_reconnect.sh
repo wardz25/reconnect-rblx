@@ -2,10 +2,12 @@
 
 # ──────────────────────────────────────────────────────────────
 #   ROBLOX AUTO RECONNECT + AUTO RELOG
-#   by: Wardz | versi: 2.20
-#   Perbaikan: - Tambahan Temperatur di System Stats
-#              - Application Details: nama package, uptime (🕐), RAM (💾), CPU (⚡)
-#              - Layout Kaeru style dengan emoji
+#   by: Wardz | versi: 2.21
+#   Perbaikan: - PID detection lebih akurat (pgrep -x)
+#              - wait_ingame handling jika PID tidak ditemukan
+#              - monitor_events restart lebih bersih
+#              - Dashboard error compression lebih baik
+#              - Split screen dicoba untuk 2 package pertama di mode semua
 # ──────────────────────────────────────────────────────────────
 
 PKG1=""
@@ -134,7 +136,6 @@ get_proc_stats() {
     local cpu="N/A"
     local ram_percent="N/A"
 
-    # Coba dengan ps -o
     if command -v ps >/dev/null; then
         local ps_data=$(ps -p $pid -o etime,rss,pcpu --no-headers 2>/dev/null)
         if [ -z "$ps_data" ]; then
@@ -154,7 +155,6 @@ get_proc_stats() {
         fi
     fi
 
-    # Fallback ke /proc
     if [ "$uptime" = "N/A" ] || [ "$ram_mb" = "N/A" ] || [ "$cpu" = "N/A" ]; then
         if [ -r "/proc/$pid/stat" ]; then
             local stat=$(cat /proc/$pid/stat)
@@ -205,7 +205,6 @@ get_proc_stats() {
 
 get_temperature() {
     local temp="N/A"
-    # Coba thermal zone yang umum
     if [ -r "/sys/class/thermal/thermal_zone0/temp" ]; then
         temp=$(cat /sys/class/thermal/thermal_zone0/temp 2>/dev/null | awk '{print int($1/1000)}')
     fi
@@ -278,7 +277,7 @@ get_pkg_status() {
     local pkg=$1
     local state_dir="${STATE_BASE_DIR}/rbx_state_${pkg}"
     local ip_file="${state_dir}/last_ip"
-    local pid=$(pgrep -f "$pkg" 2>/dev/null | head -1)
+    local pid=$(pgrep -x "$pkg" 2>/dev/null | head -1)
     local status="Offline"
     local uptime="N/A"
     local ram_mb="N/A"
@@ -298,11 +297,8 @@ get_pkg_status() {
 send_status_update() {
     if [ "$DISCORD_ENABLED" != "1" ] || [ -z "$DISCORD_WEBHOOK" ]; then return; fi
 
-    # ── Timestamp realtime ────────────────────────────────────────────────
     local now_epoch; now_epoch=$(date +%s)
-    # Waktu sekarang (realtime — tiap kali webhook dikirim = waktu terkini)
     local now_str; now_str=$(date "+%B %d, %Y %I:%M %p")
-    # Selisih sejak webhook terakhir (untuk "(X minutes ago)")
     [ "$LAST_UPDATE_EPOCH" -eq 0 ] && LAST_UPDATE_EPOCH=$now_epoch
     local diff=$(( now_epoch - LAST_UPDATE_EPOCH ))
     local ago_str
@@ -313,22 +309,17 @@ send_status_update() {
     else ago_str="$((diff/86400)) days ago"; fi
     LAST_UPDATE_EPOCH=$now_epoch
 
-    # ── System stats ──────────────────────────────────────────────────────
     IFS='|' read -r total_ram_mb used_ram_mb ram_percent cpu_load temp \
         <<< "$(get_system_stats)"
     local free_mb=$(( total_ram_mb - used_ram_mb ))
     local free_pct=$(( 100 - ${ram_percent%%.*} ))
 
-    # ── Device info ───────────────────────────────────────────────────────
     local device_model; device_model=$(getprop ro.product.model 2>/dev/null || echo "Unknown")
 
-    # ── Per-package rows ──────────────────────────────────────────────────
     local online_count=0 offline_count=0 app_lines=""
     for pkg in "${PKGS[@]}"; do
         IFS='|' read -r pkg_status uptime ram_mb cpu _ip rp \
             <<< "$(get_pkg_status "$pkg")"
-        # Nama package disembunyikan dengan Discord spoiler ||nama||
-        # sehingga harus diklik untuk reveal — persis seperti format yang diminta
         if [ "$pkg_status" = "Online" ]; then
             online_count=$(( online_count + 1 ))
             app_lines+="🟢 ||${pkg}||\n"
@@ -342,8 +333,6 @@ send_status_update() {
     local total_pkg=${#PKGS[@]}
     [ -z "$app_lines" ] && app_lines="Tidak ada package aktif\n"
 
-    # ── Build description (semua dalam satu block, mirip Kaeru) ───────────
-    # Urutan stats: CPU → RAM → Temp (sesuai permintaan)
     local desc
     desc="**Last Updated:** ${now_str} (${ago_str})\n\n"
     desc+="📱 **Device** \`${device_model}\`\n\n"
@@ -444,11 +433,6 @@ send_discord_notification() {
             embed_title="🪟 Freeform Window"
             embed_color=10181046
             embed_desc="**Package:** ${spkg}\n**Waktu:** ${timestamp}"
-            ;;
-        "lag")
-            embed_title="⚠️ Frame Drop"
-            embed_color=16776960
-            embed_desc="**Package:** ${spkg}\n**Detail:** ${details}\n**Waktu:** ${timestamp}"
             ;;
         *)
             embed_title="ℹ️ Info"
@@ -1133,11 +1117,6 @@ open_second_package() {
 # ──────────────────────────────────────────────────────────────
 
 log_pkg() {
-    # Sebelumnya fungsi ini echo langsung ke terminal — karena tiap package
-    # punya background monitor sendiri yang manggil ini bersamaan, hasilnya
-    # baris-baris saling tumpang tindih dan acak (itu yang bikin layar penuh
-    # spam). Sekarang ditulis ke file log saja; dashboard yang baru menjadi
-    # satu-satunya hal yang menulis ke terminal.
     local pkg=$1
     local msg=$2
     local logfile="${LOG_BASE_DIR}/roblox_reconnect_${pkg}.log"
@@ -1146,7 +1125,6 @@ log_pkg() {
 }
 
 set_pkg_status() {
-    # Update status satu baris untuk package ini, dibaca oleh dashboard.
     local pkg=$1
     local status=$2
     local state_dir="${STATE_BASE_DIR}/rbx_state_${pkg}"
@@ -1161,9 +1139,6 @@ get_pkg_status_label() {
 }
 
 log_error() {
-    # Catat error ke log terpusat. Dashboard akan mengompresnya jadi
-    # "ERROR Nx" kalau pesan yang sama muncul berulang, bukan menumpuk
-    # baris yang sama berkali-kali seperti sebelumnya.
     local pkg=$1
     local msg=$2
     mkdir -p "$(dirname "$DASH_ERR_FILE")" 2>/dev/null
@@ -1172,9 +1147,6 @@ log_error() {
 }
 
 render_error_panel() {
-    # Kompres error yang sama (pkg+pesan identik) jadi satu baris dengan
-    # counter "ERROR Nx" — bukan baris berulang. Pakai bash asosiatif array,
-    # bukan awk, supaya tidak butuh paket tambahan di Termux.
     [ -f "$DASH_ERR_FILE" ] || { echo "  ✅ Tidak ada error"; return; }
 
     declare -A err_count
@@ -1210,8 +1182,6 @@ render_error_panel() {
 }
 
 draw_dashboard() {
-    # Dashboard tabel statis yang refresh berkala — menggantikan log mentah
-    # yang sebelumnya ditulis langsung oleh tiap background monitor.
     while true; do
         clr
         local now; now=$(date +%H:%M:%S)
@@ -1285,9 +1255,9 @@ join_server() {
     set_pkg_status "$pkg" "Launching..."
     log_pkg "$pkg" "🚀 Jalanin: $pkg"
     log_pkg "$pkg" "🔗 Join URL: $url"
-    am force-stop "$pkg"
+    am force-stop "$pkg" 2>/dev/null
     sleep 3
-    am start -a android.intent.action.VIEW -d "$url" "$pkg"
+    am start -a android.intent.action.VIEW -d "$url" "$pkg" 2>/dev/null
     log_pkg "$pkg" "✅ Launched"
     set_pkg_status "$pkg" "Launched"
 }
@@ -1296,11 +1266,13 @@ wait_ingame() {
     local pkg=$1
     set_pkg_status "$pkg" "Joining..."
     log_pkg "$pkg" "👀 Menunggu INGAME..."
-    local pid=$(pgrep -f "$pkg" 2>/dev/null | head -1)
+    # Tunggu sebentar agar proses benar-benar mulai
+    sleep 5
+    local pid=$(pgrep -x "$pkg" 2>/dev/null | head -1)
     if [ -z "$pid" ]; then
-        log_pkg "$pkg" "⚠️ Proses tidak ditemukan, skip wait_ingame"
+        log_pkg "$pkg" "❌ PID tidak ditemukan setelah launch"
         log_error "$pkg" "PID tidak ditemukan"
-        set_pkg_status "$pkg" "⚠ Error"
+        set_pkg_status "$pkg" "❌ No PID"
         return
     fi
     local state_dir="${STATE_BASE_DIR}/rbx_state_${pkg}"
@@ -1314,8 +1286,9 @@ wait_ingame() {
         send_discord_notification "reconnect_success" "$IP" "$pkg"
         set_pkg_status "$pkg" "Ready"
     else
-        log_pkg "$pkg" "⏱️ Timeout"
+        log_pkg "$pkg" "⏱️ Timeout 90s"
         log_error "$pkg" "Join timeout 90s"
+        set_pkg_status "$pkg" "⚠ Timeout"
     fi
 }
 
@@ -1323,10 +1296,10 @@ verify_ingame_stable() {
     local pkg=$1
     local cfg_file=$2
     local checks=0
-    log_pkg "$pkg" "🔁 Tight-monitor 20s pasca-join (fase paling rawan crash)..."
+    log_pkg "$pkg" "🔁 Tight-monitor 20s pasca-join..."
     while [ $checks -lt 20 ]; do
         sleep 1
-        if ! pgrep -f "$pkg" >/dev/null 2>&1; then
+        if ! pgrep -x "$pkg" >/dev/null 2>&1; then
             log_pkg "$pkg" "💥 $pkg mati di fase join — rejoin paksa"
             log_error "$pkg" "Mati saat fase join"
             set_pkg_status "$pkg" "Reconnecting..."
@@ -1350,7 +1323,7 @@ monitor_events() {
     log_pkg "$pkg" "🔍 Monitor aktif"
     local pid
     while true; do
-        pid=$(pgrep -f "$pkg" 2>/dev/null | head -1)
+        pid=$(pgrep -x "$pkg" 2>/dev/null | head -1)
         if [ -n "$pid" ]; then
             break
         fi
@@ -1369,7 +1342,6 @@ monitor_events() {
             log_pkg "$pkg" "❌ DC: $reason"
             log_error "$pkg" "Disconnect: $reason"
             set_pkg_status "$pkg" "Reconnecting..."
-            # Simpan stats terakhir sebelum disconnect
             save_last_stats "$pkg"
             send_discord_notification "disconnect" "$reason" "$pkg"
             sleep 3
@@ -1390,7 +1362,7 @@ crash_monitor() {
     local cfg_file=$2
     local missing_count=0
     while true; do
-        if pgrep -f "$pkg" >/dev/null 2>&1; then
+        if pgrep -x "$pkg" >/dev/null 2>&1; then
             missing_count=0
         else
             missing_count=$((missing_count + 1))
@@ -1398,7 +1370,6 @@ crash_monitor() {
                 log_pkg "$pkg" "💥 Crash detected"
                 log_error "$pkg" "App crashed"
                 set_pkg_status "$pkg" "Crashed → Relaunch"
-                # Simpan stats terakhir sebelum crash
                 save_last_stats "$pkg"
                 send_discord_notification "crash" "App crashed" "$pkg"
                 sleep 3
@@ -1471,7 +1442,7 @@ read -r SETUP_CHOICE
 
 if [ "$SETUP_CHOICE" = "2" ]; then
     USE_ALL_PKGS=1
-    USE_MULTI_PKG=0
+    USE_MULTI_PKG=1   # tetap aktif untuk split 2 package pertama
     PKGS=()
     while IFS= read -r line; do
         [ -n "$line" ] && PKGS+=("$line")
@@ -1481,6 +1452,9 @@ if [ "$SETUP_CHOICE" = "2" ]; then
         exit 1
     fi
     PKG1="${PKGS[0]}"
+    if [ ${#PKGS[@]} -ge 2 ]; then
+        PKG2="${PKGS[1]}"
+    fi
 else
     USE_ALL_PKGS=0
     USE_MULTI_PKG=0
@@ -1554,6 +1528,7 @@ for pkg in "${PKGS[@]}"; do
 done
 echo "Monitoring Aktif" > "$SYSTEM_STATUS_FILE"
 
+# Coba split untuk 2 package pertama jika ada
 if [ "$USE_MULTI_PKG" = "1" ] && [ -n "$PKG2" ]; then
     sleep 10
     open_second_package
@@ -1570,11 +1545,6 @@ if [ "$DISCORD_ENABLED" = "1" ] && [ -n "$DISCORD_WEBHOOK" ]; then
     ) &
 fi
 
-# Dashboard jadi proses foreground utama. Sebelumnya script tidak punya
-# foreground loop di akhir sehingga semua background monitor menulis
-# langsung (dan acak) ke terminal yang sama. Sekarang dashboard inilah
-# satu-satunya yang menulis ke terminal, dengan status tiap package dan
-# error yang dikompres ("ERROR Nx") bukan baris berulang.
 sleep 2
 draw_dashboard
 
