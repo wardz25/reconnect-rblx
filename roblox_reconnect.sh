@@ -49,6 +49,11 @@ BOT_AVATAR_URL="https://raw.githubusercontent.com/wardz25/updater/main/sphinx.pn
 # Untuk last update
 LAST_UPDATE_EPOCH=0
 
+# Dashboard
+DASH_ERR_FILE="${STATE_BASE_DIR}/dashboard_errors.log"
+SYSTEM_STATUS_FILE="${STATE_BASE_DIR}/dashboard_system_status"
+DASH_REFRESH=2
+
 # ──────────────────────────────────────────────────────────────
 #   PATH PER-PACKAGE
 # ──────────────────────────────────────────────────────────────
@@ -293,54 +298,59 @@ get_pkg_status() {
 send_status_update() {
     if [ "$DISCORD_ENABLED" != "1" ] || [ -z "$DISCORD_WEBHOOK" ]; then return; fi
 
-    # ── Timestamp "Last Updated" ──────────────────────────────────────────
+    # ── Timestamp realtime ────────────────────────────────────────────────
     local now_epoch; now_epoch=$(date +%s)
+    # Waktu sekarang (realtime — tiap kali webhook dikirim = waktu terkini)
+    local now_str; now_str=$(date "+%B %d, %Y %I:%M %p")
+    # Selisih sejak webhook terakhir (untuk "(X minutes ago)")
     [ "$LAST_UPDATE_EPOCH" -eq 0 ] && LAST_UPDATE_EPOCH=$now_epoch
     local diff=$(( now_epoch - LAST_UPDATE_EPOCH ))
-    local last_str; last_str=$(date -d "@$LAST_UPDATE_EPOCH" "+%B %d, %Y %I:%M %p" 2>/dev/null \
-        || date "+%B %d, %Y %I:%M %p")
     local ago_str
-    if   [ $diff -lt 60 ];    then ago_str="${diff} seconds ago"
+    if   [ $diff -lt 10 ];    then ago_str="just now"
+    elif [ $diff -lt 60 ];    then ago_str="${diff} seconds ago"
     elif [ $diff -lt 3600 ];  then ago_str="$((diff/60)) minutes ago"
     elif [ $diff -lt 86400 ]; then ago_str="$((diff/3600)) hours ago"
     else ago_str="$((diff/86400)) days ago"; fi
     LAST_UPDATE_EPOCH=$now_epoch
 
-    # ── System stats ─────────────────────────────────────────────────────
+    # ── System stats ──────────────────────────────────────────────────────
     IFS='|' read -r total_ram_mb used_ram_mb ram_percent cpu_load temp \
         <<< "$(get_system_stats)"
-    local free_ram_mb=$(( total_ram_mb - used_ram_mb ))
+    local free_mb=$(( total_ram_mb - used_ram_mb ))
     local free_pct=$(( 100 - ${ram_percent%%.*} ))
+
+    # ── Device info ───────────────────────────────────────────────────────
+    local device_model; device_model=$(getprop ro.product.model 2>/dev/null || echo "Unknown")
 
     # ── Per-package rows ──────────────────────────────────────────────────
     local online_count=0 offline_count=0 app_lines=""
     for pkg in "${PKGS[@]}"; do
-        IFS='|' read -r status uptime ram_mb cpu ip ram_percent2 \
+        IFS='|' read -r pkg_status uptime ram_mb cpu _ip rp \
             <<< "$(get_pkg_status "$pkg")"
-        # Tampilkan nama package singkat (hapus "com.roblox.")
-        local short="${pkg#com.roblox.}"
-        if [ "$status" = "Online" ]; then
+        # Nama package disembunyikan dengan Discord spoiler ||nama||
+        # sehingga harus diklik untuk reveal — persis seperti format yang diminta
+        if [ "$pkg_status" = "Online" ]; then
             online_count=$(( online_count + 1 ))
-            app_lines+="🟢 \`${short}\`\n"
+            app_lines+="🟢 ||${pkg}||\n"
             app_lines+="  ↳ 🕐 ${uptime}  |  💾 ${ram_mb} MB  |  ⚡ ${cpu}%\n"
         else
             offline_count=$(( offline_count + 1 ))
-            app_lines+="🔴 \`${short}\`  —  Offline\n"
+            app_lines+="🔴 ||${pkg}||  —  Offline\n"
         fi
+        save_last_stats "$pkg"
     done
     local total_pkg=${#PKGS[@]}
+    [ -z "$app_lines" ] && app_lines="Tidak ada package aktif\n"
 
-    # ── Device info ───────────────────────────────────────────────────────
-    local device_model; device_model=$(getprop ro.product.model 2>/dev/null || echo "Unknown")
-    local sphinx_ver="SPHINX-$(date +%Y%m)"
-
-    # ── Embed description (mirip Kaeru layout) ────────────────────────────
-    local desc="**Last Updated:** ${last_str} (${ago_str})\n\n"
-    desc+="📱 **Device** \`${device_model}\`  ┊  🔰 **Version** \`${sphinx_ver}\`\n\n"
+    # ── Build description (semua dalam satu block, mirip Kaeru) ───────────
+    # Urutan stats: CPU → RAM → Temp (sesuai permintaan)
+    local desc
+    desc="**Last Updated:** ${now_str} (${ago_str})\n\n"
+    desc+="📱 **Device** \`${device_model}\`\n\n"
     desc+="─────────────────────────\n"
     desc+="💻 **System Stats**\n"
-    desc+="🐏 RAM: **${free_ram_mb}MB** free (${free_pct}%)\n"
     desc+="⚡ CPU: **${cpu_load}%**\n"
+    desc+="🐏 RAM: **${free_mb}MB** free (${free_pct}%)\n"
     desc+="🌡️ Temp: **${temp}°C**\n\n"
     desc+="─────────────────────────\n"
     desc+="📊 **Status Overview**\n"
@@ -350,7 +360,9 @@ send_status_update() {
     desc+="${app_lines}"
 
     local mention=""
-    [ -n "$DISCORD_USER_ID" ] && mention="<@$DISCORD_USER_ID> "
+    [ -n "$DISCORD_USER_ID" ] && mention="<@${DISCORD_USER_ID}> "
+
+    local ts_iso; ts_iso=$(date -u +%Y-%m-%dT%H:%M:%S.000Z)
 
     local payload
     payload=$(cat <<SPHINX_EOF
@@ -359,14 +371,15 @@ send_status_update() {
   "avatar_url": "${BOT_AVATAR_URL}",
   "content": "${mention}",
   "embeds": [{
-    "title": "📡 Sphinx Status Update",
+    "title": "📊 Sphinx Status Update",
     "description": "${desc}",
     "color": 15105570,
+    "thumbnail": { "url": "${BOT_AVATAR_URL}" },
     "footer": {
       "text": "Sphinx Monitor  •  ${device_model}",
       "icon_url": "${BOT_AVATAR_URL}"
     },
-    "timestamp": "$(date -u +%Y-%m-%dT%H:%M:%S.000Z)"
+    "timestamp": "${ts_iso}"
   }]
 }
 SPHINX_EOF
@@ -382,74 +395,73 @@ send_discord_notification() {
     local pkg=$3
     if [ "$DISCORD_ENABLED" != "1" ] || [ -z "$DISCORD_WEBHOOK" ]; then return; fi
 
-    local timestamp; timestamp=$(date '+%Y-%m-%d %H:%M:%S')
-    local short_pkg="${pkg#com.roblox.}"
-    local embed_color embed_title embed_desc fields
+    local timestamp; timestamp=$(date '+%B %d, %Y %I:%M %p')
+    local spkg="||${pkg}||"
+    local embed_color embed_title embed_desc
 
-    # Stats terakhir package yang bersangkutan
-    IFS='|' read -r last_uptime last_ram last_cpu last_rampct \
-        <<< "$(get_last_stats "$pkg")"
-
-    # System stats saat event
-    IFS='|' read -r total_ram_mb used_ram_mb ram_pct cpu_load temp \
-        <<< "$(get_system_stats)"
-    local device_model; device_model=$(getprop ro.product.model 2>/dev/null || echo "Unknown")
-    local free_ram=$(( total_ram_mb - used_ram_mb ))
+    IFS='|' read -r last_uptime last_ram last_cpu last_rampct <<< "$(get_last_stats "$pkg")"
+    IFS='|' read -r total_ram_mb used_ram_mb ram_pct cpu_load temp <<< "$(get_system_stats)"
+    local free_mb=$(( total_ram_mb - used_ram_mb ))
+    local free_pct=$(( 100 - ${ram_pct%%.*} ))
 
     case $event_type in
         "disconnect")
             embed_title="❌ Disconnected"
             embed_color=15548997
-            embed_desc="**Package:** \`${short_pkg}\`\n**Alasan:** ${details}\n**Waktu:** ${timestamp}\n\n"
+            embed_desc="**Package:** ${spkg}\n**Alasan:** ${details}\n**Waktu:** ${timestamp}\n\n"
+            embed_desc+="─────────────────────────\n"
             embed_desc+="📊 **Stats sebelum DC**\n"
-            embed_desc+="🕐 Uptime: ${last_uptime}\n💾 RAM: ${last_ram} MB (${last_rampct}%)\n⚡ CPU: ${last_cpu}%"
+            embed_desc+="⚡ CPU: ${last_cpu}%\n🐏 RAM: ${last_ram} MB (${last_rampct}%)\n🕐 Uptime: ${last_uptime}"
             ;;
         "crash")
             embed_title="💥 App Crash"
             embed_color=15548997
-            embed_desc="**Package:** \`${short_pkg}\`\n**Info:** ${details}\n**Waktu:** ${timestamp}\n\n"
+            embed_desc="**Package:** ${spkg}\n**Info:** ${details}\n**Waktu:** ${timestamp}\n\n"
+            embed_desc+="─────────────────────────\n"
             embed_desc+="📊 **Stats sebelum crash**\n"
-            embed_desc+="🕐 Uptime: ${last_uptime}\n💾 RAM: ${last_ram} MB\n⚡ CPU: ${last_cpu}%"
+            embed_desc+="⚡ CPU: ${last_cpu}%\n🐏 RAM: ${last_ram} MB\n🕐 Uptime: ${last_uptime}"
             ;;
         "relog")
             embed_title="🔄 Relog"
             embed_color=16776960
-            embed_desc="**Package:** \`${short_pkg}\`\n**Waktu:** ${timestamp}"
+            embed_desc="**Package:** ${spkg}\n**Waktu:** ${timestamp}"
             ;;
         "reconnect_success")
             embed_title="✅ Account Recovered"
             embed_color=5763719
-            IFS='|' read -r s uptime ram_mb cpu ip rp <<< "$(get_pkg_status "$pkg")"
-            embed_desc="**Package:** \`${short_pkg}\`\n**Server:** ${details}\n**Waktu:** ${timestamp}\n\n"
+            IFS='|' read -r s uptime ram_mb cpu _ip rp <<< "$(get_pkg_status "$pkg")"
+            embed_desc="**Package:** ${spkg}\n**Server:** ${details}\n**Waktu:** ${timestamp}\n\n"
+            embed_desc+="─────────────────────────\n"
             embed_desc+="📊 **Stats sekarang**\n"
-            embed_desc+="🕐 Uptime: ${uptime}\n💾 RAM: ${ram_mb} MB (${rp}%)\n⚡ CPU: ${cpu}%"
+            embed_desc+="⚡ CPU: ${cpu}%\n🐏 RAM: ${ram_mb} MB (${rp}%)\n🕐 Uptime: ${uptime}"
             ;;
         "split")
             embed_title="📱 Split Screen"
             embed_color=3447003
-            embed_desc="**Packages:** \`${short_pkg}\`\n**Waktu:** ${timestamp}"
+            embed_desc="**Package:** ${spkg}\n**Waktu:** ${timestamp}"
             ;;
         "floating")
             embed_title="🪟 Freeform Window"
             embed_color=10181046
-            embed_desc="**Package:** \`${short_pkg}\`\n**Waktu:** ${timestamp}"
+            embed_desc="**Package:** ${spkg}\n**Waktu:** ${timestamp}"
             ;;
         "lag")
             embed_title="⚠️ Frame Drop"
             embed_color=16776960
-            embed_desc="**Package:** \`${short_pkg}\`\n**Detail:** ${details}\n**Waktu:** ${timestamp}"
+            embed_desc="**Package:** ${spkg}\n**Detail:** ${details}\n**Waktu:** ${timestamp}"
             ;;
         *)
             embed_title="ℹ️ Info"
             embed_color=9807270
-            embed_desc="**Package:** \`${short_pkg}\`\n**Detail:** ${details}\n**Waktu:** ${timestamp}"
+            embed_desc="**Package:** ${spkg}\n**Detail:** ${details}\n**Waktu:** ${timestamp}"
             ;;
     esac
 
     local mention=""
-    [ -n "$DISCORD_USER_ID" ] && mention="<@$DISCORD_USER_ID> "
+    [ -n "$DISCORD_USER_ID" ] && mention="<@${DISCORD_USER_ID}> "
 
-    local sys_footer="📱 ${device_model}  |  🐏 RAM free: ${free_ram}MB  |  ⚡ CPU: ${cpu_load}%  |  🌡️ ${temp}°C"
+    local sys_footer="⚡ CPU: ${cpu_load}%  |  🐏 RAM: ${free_mb}MB free (${free_pct}%)  |  🌡️ ${temp}°C  •  Sphinx Monitor"
+    local ts_iso; ts_iso=$(date -u +%Y-%m-%dT%H:%M:%S.000Z)
 
     local payload
     payload=$(cat <<SPHINX_EOF
@@ -461,11 +473,12 @@ send_discord_notification() {
     "title": "${embed_title}",
     "description": "${embed_desc}",
     "color": ${embed_color},
+    "thumbnail": { "url": "${BOT_AVATAR_URL}" },
     "footer": {
-      "text": "${sys_footer}  •  Sphinx Monitor",
+      "text": "${sys_footer}",
       "icon_url": "${BOT_AVATAR_URL}"
     },
-    "timestamp": "$(date -u +%Y-%m-%dT%H:%M:%S.000Z)"
+    "timestamp": "${ts_iso}"
   }]
 }
 SPHINX_EOF
@@ -1120,11 +1133,113 @@ open_second_package() {
 # ──────────────────────────────────────────────────────────────
 
 log_pkg() {
+    # Sebelumnya fungsi ini echo langsung ke terminal — karena tiap package
+    # punya background monitor sendiri yang manggil ini bersamaan, hasilnya
+    # baris-baris saling tumpang tindih dan acak (itu yang bikin layar penuh
+    # spam). Sekarang ditulis ke file log saja; dashboard yang baru menjadi
+    # satu-satunya hal yang menulis ke terminal.
     local pkg=$1
     local msg=$2
-    echo "[$pkg] [$(date +%H:%M:%S)] $msg"
     local logfile="${LOG_BASE_DIR}/roblox_reconnect_${pkg}.log"
-    echo "[$(date +%H:%M:%S)] $msg" >> "$logfile"
+    mkdir -p "$(dirname "$logfile")" 2>/dev/null
+    echo "[$(date +%H:%M:%S)] $msg" >> "$logfile" 2>/dev/null
+}
+
+set_pkg_status() {
+    # Update status satu baris untuk package ini, dibaca oleh dashboard.
+    local pkg=$1
+    local status=$2
+    local state_dir="${STATE_BASE_DIR}/rbx_state_${pkg}"
+    mkdir -p "$state_dir" 2>/dev/null
+    echo "$status" > "$state_dir/dash_status" 2>/dev/null
+}
+
+get_pkg_status_label() {
+    local pkg=$1
+    local f="${STATE_BASE_DIR}/rbx_state_${pkg}/dash_status"
+    [ -f "$f" ] && cat "$f" 2>/dev/null || echo "Menunggu..."
+}
+
+log_error() {
+    # Catat error ke log terpusat. Dashboard akan mengompresnya jadi
+    # "ERROR Nx" kalau pesan yang sama muncul berulang, bukan menumpuk
+    # baris yang sama berkali-kali seperti sebelumnya.
+    local pkg=$1
+    local msg=$2
+    mkdir -p "$(dirname "$DASH_ERR_FILE")" 2>/dev/null
+    echo "$(date +%H:%M:%S)|${pkg}|${msg}" >> "$DASH_ERR_FILE" 2>/dev/null
+    set_pkg_status "$pkg" "⚠ Error"
+}
+
+render_error_panel() {
+    # Kompres error yang sama (pkg+pesan identik) jadi satu baris dengan
+    # counter "ERROR Nx" — bukan baris berulang. Pakai bash asosiatif array,
+    # bukan awk, supaya tidak butuh paket tambahan di Termux.
+    [ -f "$DASH_ERR_FILE" ] || { echo "  ✅ Tidak ada error"; return; }
+
+    declare -A err_count
+    declare -A err_last
+    local n=0
+    while IFS='|' read -r _ts pkg msg; do
+        [ -z "$pkg" ] && continue
+        n=$((n+1))
+        local key="${pkg}::${msg}"
+        err_count["$key"]=$(( ${err_count["$key"]:-0} + 1 ))
+        err_last["$key"]=$n
+    done < <(tail -n 300 "$DASH_ERR_FILE" 2>/dev/null)
+
+    if [ ${#err_count[@]} -eq 0 ]; then
+        echo "  ✅ Tidak ada error"
+        return
+    fi
+
+    local shown=0
+    for key in "${!err_last[@]}"; do
+        echo "${err_last[$key]}|$key"
+    done | sort -t'|' -k1 -rn | head -5 | while IFS='|' read -r _ key; do
+        local pkg="${key%%::*}"
+        local msg="${key#*::}"
+        local cnt="${err_count[$key]}"
+        if [ "$cnt" -gt 1 ]; then
+            printf "  \033[31m✖ ERROR %sx\033[0m — %s [%s]\n" "$cnt" "$msg" "$pkg"
+        else
+            printf "  \033[31m✖ ERROR\033[0m — %s [%s]\n" "$msg" "$pkg"
+        fi
+        shown=$((shown+1))
+    done
+}
+
+draw_dashboard() {
+    # Dashboard tabel statis yang refresh berkala — menggantikan log mentah
+    # yang sebelumnya ditulis langsung oleh tiap background monitor.
+    while true; do
+        clr
+        local now; now=$(date +%H:%M:%S)
+        IFS='|' read -r total_ram_mb used_ram_mb ram_pct cpu_load temp \
+            <<< "$(get_system_stats)"
+        local free_mb=$(( total_ram_mb - used_ram_mb ))
+        local free_pct=$(( 100 - ${ram_pct%%.*} ))
+        local sys_status; sys_status=$(cat "$SYSTEM_STATUS_FILE" 2>/dev/null || echo "Monitoring Aktif")
+
+        printf "\033[36m=========================================\033[0m\n"
+        printf "\033[36m   SPHINX MONITOR  •  %s\033[0m\n" "$now"
+        printf "\033[36m=========================================\033[0m\n"
+        printf "\033[36m%-30s %s\033[0m\n" "PACKAGE" "STATUS"
+        printf "\033[36m-----------------------------------------\033[0m\n"
+        printf "%-30s %s\n" "System" "$sys_status"
+        printf "%-30s Free: %sMB (%s%%)\n" "Memory" "$free_mb" "$free_pct"
+        printf "\033[36m-----------------------------------------\033[0m\n"
+        for pkg in "${PKGS[@]}"; do
+            local st; st=$(get_pkg_status_label "$pkg")
+            printf "%-30s \033[32m%s\033[0m\n" "$pkg" "$st"
+        done
+        printf "\033[36m-----------------------------------------\033[0m\n"
+        echo "ERRORS"
+        render_error_panel
+        printf "\033[36m=========================================\033[0m\n"
+        echo "[Ctrl+C untuk stop]"
+        sleep "$DASH_REFRESH"
+    done
 }
 
 build_join_url() {
@@ -1167,20 +1282,25 @@ join_server() {
     local pkg=$1
     local url=$2
     local mode=$3
+    set_pkg_status "$pkg" "Launching..."
     log_pkg "$pkg" "🚀 Jalanin: $pkg"
     log_pkg "$pkg" "🔗 Join URL: $url"
     am force-stop "$pkg"
     sleep 3
     am start -a android.intent.action.VIEW -d "$url" "$pkg"
     log_pkg "$pkg" "✅ Launched"
+    set_pkg_status "$pkg" "Launched"
 }
 
 wait_ingame() {
     local pkg=$1
+    set_pkg_status "$pkg" "Joining..."
     log_pkg "$pkg" "👀 Menunggu INGAME..."
     local pid=$(pgrep -f "$pkg" 2>/dev/null | head -1)
     if [ -z "$pid" ]; then
         log_pkg "$pkg" "⚠️ Proses tidak ditemukan, skip wait_ingame"
+        log_error "$pkg" "PID tidak ditemukan"
+        set_pkg_status "$pkg" "⚠ Error"
         return
     fi
     local state_dir="${STATE_BASE_DIR}/rbx_state_${pkg}"
@@ -1190,11 +1310,12 @@ wait_ingame() {
         IP=$(logcat --pid="$pid" -v time 2>/dev/null | grep -oE "([0-9]{1,3}\.){3}[0-9]{1,3}" | head -1)
         log_pkg "$pkg" "✅ INGAME! IP: $IP"
         echo "$IP" > "$state_dir/last_ip"
-        # Simpan stats terakhir
         save_last_stats "$pkg"
         send_discord_notification "reconnect_success" "$IP" "$pkg"
+        set_pkg_status "$pkg" "Ready"
     else
         log_pkg "$pkg" "⏱️ Timeout"
+        log_error "$pkg" "Join timeout 90s"
     fi
 }
 
@@ -1207,6 +1328,8 @@ verify_ingame_stable() {
         sleep 1
         if ! pgrep -f "$pkg" >/dev/null 2>&1; then
             log_pkg "$pkg" "💥 $pkg mati di fase join — rejoin paksa"
+            log_error "$pkg" "Mati saat fase join"
+            set_pkg_status "$pkg" "Reconnecting..."
             sleep 2
             source "$cfg_file"
             local active_url
@@ -1244,6 +1367,8 @@ monitor_events() {
                 reason="Disconnected"
             fi
             log_pkg "$pkg" "❌ DC: $reason"
+            log_error "$pkg" "Disconnect: $reason"
+            set_pkg_status "$pkg" "Reconnecting..."
             # Simpan stats terakhir sebelum disconnect
             save_last_stats "$pkg"
             send_discord_notification "disconnect" "$reason" "$pkg"
@@ -1271,6 +1396,8 @@ crash_monitor() {
             missing_count=$((missing_count + 1))
             if [ $missing_count -ge 3 ]; then
                 log_pkg "$pkg" "💥 Crash detected"
+                log_error "$pkg" "App crashed"
+                set_pkg_status "$pkg" "Crashed → Relaunch"
                 # Simpan stats terakhir sebelum crash
                 save_last_stats "$pkg"
                 send_discord_notification "crash" "App crashed" "$pkg"
@@ -1291,15 +1418,20 @@ crash_monitor() {
 
 start_monitoring_pkg() {
     local pkg=$1
+    set_pkg_status "$pkg" "Menunggu..."
     local cfg_file="${CONFIG_BASE_DIR}/roblox_config_${pkg}.cfg"
     if [ ! -f "$cfg_file" ]; then
         log_pkg "$pkg" "❌ Config tidak ditemukan, skip"
+        log_error "$pkg" "Config tidak ditemukan"
+        set_pkg_status "$pkg" "⚠ No Config"
         return
     fi
     source "$cfg_file"
     local active_url=$(get_active_url "$MODE" "$URL")
     if [ -z "$active_url" ] && { [ "$MODE" = "main" ] || [ "$MODE" = "public" ]; }; then
         log_pkg "$pkg" "❌ URL kosong untuk mode $MODE — skip"
+        log_error "$pkg" "URL kosong (mode: $MODE)"
+        set_pkg_status "$pkg" "⚠ URL Kosong"
         return
     fi
     local state_dir="${STATE_BASE_DIR}/rbx_state_${pkg}"
@@ -1409,10 +1541,18 @@ for pkg in "${PKGS[@]}"; do
     persist_discord_settings "${CONFIG_BASE_DIR}/roblox_config_${pkg}.cfg" "$pkg"
 done
 
+_total_pkg=${#PKGS[@]}
+_i=0
 for pkg in "${PKGS[@]}"; do
+    _i=$((_i+1))
+    _remaining=$(( (_total_pkg - _i) * 2 ))
+    if [ "$_remaining" -gt 0 ]; then
+        echo "Launch Delay: ${_remaining}s..." > "$SYSTEM_STATUS_FILE"
+    fi
     start_monitoring_pkg "$pkg" &
     sleep 2
 done
+echo "Monitoring Aktif" > "$SYSTEM_STATUS_FILE"
 
 if [ "$USE_MULTI_PKG" = "1" ] && [ -n "$PKG2" ]; then
     sleep 10
@@ -1420,13 +1560,22 @@ if [ "$USE_MULTI_PKG" = "1" ] && [ -n "$PKG2" ]; then
 fi
 
 if [ "$DISCORD_ENABLED" = "1" ] && [ -n "$DISCORD_WEBHOOK" ]; then
-    echo "  ⏳ Menunggu 15 detik sebelum status update pertama..."
-    sleep 15
-    send_status_update
-    while true; do
-        sleep $STATUS_INTERVAL
+    (
+        sleep 15
         send_status_update
-    done &
+        while true; do
+            sleep $STATUS_INTERVAL
+            send_status_update
+        done
+    ) &
 fi
+
+# Dashboard jadi proses foreground utama. Sebelumnya script tidak punya
+# foreground loop di akhir sehingga semua background monitor menulis
+# langsung (dan acak) ke terminal yang sama. Sekarang dashboard inilah
+# satu-satunya yang menulis ke terminal, dengan status tiap package dan
+# error yang dikompres ("ERROR Nx") bukan baris berulang.
+sleep 2
+draw_dashboard
 
 wait
