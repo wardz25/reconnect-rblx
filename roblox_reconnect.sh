@@ -972,13 +972,20 @@ verify_ingame_stable() {
     local cfg_file=$2
     local checks=0
 
-    log "🔁 Tight-monitor 20s pasca-join (fase paling rawan crash)..."
+    log "🔁 Tight-monitor 20s pasca-join..."
     while [ $checks -lt 20 ]; do
         sleep 1
-        if ! ps -A 2>/dev/null | grep -q "$pkg"; then
-            log "💥 $pkg mati di fase join (keluar dari jendela crash_monitor biasa) — rejoin paksa"
+        local main_pid
+        main_pid=$(get_pid_for_pkg "$pkg")
+        local alive=0
+        if [ -n "$main_pid" ] && [ -d "/proc/$main_pid" ]; then
+            local cmdline; cmdline=$(cat "/proc/$main_pid/cmdline" 2>/dev/null | tr -d '\0')
+            echo "$cmdline" | grep -q "$pkg" && alive=1
+        fi
+        if [ "$alive" = "0" ]; then
+            log "💥 $pkg mati di fase join — rejoin paksa"
             sleep 2
-            source "$cfg_file"
+            source "$cfg_file" 2>/dev/null || true
             local active_url
             active_url=$(get_active_url "$MODE" "$URL")
             join_server "$pkg" "$active_url" "$MODE"
@@ -1034,26 +1041,122 @@ monitor_events() {
 crash_monitor() {
     local pkg=$1
     local cfg_file=$2
+    local miss_count=0
+    local state_dir="${STATE_BASE_DIR}/rbx_state_${pkg}"
 
-    # Loop ini TIDAK BOLEH pernah exit — kalau crash_monitor mati,
-    # `wait` di MAIN kehilangan job terakhirnya dan script exit ke shell.
-    # Tambahkan trap lokal dan outer loop sebagai safety net.
     while true; do
-        if ! ps -A 2>/dev/null | grep -q "$pkg"; then
-            log "💥 Crash detected"
-            send_discord_notification "crash" "App crashed" "$pkg"
+        # ── Deteksi via PID ──────────────────────────────────────────────
+        # Bug sebelumnya: ps -A | grep -q "$pkg" selalu TRUE karena Roblox
+        # punya banyak proses (background service, download, dll) — ketika
+        # main activity crash, service-nya masih jalan → crash tidak terdeteksi.
+        #
+        # Fix: cari PID main process dengan grep anchor "$" biar exact match,
+        # lalu cek PID itu masih hidup via /proc atau kill -0.
+        local main_pid=""
 
-            sleep 3
-            # source dengan 2>/dev/null biar tidak exit kalau file tidak ada
-            source "$cfg_file" 2>/dev/null || true
-            local active_url=$(get_active_url "$MODE" "$URL")
-            join_server "$pkg" "$active_url" "$MODE"
-            wait_ingame "$pkg"
-            verify_ingame_stable "$pkg" "$cfg_file"
+        # Coba ps -A dengan exact match di kolom terakhir (nama proses tanpa : suffix)
+        main_pid=$(ps -A 2>/dev/null \
+            | grep -v ":" \
+            | awk '{print $NF, $2}' \
+            | grep "^${pkg} " \
+            | awk '{print $2}' \
+            | head -1)
 
-            open_second_package
+        # Fallback: get_pid_for_pkg kalau ps -A exact match tidak ketemu
+        if [ -z "$main_pid" ]; then
+            main_pid=$(get_pid_for_pkg "$pkg")
         fi
+
+        # Verifikasi PID benar-benar hidup via /proc (tidak perlu root)
+        local app_alive=0
+        if [ -n "$main_pid" ] && [ -d "/proc/$main_pid" ]; then
+            # Double-check: pastikan /proc/$PID/cmdline memang milik pkg ini
+            local cmdline
+            cmdline=$(cat "/proc/$main_pid/cmdline" 2>/dev/null | tr -d '\0')
+            if echo "$cmdline" | grep -q "$pkg"; then
+                app_alive=1
+                miss_count=0
+                # Simpan PID untuk referensi lain
+                mkdir -p "$state_dir" 2>/dev/null
+                echo "$main_pid" > "$state_dir/pid" 2>/dev/null
+            fi
+        fi
+
+        # ── Deteksi via dumpsys (lebih akurat, khusus foreground activity) ─
+        if [ "$app_alive" = "0" ]; then
+            # Cek apakah ada activity Roblox yang aktif via ActivityManager
+            if dumpsys activity processes 2>/dev/null | grep -q "proc=${pkg}[^:]"; then
+                app_alive=1
+                miss_count=0
+            fi
+        fi
+
+        # ── Deklarasi crash setelah 2 cek berturut-turut gagal (10s) ─────
+        if [ "$app_alive" = "0" ]; then
+            miss_count=$((miss_count + 1))
+            if [ "$miss_count" -ge 2 ]; then
+                miss_count=0
+                log "💥 CRASH DETECTED — $pkg tidak ditemukan (PID hilang)"
+                send_discord_notification "crash" "App crashed / tidak ditemukan" "$pkg"
+                sleep 3
+                source "$cfg_file" 2>/dev/null || true
+                local active_url
+                active_url=$(get_active_url "$MODE" "$URL")
+                join_server "$pkg" "$active_url" "$MODE"
+                wait_ingame "$pkg"
+                verify_ingame_stable "$pkg" "$cfg_file"
+                open_second_package
+            fi
+        fi
+
         sleep 5
+    done
+}
+
+# ─────────────────────────────────────────
+#   LOGCAT CRASH DETECTOR (parallel dengan crash_monitor)
+# ─────────────────────────────────────────
+logcat_crash_detector() {
+    # Deteksi crash via logcat sebagai jalur kedua — menangkap crash
+    # yang prosesnya respawn terlalu cepat sebelum crash_monitor sempat
+    # mendeteksi PID hilang (race condition 5s polling).
+    local pkg=$1
+    local cfg_file=$2
+
+    while true; do
+        while read -r line; do
+            local is_crash=0
+            local reason=""
+
+            # Roblox crash / exit
+            if echo "$line" | grep -qi "System.exit called\|FATAL EXCEPTION.*roblox\|Process.*${pkg}.*has died\|Roblox has crashed"; then
+                is_crash=1
+                reason="System.exit / Fatal"
+            fi
+
+            # Roblox force-close dari ActivityManager
+            if echo "$line" | grep -qi "Force finishing activity.*${pkg}\|Killing.*${pkg}.*crashed"; then
+                is_crash=1
+                reason="Force-closed"
+            fi
+
+            if [ "$is_crash" = "1" ]; then
+                log "💥 CRASH DETECTED via logcat — $reason"
+                send_discord_notification "crash" "$reason" "$pkg"
+                sleep 5
+                source "$cfg_file" 2>/dev/null || true
+                local active_url
+                active_url=$(get_active_url "$MODE" "$URL")
+                join_server "$pkg" "$active_url" "$MODE"
+                wait_ingame "$pkg"
+                verify_ingame_stable "$pkg" "$cfg_file"
+            fi
+
+        done < <(logcat -v time 2>/dev/null | grep --line-buffered -iE \
+            "System\.exit called|FATAL EXCEPTION|Process.*${pkg}.*has died|Force finishing.*${pkg}|Killing.*${pkg}.*crashed|Roblox has crashed")
+
+        log "⚠️ logcat crash detector pipe tutup — restart..."
+        sleep 3
     done
 }
 
@@ -1229,25 +1332,25 @@ MONITOR_PID=$!
 crash_monitor "$PKG1" "${CONFIG_BASE_DIR}/roblox_config_${PKG1}.cfg" &
 CRASH_PID=$!
 
-# Keep alive — loop ini TIDAK BOLEH selesai.
-# Bug sebelumnya: bare `wait` — begitu semua background job mati
-# (misal monitor_events exit karena logcat pipe tutup), `wait` return
-# dan script selesai → balik ke Termux shell ("Welcome to Termux!").
-# Fix: infinite loop yang juga restart monitor kalau mati.
+logcat_crash_detector "$PKG1" "${CONFIG_BASE_DIR}/roblox_config_${PKG1}.cfg" &
+LOGCAT_CRASH_PID=$!
+
+# Keep alive — restart monitor jika mati
 while true; do
-    # Restart monitor_events jika prosesnya tidak ada lagi
     if ! kill -0 "$MONITOR_PID" 2>/dev/null; then
         log "⚠️ monitor_events mati — restart otomatis"
         monitor_events "$PKG1" "${CONFIG_BASE_DIR}/roblox_config_${PKG1}.cfg" &
         MONITOR_PID=$!
     fi
-
-    # Restart crash_monitor jika prosesnya tidak ada lagi
     if ! kill -0 "$CRASH_PID" 2>/dev/null; then
         log "⚠️ crash_monitor mati — restart otomatis"
         crash_monitor "$PKG1" "${CONFIG_BASE_DIR}/roblox_config_${PKG1}.cfg" &
         CRASH_PID=$!
     fi
-
+    if ! kill -0 "$LOGCAT_CRASH_PID" 2>/dev/null; then
+        log "⚠️ logcat_crash_detector mati — restart otomatis"
+        logcat_crash_detector "$PKG1" "${CONFIG_BASE_DIR}/roblox_config_${PKG1}.cfg" &
+        LOGCAT_CRASH_PID=$!
+    fi
     sleep "$CHECK_INTERVAL"
 done
