@@ -897,6 +897,72 @@ log() {
     fi
 }
 
+# ─────────────────────────────────────────
+#   GET PID FOR PACKAGE (was undefined — BUG FIX)
+# ─────────────────────────────────────────
+
+get_pid_for_pkg() {
+    local pkg=$1
+    local pid=""
+
+    # Method 1: pidof (tersedia di Android 8+)
+    pid=$(pidof "$pkg" 2>/dev/null | awk '{print $1}')
+    [ -n "$pid" ] && { echo "$pid"; return; }
+
+    # Method 2: ps -A dengan awk exact match di kolom NAME
+    pid=$(ps -A 2>/dev/null \
+        | awk '{print $2, $NF}' \
+        | grep " ${pkg}$" \
+        | awk '{print $1}' \
+        | head -1)
+    [ -n "$pid" ] && { echo "$pid"; return; }
+
+    # Method 3: scan /proc/*/cmdline (paling akurat, butuh root)
+    for f in /proc/[0-9]*/cmdline; do
+        local p="${f%/cmdline}"
+        p="${p##*/}"
+        local cmd
+        cmd=$(cat "$f" 2>/dev/null | tr '\0' '\n' | head -1)
+        if [ "$cmd" = "$pkg" ]; then
+            pid="$p"
+            break
+        fi
+    done
+    [ -n "$pid" ] && { echo "$pid"; return; }
+
+    echo ""
+}
+
+# ─────────────────────────────────────────
+#   CRASH LOCK — cegah double-handle dari crash_monitor + logcat_detector
+# ─────────────────────────────────────────
+
+acquire_crash_lock() {
+    local pkg=$1
+    local lock_file="${STATE_BASE_DIR}/rbx_state_${pkg}/crash_lock"
+    mkdir -p "$(dirname "$lock_file")" 2>/dev/null
+
+    if [ -f "$lock_file" ]; then
+        local lock_age now mtime
+        now=$(date +%s)
+        mtime=$(stat -c %Y "$lock_file" 2>/dev/null || echo 0)
+        lock_age=$(( now - mtime ))
+        # Lock masih fresh (< 3 menit) → skip, biarkan handler lain yang jalan
+        if [ "$lock_age" -lt 180 ]; then
+            return 1
+        fi
+    fi
+
+    echo $$ > "$lock_file"
+    return 0
+}
+
+release_crash_lock() {
+    local pkg=$1
+    local lock_file="${STATE_BASE_DIR}/rbx_state_${pkg}/crash_lock"
+    rm -f "$lock_file" 2>/dev/null
+}
+
 build_join_url() {
     local url=$1
     local place_id query code type
@@ -954,16 +1020,21 @@ join_server() {
 wait_ingame() {
     local pkg=$1
     log "👀 Menunggu INGAME..."
-    local found=0
-    
-    timeout 90 logcat -v time 2>/dev/null | grep --line-buffered -i "Connection accepted from" | head -1 > /dev/null
-    if [ $? -eq 0 ]; then
-        found=1
-        IP=$(logcat -v time 2>/dev/null | grep -oE "([0-9]{1,3}\.){3}[0-9]{1,3}" | head -1)
-        log "✅ INGAME! IP: $IP"
-        send_discord_notification "reconnect_success" "$IP" "$pkg"
+
+    # FIX: pipe exit code dari head -1 selalu 0 (EOF maupun dapat line).
+    # Pakai file tmp untuk tahu apakah "Connection accepted" benar-benar ditemukan.
+    local tmp_ip
+    tmp_ip=$(timeout 90 logcat -b main -b system -v time 2>/dev/null \
+        | grep --line-buffered -i "Connection accepted from" \
+        | head -1 \
+        | grep -oE "([0-9]{1,3}\.){3}[0-9]{1,3}" \
+        | head -1)
+
+    if [ -n "$tmp_ip" ]; then
+        log "✅ INGAME! IP: $tmp_ip"
+        send_discord_notification "reconnect_success" "$tmp_ip" "$pkg"
     else
-        log "⏱️ Timeout"
+        log "⏱️ Timeout / Connection accepted tidak terdeteksi — lanjut saja"
     fi
 }
 
@@ -971,14 +1042,36 @@ verify_ingame_stable() {
     local pkg=$1
     local cfg_file=$2
     local checks=0
+    local max_rejoin=3
+    local rejoin_count=0
 
-    log "🔁 Tight-monitor 20s pasca-join (fase paling rawan crash)..."
+    log "🔁 Tight-monitor 20s pasca-join..."
     while [ $checks -lt 20 ]; do
         sleep 1
-        if ! ps -A 2>/dev/null | grep -q "$pkg"; then
-            log "💥 $pkg mati di fase join (keluar dari jendela crash_monitor biasa) — rejoin paksa"
+        local main_pid
+        main_pid=$(get_pid_for_pkg "$pkg")
+        local alive=0
+
+        if [ -n "$main_pid" ] && [ -d "/proc/$main_pid" ]; then
+            # Cek zombie state — zombie = crash, jangan dianggap alive
+            local proc_state
+            proc_state=$(grep -m1 "^State:" "/proc/$main_pid/status" 2>/dev/null | awk '{print $2}')
+            if [ "$proc_state" != "Z" ] && [ "$proc_state" != "X" ]; then
+                local cmdline
+                cmdline=$(cat "/proc/$main_pid/cmdline" 2>/dev/null | tr -d '\0')
+                echo "$cmdline" | grep -q "$pkg" && alive=1
+            fi
+        fi
+
+        if [ "$alive" = "0" ]; then
+            rejoin_count=$((rejoin_count + 1))
+            if [ "$rejoin_count" -gt "$max_rejoin" ]; then
+                log "⚠️ Max rejoin ($max_rejoin) tercapai di verify — skip, biarkan crash_monitor handle"
+                return
+            fi
+            log "💥 $pkg mati di fase join (attempt $rejoin_count/$max_rejoin) — rejoin paksa"
             sleep 2
-            source "$cfg_file"
+            source "$cfg_file" 2>/dev/null || true
             local active_url
             active_url=$(get_active_url "$MODE" "$URL")
             join_server "$pkg" "$active_url" "$MODE"
@@ -994,54 +1087,218 @@ verify_ingame_stable() {
 monitor_events() {
     local pkg=$1
     local cfg_file=$2
-    
-    log "🔍 Monitor aktif"
-    
-    while read -r line; do
-        
-        if echo "$line" | grep -qi "Sending disconnect with reason\|Connection lost\|Lost connection\|Disconnected from server"; then
-            local reason
-            if echo "$line" | grep -qi "Sending disconnect"; then
-                reason="Sending disconnect"
-            elif echo "$line" | grep -qi "Connection lost"; then
-                reason="Connection lost"
-            else
-                reason="Disconnected"
+
+    # Outer loop: restart otomatis kalau logcat pipe tutup (disconnect,
+    # Android kill proses logcat, dll). Sebelumnya fungsi ini langsung
+    # return saat pipe selesai → background process mati → wait di MAIN
+    # kehabisan job → script exit ke Termux shell.
+    while true; do
+        log "🔍 Monitor aktif"
+
+        while read -r line; do
+            if echo "$line" | grep -qiE "Sending disconnect with reason|Connection lost|Lost connection|Disconnected from server"; then
+                local reason
+                if echo "$line" | grep -qiE "Sending disconnect"; then
+                    reason="Sending disconnect"
+                elif echo "$line" | grep -qiE "Connection lost"; then
+                    reason="Connection lost"
+                else
+                    reason="Disconnected"
+                fi
+
+                log "❌ DC: $reason"
+                send_discord_notification "disconnect" "$reason" "$pkg"
+
+                sleep 3
+                source "$cfg_file" 2>/dev/null
+                local active_url=$(get_active_url "$MODE" "$URL")
+                join_server "$pkg" "$active_url" "$MODE"
+                wait_ingame "$pkg"
+                verify_ingame_stable "$pkg" "$cfg_file"
             fi
-            
-            log "❌ DC: $reason"
-            send_discord_notification "disconnect" "$reason" "$pkg"
-            
-            sleep 3
-            source "$cfg_file"
-            local active_url=$(get_active_url "$MODE" "$URL")
-            join_server "$pkg" "$active_url" "$MODE"
-            wait_ingame "$pkg"
-            verify_ingame_stable "$pkg" "$cfg_file"
-        fi
-        
-    done < <(logcat -v time 2>/dev/null | grep --line-buffered -iE "Sending disconnect|Connection lost|Lost connection|Disconnected from server")
+
+        done < <(logcat -v time 2>/dev/null | grep --line-buffered -iE "Sending disconnect|Connection lost|Lost connection|Disconnected from server")
+
+        log "⚠️ logcat pipe tutup — restart monitor dalam 3s..."
+        sleep 3
+    done
 }
 
 crash_monitor() {
     local pkg=$1
     local cfg_file=$2
-    
+    local miss_count=0
+    local state_dir="${STATE_BASE_DIR}/rbx_state_${pkg}"
+
     while true; do
-        if ! ps -A 2>/dev/null | grep -q "$pkg"; then
-            log "💥 Crash detected"
-            send_discord_notification "crash" "App crashed" "$pkg"
-            
-            sleep 3
-            source "$cfg_file"
-            local active_url=$(get_active_url "$MODE" "$URL")
-            join_server "$pkg" "$active_url" "$MODE"
-            wait_ingame "$pkg"
-            verify_ingame_stable "$pkg" "$cfg_file"
-            
-            open_second_package
+        # ── Deteksi via PID ──────────────────────────────────────────────
+        local main_pid=""
+
+        # Method 1: ps -A exact match di kolom NAME
+        main_pid=$(ps -A 2>/dev/null \
+            | grep -v ":" \
+            | awk '{print $NF, $2}' \
+            | grep "^${pkg} " \
+            | awk '{print $2}' \
+            | head -1)
+
+        # Method 2: get_pid_for_pkg (sekarang sudah terdefinisi)
+        if [ -z "$main_pid" ]; then
+            main_pid=$(get_pid_for_pkg "$pkg")
         fi
-        sleep 5
+
+        # Verifikasi PID via /proc — + cek zombie state (BUG FIX)
+        local app_alive=0
+        if [ -n "$main_pid" ] && [ -d "/proc/$main_pid" ]; then
+            # Zombie (Z) atau dead (X) = proses sudah mati, jangan dianggap alive
+            local proc_state
+            proc_state=$(grep -m1 "^State:" "/proc/$main_pid/status" 2>/dev/null | awk '{print $2}')
+            if [ "$proc_state" != "Z" ] && [ "$proc_state" != "X" ]; then
+                local cmdline
+                cmdline=$(cat "/proc/$main_pid/cmdline" 2>/dev/null | tr -d '\0')
+                if echo "$cmdline" | grep -q "$pkg"; then
+                    app_alive=1
+                    miss_count=0
+                    mkdir -p "$state_dir" 2>/dev/null
+                    echo "$main_pid" > "$state_dir/pid" 2>/dev/null
+                fi
+            fi
+        fi
+
+        # ── Fallback: dumpsys (BUG FIX: pattern diperbaiki untuk Android 8-14) ─
+        if [ "$app_alive" = "0" ]; then
+            local dumpsys_out
+            dumpsys_out=$(dumpsys activity processes 2>/dev/null)
+
+            # Pattern lama (Android < 12): proc=com.roblox.client
+            # Pattern baru (Android 12+):  processName=com.roblox.client
+            if echo "$dumpsys_out" | grep -qE "(^|[[:space:]])(proc|processName)=${pkg}([[:space:]]|\$|,)"; then
+                app_alive=1
+                miss_count=0
+            fi
+
+            # Fallback: cek via activity top (foreground activity)
+            if [ "$app_alive" = "0" ]; then
+                if dumpsys activity top 2>/dev/null | grep -q "ACTIVITY ${pkg}"; then
+                    app_alive=1
+                    miss_count=0
+                fi
+            fi
+        fi
+
+        # ── Deklarasi crash ───────────────────────────────────────────────
+        if [ "$app_alive" = "0" ]; then
+            miss_count=$((miss_count + 1))
+            if [ "$miss_count" -ge 2 ]; then
+                miss_count=0
+
+                # Cegah double-handle dari logcat_crash_detector (race condition FIX)
+                if ! acquire_crash_lock "$pkg"; then
+                    log "⏭️ crash_monitor: handler lain sudah handling crash — skip"
+                    sleep 5
+                    continue
+                fi
+
+                log "💥 CRASH DETECTED — $pkg tidak ditemukan (PID hilang)"
+                send_discord_notification "crash" "App crashed / tidak ditemukan" "$pkg"
+                sleep 3
+
+                source "$cfg_file" 2>/dev/null || true
+
+                # Cek config — hanya restart kalau RESTART_KALAU_CRASH=1 (BUG FIX)
+                if [ "${RESTART_KALAU_CRASH:-1}" != "1" ]; then
+                    log "ℹ️ RESTART_KALAU_CRASH=OFF — tidak auto-restart"
+                    release_crash_lock "$pkg"
+                    sleep 5
+                    continue
+                fi
+
+                local active_url
+                active_url=$(get_active_url "$MODE" "$URL")
+                join_server "$pkg" "$active_url" "$MODE"
+                wait_ingame "$pkg"
+                verify_ingame_stable "$pkg" "$cfg_file"
+                open_second_package
+                release_crash_lock "$pkg"
+            fi
+        fi
+
+        sleep 3
+    done
+}
+
+# ─────────────────────────────────────────
+#   LOGCAT CRASH DETECTOR (parallel dengan crash_monitor)
+# ─────────────────────────────────────────
+logcat_crash_detector() {
+    # Deteksi crash via logcat sebagai jalur kedua — menangkap crash
+    # yang prosesnya respawn terlalu cepat sebelum crash_monitor sempat
+    # mendeteksi PID hilang (race condition 3s polling).
+    local pkg=$1
+    local cfg_file=$2
+
+    while true; do
+        while read -r line; do
+            local is_crash=0
+            local reason=""
+
+            # BUG FIX: grep -qi "a\|b" TIDAK bekerja di Android toybox grep
+            # (tanpa -E, \| dianggap literal bukan OR). Harus pakai -qiE "a|b"
+            # atau cek satu-satu. Di sini pakai -qiE.
+
+            # Roblox crash / exit — System.exit, FATAL EXCEPTION, process died
+            if echo "$line" | grep -qiE "System\.exit called|FATAL EXCEPTION.*(roblox|${pkg})|Process.*${pkg}.*(has died|died)|Roblox has crashed"; then
+                is_crash=1
+                reason="System.exit / Fatal"
+            fi
+
+            # Force-close / killed oleh ActivityManager
+            if echo "$line" | grep -qiE "Force finishing activity.*${pkg}|Killing.*${pkg}.*(crashed|dying)|${pkg}.*force.*(stop|close)"; then
+                is_crash=1
+                reason="Force-closed by AM"
+            fi
+
+            # crash_dump / tombstone (native crash)
+            if echo "$line" | grep -qiE "crash_dump.*${pkg}|tombstone.*${pkg}|SIGSEGV.*${pkg}|${pkg}.*native.*crash"; then
+                is_crash=1
+                reason="Native crash"
+            fi
+
+            if [ "$is_crash" = "1" ]; then
+                # Cegah race condition dengan crash_monitor
+                if ! acquire_crash_lock "$pkg"; then
+                    log "⏭️ logcat_detector: crash_monitor sudah handle — skip ($reason)"
+                    continue
+                fi
+
+                log "💥 CRASH DETECTED via logcat — $reason"
+                send_discord_notification "crash" "$reason" "$pkg"
+                sleep 5
+
+                source "$cfg_file" 2>/dev/null || true
+
+                # Cek RESTART_KALAU_CRASH (BUG FIX — sebelumnya tidak dicek)
+                if [ "${RESTART_KALAU_CRASH:-1}" != "1" ]; then
+                    log "ℹ️ RESTART_KALAU_CRASH=OFF — tidak auto-restart"
+                    release_crash_lock "$pkg"
+                    continue
+                fi
+
+                local active_url
+                active_url=$(get_active_url "$MODE" "$URL")
+                join_server "$pkg" "$active_url" "$MODE"
+                wait_ingame "$pkg"
+                verify_ingame_stable "$pkg" "$cfg_file"
+                release_crash_lock "$pkg"
+            fi
+
+        # BUG FIX: tambah -b crash -b main untuk capture crash buffer
+        # + perluas pattern agar lebih banyak jenis crash terdeteksi
+        done < <(logcat -b crash -b main -v time 2>/dev/null | grep --line-buffered -iE \
+            "System\.exit called|FATAL EXCEPTION|Process.*${pkg}.*(has died|died)|Force finishing.*${pkg}|Killing.*${pkg}.*crash|Roblox has crashed|crash_dump.*${pkg}|tombstone.*${pkg}")
+
+        log "⚠️ logcat crash detector pipe tutup — restart..."
+        sleep 3
     done
 }
 
@@ -1217,5 +1474,25 @@ MONITOR_PID=$!
 crash_monitor "$PKG1" "${CONFIG_BASE_DIR}/roblox_config_${PKG1}.cfg" &
 CRASH_PID=$!
 
-# Keep alive
-wait
+logcat_crash_detector "$PKG1" "${CONFIG_BASE_DIR}/roblox_config_${PKG1}.cfg" &
+LOGCAT_CRASH_PID=$!
+
+# Keep alive — restart monitor jika mati
+while true; do
+    if ! kill -0 "$MONITOR_PID" 2>/dev/null; then
+        log "⚠️ monitor_events mati — restart otomatis"
+        monitor_events "$PKG1" "${CONFIG_BASE_DIR}/roblox_config_${PKG1}.cfg" &
+        MONITOR_PID=$!
+    fi
+    if ! kill -0 "$CRASH_PID" 2>/dev/null; then
+        log "⚠️ crash_monitor mati — restart otomatis"
+        crash_monitor "$PKG1" "${CONFIG_BASE_DIR}/roblox_config_${PKG1}.cfg" &
+        CRASH_PID=$!
+    fi
+    if ! kill -0 "$LOGCAT_CRASH_PID" 2>/dev/null; then
+        log "⚠️ logcat_crash_detector mati — restart otomatis"
+        logcat_crash_detector "$PKG1" "${CONFIG_BASE_DIR}/roblox_config_${PKG1}.cfg" &
+        LOGCAT_CRASH_PID=$!
+    fi
+    sleep "$CHECK_INTERVAL"
+done
