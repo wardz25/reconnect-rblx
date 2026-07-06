@@ -219,10 +219,9 @@ send_discord_notification() {
             | awk '{if(NR>1)printf "\\n"; printf "%s",$0}'
     }
 
-    local esc_pkg esc_device esc_details esc_status esc_ts esc_mention esc_last_updated esc_footer_ts
+    local esc_pkg esc_device esc_status esc_ts esc_mention esc_last_updated esc_footer_ts
     esc_pkg=$(_jesc "$pkg")
     esc_device=$(_jesc "$device")
-    esc_details=$(_jesc "${details:--}")
     esc_status=$(_jesc "$app_status")
     esc_ts=$(_jesc "$timestamp")
     esc_last_updated=$(_jesc "$last_updated")
@@ -254,13 +253,13 @@ send_discord_notification() {
     description+="${divider}\n"
     description+="📦 **Application Details**\n"
     description+="${app_icon} ||${esc_pkg}|| — ${esc_status}"
-    [ "${esc_details}" != "-" ] && description+="\n*${esc_details}*"
 
     # ── Build JSON dengan printf ──────────────────────────────────────────
     # BUG FIX: heredoc multiline menyebabkan payload corrupt saat di-pass ke curl.
     # printf memberikan kontrol penuh — output dijamin satu string tanpa newline liar.
     local payload
-    payload=$(printf '{"content":"%s","embeds":[{"title":"📊 Sphinx Status Update","description":"%s","color":%d,"timestamp":"%s","thumbnail":{"url":"%s"},"footer":{"text":"Sphinx Monitor • %s • %s","icon_url":"%s"}}]}' \
+    payload=$(printf '{"username":"Sphinx Monitor","avatar_url":"%s","content":"%s","embeds":[{"title":"📊 Sphinx Status Update","description":"%s","color":%d,"timestamp":"%s","thumbnail":{"url":"%s"},"footer":{"text":"Sphinx Monitor • %s • %s","icon_url":"%s"}}]}' \
+        "$sphinx_icon_url" \
         "$esc_mention" \
         "$description" \
         "$embed_color" \
