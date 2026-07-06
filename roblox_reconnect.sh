@@ -2,7 +2,7 @@
 
 # ─────────────────────────────────────────
 #   ROBLOX AUTO RECONNECT + AUTO RELOG
-#   by: Wardz | versi: 2.6 (Join Lock + Sphinx Status Update Embed)
+#   by: Wardz | versi: 2.7 (Fix Double-Launch Private Server Crash)
 #   Perbaikan: - JOIN LOCK: crash_monitor & logcat_detector skip saat proses join
 #              - wait_ingame: fallback PID+dumpsys, tidak hanya "Connection accepted"
 #              - join_server: am start diperbaiki (-p flag) + JOIN_LOCK set/release
@@ -17,6 +17,15 @@
 #                Sekarang lock direfresh aktif di wait_ingame +
 #                verify_ingame_stable, JOIN_LOCK_TIMEOUT 180→240s, dan
 #                miss_count crash_monitor 2→3 sebagai buffer tambahan.
+#              - ROOT CAUSE FIX crash Private Server: join_server sebelumnya
+#                pakai `am start -p pkg || am start` — exit code am start
+#                TIDAK KONSISTEN, sering bikin `||` menembak am start KEDUA
+#                tepat setelah yang pertama (double-launch), app kelihatan
+#                blank/close sebentar (restart genuine, bukan cuma false
+#                detect). Diganti pakai get_view_activity() (fungsi yang
+#                sudah stabil dipakai di split/floating) untuk resolve
+#                component -n pkg/activity secara deterministik — cuma SATU
+#                am start, tidak ada lagi double-launch.
 # ─────────────────────────────────────────
 
 PKG1=""
@@ -1203,10 +1212,27 @@ join_server() {
     am force-stop "$pkg"
     sleep 3
 
-    # Gunakan -p untuk specify package, bukan argumen loose di akhir
-    # (argumen tanpa flag di am start diabaikan/error di beberapa Android)
-    am start -a android.intent.action.VIEW -d "$url" -p "$pkg" 2>/dev/null \
-        || am start -a android.intent.action.VIEW -d "$url" 2>/dev/null
+    # BUG FIX (root cause "crash" di Private Server): SEBELUMNYA pakai
+    #   am start ... -p "$pkg" 2>/dev/null || am start ... 2>/dev/null
+    # `am start` exit code TIDAK KONSISTEN antar Android/ROM — untuk intent
+    # dengan skema "roblox://" (private server share_link), Android sering
+    # print "Warning: Activity not started, its current task has been
+    # brought to the front" dan itu bikin exit code dibaca non-zero PADAHAL
+    # app sudah berhasil launch. Akibatnya `||` menembak am start KEDUA
+    # tepat setelah yang pertama — Activity yang baru mulai init kena
+    # restart/replace oleh instance kedua → app keliatan blank/close
+    # sebentar (persis dilaporkan). Public server (URL https://) jarang
+    # kena karena skemanya lebih konsisten di-resolve dengan -p.
+    #
+    # FIX: resolve activity spesifik SEKALI pakai get_view_activity (fungsi
+    # yang sama yang sudah dipakai & terbukti stabil di try_split_screen /
+    # try_floating_window), lalu -n pkg/activity — deterministik, cuma SATU
+    # am start, tidak ada lagi gambling exit code / double-launch.
+    local activity
+    activity=$(get_view_activity "$pkg" "$url")
+    log "🔍 Menggunakan activity: $activity"
+
+    am start -a android.intent.action.VIEW -d "$url" -n "$activity" 2>/dev/null
 
     log "✅ Launched — menunggu loading..."
 }
