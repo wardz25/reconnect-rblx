@@ -136,8 +136,13 @@ send_discord_notification() {
     local details=$2
     local pkg=$3
 
-    [ "$DISCORD_ENABLED" != "1" ] || [ -z "$DISCORD_WEBHOOK" ] && return
+    # BUG FIX: operator harus && bukan ||
+    # Sebelumnya: [ != "1" ] || [ -z ] → return bahkan saat enabled+webhook diisi
+    [ "$DISCORD_ENABLED" = "1" ] || return
+    [ -n "$DISCORD_WEBHOOK" ] || return
 
+    # Jalankan seluruh proses di background subshell agar tidak block monitor
+    (
     # ── Collect system stats ───────────────────────────────────────────────
     local timestamp device cpu ram_free ram_free_pct temp
 
@@ -170,122 +175,98 @@ send_discord_notification() {
     local embed_color embed_title app_icon app_status online_c offline_c
     case $event_type in
         "reconnect_success")
-            embed_color=3066993      # hijau
-            embed_title="✅ Reconnect Berhasil"
+            embed_color=3066993
+            embed_title="Reconnect Berhasil"
             app_icon="🟢"; app_status="Online"
             online_c=1; offline_c=0 ;;
         "disconnect")
-            embed_color=15158332     # merah
-            embed_title="❌ Disconnected"
+            embed_color=15158332
+            embed_title="Disconnected"
             app_icon="🔴"; app_status="Offline"
             online_c=0; offline_c=1 ;;
         "crash")
-            embed_color=10038562     # merah gelap
-            embed_title="💥 Crash Terdeteksi"
+            embed_color=10038562
+            embed_title="Crash Terdeteksi"
             app_icon="🔴"; app_status="Crashed"
             online_c=0; offline_c=1 ;;
         "relog")
-            embed_color=16776960     # kuning
-            embed_title="🔄 Re-logging"
+            embed_color=16776960
+            embed_title="Re-logging"
             app_icon="🔄"; app_status="Re-logging"
             online_c=0; offline_c=1 ;;
         "split"|"floating")
-            embed_color=3447003      # biru
-            embed_title="📱 Multi-Window Aktif"
+            embed_color=3447003
+            embed_title="Multi-Window Aktif"
             app_icon="📱"; app_status="Multi-Window"
             online_c=1; offline_c=0 ;;
         *)
-            embed_color=9807270      # abu
-            embed_title="🟡 ${event_type}"
+            embed_color=9807270
+            embed_title="${event_type}"
             app_icon="🟡"; app_status="${event_type}"
             online_c=0; offline_c=0 ;;
     esac
     local total_c=$(( online_c + offline_c ))
 
-    # ── Mention (content, bukan embed) ────────────────────────────────────
-    local mention_content=""
-    [ -n "$DISCORD_USER_ID" ] && mention_content="<@${DISCORD_USER_ID}>"
-
-    # ── Helper: escape string untuk JSON (pure sed) ───────────────────────
-    json_esc() {
-        printf '%s' "$1" \
-            | sed 's/\\/\\\\/g; s/"/\\"/g; s/	/\\t/g' \
-            | awk 'NR>1{printf "\\n"}{printf "%s", $0}'
-    }
-
-    local esc_pkg esc_device esc_details esc_status esc_timestamp
-    esc_pkg=$(json_esc "$pkg")
-    esc_device=$(json_esc "$device")
-    esc_details=$(json_esc "${details:-—}")
-    esc_status=$(json_esc "$app_status")
-    esc_timestamp=$(json_esc "$timestamp")
-
-    # ── Build Embed JSON ──────────────────────────────────────────────────
-    # Unix timestamp untuk embed.timestamp (ISO 8601)
+    # ── ISO 8601 timestamp untuk Discord embed ────────────────────────────
     local iso_ts
     iso_ts=$(date -u '+%Y-%m-%dT%H:%M:%SZ' 2>/dev/null || echo "")
 
-    local payload
-    payload=$(cat <<JSONEOF
-{
-  "content": "$(json_esc "$mention_content")",
-  "embeds": [{
-    "title": "$(json_esc "$embed_title")",
-    "color": ${embed_color},
-    "timestamp": "${iso_ts}",
-    "fields": [
-      {
-        "name": "📱 Device",
-        "value": "\`${esc_device}\`",
-        "inline": false
-      },
-      {
-        "name": "⚡ CPU",
-        "value": "${cpu}%",
-        "inline": true
-      },
-      {
-        "name": "🐏 RAM Free",
-        "value": "${ram_free}MB (${ram_free_pct}%)",
-        "inline": true
-      },
-      {
-        "name": "🌡️ Temp",
-        "value": "${temp}°C",
-        "inline": true
-      },
-      {
-        "name": "📊 Status",
-        "value": "🟢 Online: **${online_c}**  ┊  🔴 Offline: **${offline_c}**  ┊  👥 Total: **${total_c}**",
-        "inline": false
-      },
-      {
-        "name": "📦 Package",
-        "value": "||${esc_pkg}||",
-        "inline": true
-      },
-      {
-        "name": "🔖 App Status",
-        "value": "${app_icon} ${esc_status}",
-        "inline": true
-      },
-      {
-        "name": "📋 Detail",
-        "value": "${esc_details}",
-        "inline": false
-      }
-    ],
-    "footer": {
-      "text": "Sphinx Monitor • ${esc_device} • ${esc_timestamp}"
+    # ── Helper escape JSON ────────────────────────────────────────────────
+    # BUG FIX: definisikan di scope subshell ini (bukan di dalam heredoc)
+    _jesc() {
+        printf '%s' "$1" \
+            | sed 's/\\/\\\\/g' \
+            | sed 's/"/\\"/g' \
+            | awk '{if(NR>1)printf "\\n"; printf "%s",$0}'
     }
-  }]
-}
-JSONEOF
-)
 
-    curl -s -X POST "$DISCORD_WEBHOOK" \
-        -H "Content-Type: application/json" \
-        -d "$payload" > /dev/null 2>&1 &
+    local esc_pkg esc_device esc_details esc_status esc_ts esc_title esc_mention
+    esc_pkg=$(_jesc "$pkg")
+    esc_device=$(_jesc "$device")
+    esc_details=$(_jesc "${details:--}")
+    esc_status=$(_jesc "$app_status")
+    esc_ts=$(_jesc "$timestamp")
+    esc_title=$(_jesc "$embed_title")
+
+    local mention_str=""
+    [ -n "$DISCORD_USER_ID" ] && mention_str="<@${DISCORD_USER_ID}>"
+    esc_mention=$(_jesc "$mention_str")
+
+    # ── Build JSON dengan printf ──────────────────────────────────────────
+    # BUG FIX: heredoc multiline menyebabkan payload corrupt saat di-pass ke curl.
+    # printf memberikan kontrol penuh — output dijamin satu string tanpa newline liar.
+    local payload
+    payload=$(printf '{"content":"%s","embeds":[{"title":"%s","color":%d,"timestamp":"%s","fields":[{"name":"Device","value":"`%s`","inline":false},{"name":"CPU","value":"%s%%","inline":true},{"name":"RAM Free","value":"%sMB (%s%%)","inline":true},{"name":"Temp","value":"%s C","inline":true},{"name":"Status","value":"Online: **%d**  |  Offline: **%d**  |  Total: **%d**","inline":false},{"name":"Package","value":"||%s||","inline":true},{"name":"App Status","value":"%s %s","inline":true},{"name":"Detail","value":"%s","inline":false}],"footer":{"text":"Sphinx Monitor - %s - %s"}}]}' \
+        "$esc_mention" \
+        "$esc_title" \
+        "$embed_color" \
+        "$iso_ts" \
+        "$esc_device" \
+        "$cpu" \
+        "$ram_free" "$ram_free_pct" \
+        "$temp" \
+        "$online_c" "$offline_c" "$total_c" \
+        "$esc_pkg" \
+        "$app_icon" "$esc_status" \
+        "$esc_details" \
+        "$esc_device" "$esc_ts")
+
+    # ── Kirim via temp file — hindari shell expansion corrupt payload ─────
+    # BUG FIX: curl -d "$payload" gagal jika payload mengandung newline/spasi
+    # khusus. --data-binary @file memastikan payload dikirim apa adanya.
+    local tmp_payload
+    tmp_payload=$(mktemp /data/local/tmp/rbx_discord_XXXXXX 2>/dev/null \
+        || mktemp /tmp/rbx_discord_XXXXXX 2>/dev/null)
+
+    if [ -n "$tmp_payload" ]; then
+        printf '%s' "$payload" > "$tmp_payload"
+        curl -s -X POST "$DISCORD_WEBHOOK" \
+            -H "Content-Type: application/json" \
+            --data-binary "@${tmp_payload}" \
+            -o /dev/null 2>/dev/null
+        rm -f "$tmp_payload" 2>/dev/null
+    fi
+    ) &
 }
 
 # ─────────────────────────────────────────
