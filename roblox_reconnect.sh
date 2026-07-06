@@ -184,6 +184,42 @@ send_discord_notification() {
         }
     done
 
+    # ── App-specific stats: uptime proses, RSS memory, CPU (load avg) ──────
+    # ⏱️ Uptime  : dihitung dari starttime proses (/proc/PID/stat field 22)
+    #              dibanding /proc/uptime — jadi murni "sejak proses OS start",
+    #              bukan sejak reconnect/join terakhir.
+    # 💾 Memory  : VmRSS dari /proc/PID/status (RAM nyata yang dipakai proses).
+    # ⚡ CPU     : formula sama dengan System Stats (load avg device), cuma
+    #              presisi 1 desimal biar match tampilan referensi.
+    local app_pid app_uptime app_rss_mb app_cpu
+    app_pid=$(get_pid_for_pkg "$pkg")
+
+    app_uptime="N/A"
+    if [ -n "$app_pid" ] && [ -f "/proc/$app_pid/stat" ]; then
+        local clk_tck sys_uptime start_ticks start_sec elapsed_sec
+        clk_tck=$(getconf CLK_TCK 2>/dev/null || echo 100)
+        sys_uptime=$(awk '{print $1}' /proc/uptime 2>/dev/null)
+        start_ticks=$(awk '{print $22}' "/proc/$app_pid/stat" 2>/dev/null)
+        if [ -n "$sys_uptime" ] && [ -n "$start_ticks" ] && [ "${clk_tck:-0}" -gt 0 ] 2>/dev/null; then
+            start_sec=$(awk -v t="$start_ticks" -v c="$clk_tck" 'BEGIN{printf "%.0f", t/c}')
+            elapsed_sec=$(awk -v s="$sys_uptime" -v st="$start_sec" 'BEGIN{d=s-st; if(d<0)d=0; printf "%.0f", d}')
+            app_uptime=$(awk -v s="$elapsed_sec" 'BEGIN{
+                h=int(s/3600); m=int((s%3600)/60); sec=s%60;
+                printf "%02d:%02d:%02d", h, m, sec
+            }')
+        fi
+    fi
+
+    app_rss_mb="N/A"
+    if [ -n "$app_pid" ] && [ -f "/proc/$app_pid/status" ]; then
+        local rss_kb
+        rss_kb=$(grep -m1 "^VmRSS:" "/proc/$app_pid/status" 2>/dev/null | awk '{print $2}')
+        [ -n "$rss_kb" ] && app_rss_mb=$(awk -v k="$rss_kb" 'BEGIN{printf "%.1f", k/1024}')
+    fi
+
+    app_cpu=$(awk -v n="$nproc_n" '{printf "%.1f", ($1 * 100) / n}' \
+        /proc/loadavg 2>/dev/null || echo "N/A")
+
     # ── Status per event type ─────────────────────────────────────────────
     local embed_color app_icon app_status online_c offline_c
     case $event_type in
@@ -262,7 +298,8 @@ send_discord_notification() {
     description+="🟢 Online: **${online_c}**  ⋮  🔴 Offline: **${offline_c}**  ⋮  👤 Total: **${total_c}**\n"
     description+="${divider}\n"
     description+="📦 **Application Details**\n"
-    description+="${app_icon} ||${esc_pkg}|| — ${esc_status}"
+    description+="${app_icon} ||${esc_pkg}|| — ${esc_status}\n"
+    description+="⏱️ ${app_uptime} | 💾 ${app_rss_mb}MB | ⚡ ${app_cpu}%"
 
     # ── Build JSON dengan printf ──────────────────────────────────────────
     # BUG FIX: heredoc multiline menyebabkan payload corrupt saat di-pass ke curl.
