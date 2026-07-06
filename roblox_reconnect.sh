@@ -2,10 +2,12 @@
 
 # ─────────────────────────────────────────
 #   ROBLOX AUTO RECONNECT + AUTO RELOG
-#   by: Wardz | versi: 2.4 (Multi-Package Split + Discord) - FIXED SPLIT/FREEFORM
-#   Perbaikan: - Menggunakan -n + activity untuk split/freeform
-#              - Deteksi windowingMode lebih akurat
-#              - Fungsi get_view_activity untuk resolve activity penangan URL
+#   by: Wardz | versi: 2.5 (Join Lock + Discord Embeds)
+#   Perbaikan: - JOIN LOCK: crash_monitor & logcat_detector skip saat proses join
+#              - wait_ingame: fallback PID+dumpsys, tidak hanya "Connection accepted"
+#              - join_server: am start diperbaiki (-p flag) + JOIN_LOCK set/release
+#              - Discord: full Embed (color, fields, thumbnail, footer)
+#              - Bug fix: menu_edit_settings_pkg pilihan 3 argumen salah (extra $cur_restart)
 # ─────────────────────────────────────────
 
 PKG1=""
@@ -43,6 +45,10 @@ DETECTED_USER_ID=""
 # Split mode
 USE_MULTI_PKG=0
 SPLIT_ENABLED=0
+
+# Join lock — cegah crash_monitor/logcat_detector intervensi saat proses join
+JOIN_LOCK_DIR="${STATE_BASE_DIR}"
+JOIN_LOCK_TIMEOUT=180   # detik — maks waktu loading private server sebelum lock expired
 
 # ─────────────────────────────────────────
 #   PATH PER-PACKAGE
@@ -135,10 +141,9 @@ send_discord_notification() {
     # ── Collect system stats ───────────────────────────────────────────────
     local timestamp device cpu ram_free ram_free_pct temp
 
-    timestamp=$(date '+%B %d, %Y %I:%M %p')
+    timestamp=$(date '+%d/%m/%Y %H:%M:%S')
     device=$(getprop ro.product.model 2>/dev/null || echo "Unknown")
 
-    # CPU via loadavg (non-blocking)
     local nproc_n
     nproc_n=$(nproc 2>/dev/null \
         || grep -c "^processor" /proc/cpuinfo 2>/dev/null \
@@ -146,14 +151,12 @@ send_discord_notification() {
     cpu=$(awk -v n="$nproc_n" '{printf "%.0f", ($1 * 100) / n}' \
         /proc/loadavg 2>/dev/null || echo "N/A")
 
-    # RAM free (MB) dan free percentage
     ram_free=$(awk '/^MemAvailable:/{printf "%d", $2/1024}' \
         /proc/meminfo 2>/dev/null || echo "N/A")
     ram_free_pct=$(awk \
         '/^MemTotal:/{t=$2}/^MemAvailable:/{a=$2}END{if(t>0)printf "%.0f",a*100/t;else print "N/A"}' \
         /proc/meminfo 2>/dev/null || echo "N/A")
 
-    # Temperature dari thermal zone
     temp="N/A"
     for zone in /sys/class/thermal/thermal_zone*/temp; do
         [ -f "$zone" ] || continue
@@ -164,57 +167,121 @@ send_discord_notification() {
     done
 
     # ── Status per event type ─────────────────────────────────────────────
-    local app_icon app_status online_c offline_c
+    local embed_color embed_title app_icon app_status online_c offline_c
     case $event_type in
         "reconnect_success")
+            embed_color=3066993      # hijau
+            embed_title="✅ Reconnect Berhasil"
             app_icon="🟢"; app_status="Online"
             online_c=1; offline_c=0 ;;
-        "disconnect"|"crash")
+        "disconnect")
+            embed_color=15158332     # merah
+            embed_title="❌ Disconnected"
             app_icon="🔴"; app_status="Offline"
             online_c=0; offline_c=1 ;;
+        "crash")
+            embed_color=10038562     # merah gelap
+            embed_title="💥 Crash Terdeteksi"
+            app_icon="🔴"; app_status="Crashed"
+            online_c=0; offline_c=1 ;;
         "relog")
+            embed_color=16776960     # kuning
+            embed_title="🔄 Re-logging"
             app_icon="🔄"; app_status="Re-logging"
             online_c=0; offline_c=1 ;;
         "split"|"floating")
+            embed_color=3447003      # biru
+            embed_title="📱 Multi-Window Aktif"
             app_icon="📱"; app_status="Multi-Window"
             online_c=1; offline_c=0 ;;
         *)
+            embed_color=9807270      # abu
+            embed_title="🟡 ${event_type}"
             app_icon="🟡"; app_status="${event_type}"
             online_c=0; offline_c=0 ;;
     esac
     local total_c=$(( online_c + offline_c ))
 
-    # ── Build message ─────────────────────────────────────────────────────
-    local mention=""
-    [ -n "$DISCORD_USER_ID" ] && mention="<@${DISCORD_USER_ID}>"$'\n'
+    # ── Mention (content, bukan embed) ────────────────────────────────────
+    local mention_content=""
+    [ -n "$DISCORD_USER_ID" ] && mention_content="<@${DISCORD_USER_ID}>"
 
-    local SEP="─────────────────────────"
-    local content
-    content="${mention}**Last Updated:** ${timestamp} (just now)"$'\n'
-    content+=""$'\n'
-    content+="📱 **Device** \`${device}\`"$'\n'
-    content+=""$'\n'
-    content+="${SEP}"$'\n'
-    content+="💻 **System Stats**"$'\n'
-    content+="⚡ CPU: **${cpu}%**"$'\n'
-    content+="🐏 RAM: **${ram_free}MB** free (${ram_free_pct}%)"$'\n'
-    content+="🌡️ Temp: **${temp}°C**"$'\n'
-    content+=""$'\n'
-    content+="${SEP}"$'\n'
-    content+="📊 **Status Overview**"$'\n'
-    content+="🟢 Online: **${online_c}**  ┊  🔴 Offline: **${offline_c}**  ┊  👥 Total: **${total_c}**"$'\n'
-    content+=""$'\n'
-    content+="${SEP}"$'\n'
-    content+="📦 **Application Details**"$'\n'
-    content+="${app_icon} ||${pkg}||  —  ${app_status}"
+    # ── Helper: escape string untuk JSON (pure sed) ───────────────────────
+    json_esc() {
+        printf '%s' "$1" \
+            | sed 's/\\/\\\\/g; s/"/\\"/g; s/	/\\t/g' \
+            | awk 'NR>1{printf "\\n"}{printf "%s", $0}'
+    }
 
-    # ── JSON encode dan kirim (pure bash/sed/awk, tanpa python3) ─────────
-    local escaped
-    escaped=$(printf '%s' "$content" \
-        | sed 's/\\/\\\\/g' \
-        | sed 's/"/\\"/g' \
-        | awk 'NR>1{printf "\\n"}{printf "%s", $0}')
-    local payload="{\"content\":\"${escaped}\"}"
+    local esc_pkg esc_device esc_details esc_status esc_timestamp
+    esc_pkg=$(json_esc "$pkg")
+    esc_device=$(json_esc "$device")
+    esc_details=$(json_esc "${details:-—}")
+    esc_status=$(json_esc "$app_status")
+    esc_timestamp=$(json_esc "$timestamp")
+
+    # ── Build Embed JSON ──────────────────────────────────────────────────
+    # Unix timestamp untuk embed.timestamp (ISO 8601)
+    local iso_ts
+    iso_ts=$(date -u '+%Y-%m-%dT%H:%M:%SZ' 2>/dev/null || echo "")
+
+    local payload
+    payload=$(cat <<JSONEOF
+{
+  "content": "$(json_esc "$mention_content")",
+  "embeds": [{
+    "title": "$(json_esc "$embed_title")",
+    "color": ${embed_color},
+    "timestamp": "${iso_ts}",
+    "fields": [
+      {
+        "name": "📱 Device",
+        "value": "\`${esc_device}\`",
+        "inline": false
+      },
+      {
+        "name": "⚡ CPU",
+        "value": "${cpu}%",
+        "inline": true
+      },
+      {
+        "name": "🐏 RAM Free",
+        "value": "${ram_free}MB (${ram_free_pct}%)",
+        "inline": true
+      },
+      {
+        "name": "🌡️ Temp",
+        "value": "${temp}°C",
+        "inline": true
+      },
+      {
+        "name": "📊 Status",
+        "value": "🟢 Online: **${online_c}**  ┊  🔴 Offline: **${offline_c}**  ┊  👥 Total: **${total_c}**",
+        "inline": false
+      },
+      {
+        "name": "📦 Package",
+        "value": "||${esc_pkg}||",
+        "inline": true
+      },
+      {
+        "name": "🔖 App Status",
+        "value": "${app_icon} ${esc_status}",
+        "inline": true
+      },
+      {
+        "name": "📋 Detail",
+        "value": "${esc_details}",
+        "inline": false
+      }
+    ],
+    "footer": {
+      "text": "Sphinx Monitor • ${esc_device} • ${esc_timestamp}"
+    }
+  }]
+}
+JSONEOF
+)
 
     curl -s -X POST "$DISCORD_WEBHOOK" \
         -H "Content-Type: application/json" \
@@ -700,7 +767,7 @@ menu_edit_settings_pkg() {
                 ;;
             3)
                 local new_val; new_val=$([ "$cur_restart" = "1" ] && echo 0 || echo 1)
-                save_config "$cfg_file" "$pkg" "$cur_url" "$cur_mode" "$cur_relog" "$cur_reconnect" "$new_val" "$cur_restart" "$cur_home"
+                save_config "$cfg_file" "$pkg" "$cur_url" "$cur_mode" "$cur_relog" "$cur_reconnect" "$new_val" "$cur_home"
                 echo "  ✅ Restart: $(show_toggle $new_val)"
                 sleep 1
                 ;;
@@ -998,6 +1065,43 @@ release_crash_lock() {
     rm -f "$lock_file" 2>/dev/null
 }
 
+# ─────────────────────────────────────────
+#   JOIN LOCK — cegah crash_monitor/logcat_detector
+#   intervensi saat proses join/loading berlangsung
+# ─────────────────────────────────────────
+
+acquire_join_lock() {
+    local pkg=$1
+    local lock_file="${STATE_BASE_DIR}/rbx_state_${pkg}/join_lock"
+    mkdir -p "$(dirname "$lock_file")" 2>/dev/null
+    echo $$ > "$lock_file"
+}
+
+release_join_lock() {
+    local pkg=$1
+    local lock_file="${STATE_BASE_DIR}/rbx_state_${pkg}/join_lock"
+    rm -f "$lock_file" 2>/dev/null
+}
+
+is_joining() {
+    # Return 0 (true) kalau join lock aktif dan masih fresh
+    local pkg=$1
+    local lock_file="${STATE_BASE_DIR}/rbx_state_${pkg}/join_lock"
+    [ -f "$lock_file" ] || return 1
+
+    local now mtime lock_age
+    now=$(date +%s)
+    mtime=$(stat -c %Y "$lock_file" 2>/dev/null || echo 0)
+    lock_age=$(( now - mtime ))
+
+    # Lock expired (> JOIN_LOCK_TIMEOUT) = proses join hang / stuck → anggap sudah selesai
+    if [ "$lock_age" -gt "${JOIN_LOCK_TIMEOUT:-180}" ]; then
+        rm -f "$lock_file" 2>/dev/null
+        return 1
+    fi
+    return 0
+}
+
 build_join_url() {
     local url=$1
     local place_id query code type
@@ -1043,34 +1147,83 @@ join_server() {
     local pkg=$1
     local url=$2
     local mode=$3
-    
+
     log "🚀 Jalanin: $pkg"
     log "🔗 Join URL: $url"
+
+    # Set JOIN LOCK sebelum force-stop agar crash_monitor tidak intervensi
+    # selama proses loading berlangsung
+    acquire_join_lock "$pkg"
+
     am force-stop "$pkg"
     sleep 3
-    am start -a android.intent.action.VIEW -d "$url" "$pkg"
-    log "✅ Launched"
+
+    # Gunakan -p untuk specify package, bukan argumen loose di akhir
+    # (argumen tanpa flag di am start diabaikan/error di beberapa Android)
+    am start -a android.intent.action.VIEW -d "$url" -p "$pkg" 2>/dev/null \
+        || am start -a android.intent.action.VIEW -d "$url" 2>/dev/null
+
+    log "✅ Launched — menunggu loading..."
 }
 
 wait_ingame() {
     local pkg=$1
     log "👀 Menunggu INGAME..."
 
-    # FIX: pipe exit code dari head -1 selalu 0 (EOF maupun dapat line).
-    # Pakai file tmp untuk tahu apakah "Connection accepted" benar-benar ditemukan.
+    # JOIN LOCK harus aktif saat wait_ingame (dipasang oleh join_server).
+    # Jika belum, pasang sekarang sebagai safety net.
+    is_joining "$pkg" || acquire_join_lock "$pkg"
+
+    # ── Metode 1: Tunggu "Connection accepted" via logcat (max 120s) ─────
+    # Private server memerlukan loading lebih lama dari public server.
     local tmp_ip
-    tmp_ip=$(timeout 90 logcat -b main -b system -v time 2>/dev/null \
-        | grep --line-buffered -i "Connection accepted from" \
+    tmp_ip=$(timeout 120 logcat -b main -b system -v time 2>/dev/null \
+        | grep --line-buffered -iE "Connection accepted from|NetworkClient.*connected|RobloxNetworkHandler.*Join" \
         | head -1 \
         | grep -oE "([0-9]{1,3}\.){3}[0-9]{1,3}" \
         | head -1)
 
     if [ -n "$tmp_ip" ]; then
-        log "✅ INGAME! IP: $tmp_ip"
-        send_discord_notification "reconnect_success" "$tmp_ip" "$pkg"
-    else
-        log "⏱️ Timeout / Connection accepted tidak terdeteksi — lanjut saja"
+        log "✅ INGAME via logcat! IP: $tmp_ip"
+        send_discord_notification "reconnect_success" "IP: $tmp_ip" "$pkg"
+        release_join_lock "$pkg"
+        return
     fi
+
+    # ── Metode 2: Fallback — cek PID hidup + activity foreground ─────────
+    log "⏱️ logcat timeout — fallback cek PID & activity..."
+    local waited=0
+    while [ $waited -lt 30 ]; do
+        sleep 2
+        waited=$(( waited + 2 ))
+
+        local pid
+        pid=$(get_pid_for_pkg "$pkg")
+        local alive=0
+
+        if [ -n "$pid" ] && [ -d "/proc/$pid" ]; then
+            local state
+            state=$(grep -m1 "^State:" "/proc/$pid/status" 2>/dev/null | awk '{print $2}')
+            if [ "$state" != "Z" ] && [ "$state" != "X" ]; then
+                local cmdline
+                cmdline=$(cat "/proc/$pid/cmdline" 2>/dev/null | tr -d '\0')
+                echo "$cmdline" | grep -q "$pkg" && alive=1
+            fi
+        fi
+
+        # Juga cek activity foreground sebagai konfirmasi tambahan
+        if [ "$alive" = "1" ]; then
+            if dumpsys activity top 2>/dev/null | grep -q "ACTIVITY ${pkg}"; then
+                log "✅ INGAME via PID+Activity (fallback)"
+                send_discord_notification "reconnect_success" "Joined (fallback detect)" "$pkg"
+                release_join_lock "$pkg"
+                return
+            fi
+        fi
+    done
+
+    log "⚠️ INGAME tidak terdeteksi setelah timeout — lanjut (join lock dilepas)"
+    release_join_lock "$pkg"
 }
 
 verify_ingame_stable() {
@@ -1080,7 +1233,12 @@ verify_ingame_stable() {
     local max_rejoin=3
     local rejoin_count=0
 
-    log "🔁 Tight-monitor 20s pasca-join..."
+    # JOIN LOCK wajib aktif selama fase verify ini.
+    # wait_ingame sudah release join_lock saat berhasil detect — kita pasang ulang
+    # karena verify ini masih bagian dari proses join (belum aman untuk crash_monitor).
+    acquire_join_lock "$pkg"
+
+    log "🔁 Tight-monitor 20s pasca-join (join lock aktif)..."
     while [ $checks -lt 20 ]; do
         sleep 1
         local main_pid
@@ -1101,7 +1259,8 @@ verify_ingame_stable() {
         if [ "$alive" = "0" ]; then
             rejoin_count=$((rejoin_count + 1))
             if [ "$rejoin_count" -gt "$max_rejoin" ]; then
-                log "⚠️ Max rejoin ($max_rejoin) tercapai di verify — skip, biarkan crash_monitor handle"
+                log "⚠️ Max rejoin ($max_rejoin) tercapai di verify — serahkan ke crash_monitor"
+                release_join_lock "$pkg"
                 return
             fi
             log "💥 $pkg mati di fase join (attempt $rejoin_count/$max_rejoin) — rejoin paksa"
@@ -1109,14 +1268,21 @@ verify_ingame_stable() {
             source "$cfg_file" 2>/dev/null || true
             local active_url
             active_url=$(get_active_url "$MODE" "$URL")
+            # join_server akan acquire join_lock baru — release dulu yg lama
+            release_join_lock "$pkg"
             join_server "$pkg" "$active_url" "$MODE"
             wait_ingame "$pkg"
+            # Pasang ulang untuk lanjut verify
+            acquire_join_lock "$pkg"
             checks=0
             continue
         fi
         checks=$((checks + 1))
     done
-    log "✅ Stabil pasca-join"
+
+    # Stabil — lepas join lock agar crash_monitor kembali aktif memantau
+    release_join_lock "$pkg"
+    log "✅ Stabil pasca-join — crash_monitor aktif kembali"
 }
 
 monitor_events() {
@@ -1132,6 +1298,13 @@ monitor_events() {
 
         while read -r line; do
             if echo "$line" | grep -qiE "Sending disconnect with reason|Connection lost|Lost connection|Disconnected from server"; then
+                # Skip jika join sedang berlangsung — signal disconnect bisa muncul
+                # saat Roblox berpindah server / loading private server baru
+                if is_joining "$pkg"; then
+                    log "⏭️ monitor_events: join aktif — abaikan disconnect signal"
+                    continue
+                fi
+
                 local reason
                 if echo "$line" | grep -qiE "Sending disconnect"; then
                     reason="Sending disconnect"
@@ -1146,7 +1319,8 @@ monitor_events() {
 
                 sleep 3
                 source "$cfg_file" 2>/dev/null
-                local active_url=$(get_active_url "$MODE" "$URL")
+                local active_url
+                active_url=$(get_active_url "$MODE" "$URL")
                 join_server "$pkg" "$active_url" "$MODE"
                 wait_ingame "$pkg"
                 verify_ingame_stable "$pkg" "$cfg_file"
@@ -1166,6 +1340,15 @@ crash_monitor() {
     local state_dir="${STATE_BASE_DIR}/rbx_state_${pkg}"
 
     while true; do
+        # ── SKIP jika proses join sedang berlangsung ──────────────────────
+        # Saat loading private server, Roblox restart prosesnya sendiri
+        # sehingga PID hilang sebentar — crash_monitor TIDAK boleh intervensi.
+        if is_joining "$pkg"; then
+            miss_count=0   # reset agar tidak menumpuk miss palsu
+            sleep 3
+            continue
+        fi
+
         # ── Deteksi via PID ──────────────────────────────────────────────
         local main_pid=""
 
@@ -1177,15 +1360,14 @@ crash_monitor() {
             | awk '{print $2}' \
             | head -1)
 
-        # Method 2: get_pid_for_pkg (sekarang sudah terdefinisi)
+        # Method 2: get_pid_for_pkg
         if [ -z "$main_pid" ]; then
             main_pid=$(get_pid_for_pkg "$pkg")
         fi
 
-        # Verifikasi PID via /proc — + cek zombie state (BUG FIX)
+        # Verifikasi PID via /proc — + cek zombie state
         local app_alive=0
         if [ -n "$main_pid" ] && [ -d "/proc/$main_pid" ]; then
-            # Zombie (Z) atau dead (X) = proses sudah mati, jangan dianggap alive
             local proc_state
             proc_state=$(grep -m1 "^State:" "/proc/$main_pid/status" 2>/dev/null | awk '{print $2}')
             if [ "$proc_state" != "Z" ] && [ "$proc_state" != "X" ]; then
@@ -1200,19 +1382,16 @@ crash_monitor() {
             fi
         fi
 
-        # ── Fallback: dumpsys (BUG FIX: pattern diperbaiki untuk Android 8-14) ─
+        # ── Fallback: dumpsys ─────────────────────────────────────────────
         if [ "$app_alive" = "0" ]; then
             local dumpsys_out
             dumpsys_out=$(dumpsys activity processes 2>/dev/null)
 
-            # Pattern lama (Android < 12): proc=com.roblox.client
-            # Pattern baru (Android 12+):  processName=com.roblox.client
             if echo "$dumpsys_out" | grep -qE "(^|[[:space:]])(proc|processName)=${pkg}([[:space:]]|\$|,)"; then
                 app_alive=1
                 miss_count=0
             fi
 
-            # Fallback: cek via activity top (foreground activity)
             if [ "$app_alive" = "0" ]; then
                 if dumpsys activity top 2>/dev/null | grep -q "ACTIVITY ${pkg}"; then
                     app_alive=1
@@ -1227,7 +1406,15 @@ crash_monitor() {
             if [ "$miss_count" -ge 2 ]; then
                 miss_count=0
 
-                # Cegah double-handle dari logcat_crash_detector (race condition FIX)
+                # Double-check join lock sekali lagi sebelum trigger crash
+                # (bisa saja lock baru saja dipasang oleh monitor lain)
+                if is_joining "$pkg"; then
+                    log "⏭️ crash_monitor: join lock aktif saat akan trigger — batal"
+                    sleep 3
+                    continue
+                fi
+
+                # Cegah double-handle dari logcat_crash_detector
                 if ! acquire_crash_lock "$pkg"; then
                     log "⏭️ crash_monitor: handler lain sudah handling crash — skip"
                     sleep 5
@@ -1235,12 +1422,11 @@ crash_monitor() {
                 fi
 
                 log "💥 CRASH DETECTED — $pkg tidak ditemukan (PID hilang)"
-                send_discord_notification "crash" "App crashed / tidak ditemukan" "$pkg"
+                send_discord_notification "crash" "App crashed / PID hilang" "$pkg"
                 sleep 3
 
                 source "$cfg_file" 2>/dev/null || true
 
-                # Cek config — hanya restart kalau RESTART_KALAU_CRASH=1 (BUG FIX)
                 if [ "${RESTART_KALAU_CRASH:-1}" != "1" ]; then
                     log "ℹ️ RESTART_KALAU_CRASH=OFF — tidak auto-restart"
                     release_crash_lock "$pkg"
@@ -1300,6 +1486,13 @@ logcat_crash_detector() {
             fi
 
             if [ "$is_crash" = "1" ]; then
+                # Skip jika sedang proses join — crash logcat bisa muncul
+                # saat Roblox restart prosesnya sendiri waktu loading private server
+                if is_joining "$pkg"; then
+                    log "⏭️ logcat_detector: join sedang berlangsung — abaikan crash signal ($reason)"
+                    continue
+                fi
+
                 # Cegah race condition dengan crash_monitor
                 if ! acquire_crash_lock "$pkg"; then
                     log "⏭️ logcat_detector: crash_monitor sudah handle — skip ($reason)"
@@ -1312,7 +1505,6 @@ logcat_crash_detector() {
 
                 source "$cfg_file" 2>/dev/null || true
 
-                # Cek RESTART_KALAU_CRASH (BUG FIX — sebelumnya tidak dicek)
                 if [ "${RESTART_KALAU_CRASH:-1}" != "1" ]; then
                     log "ℹ️ RESTART_KALAU_CRASH=OFF — tidak auto-restart"
                     release_crash_lock "$pkg"
