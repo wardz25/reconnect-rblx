@@ -2,7 +2,7 @@
 
 # ─────────────────────────────────────────
 #   ROBLOX AUTO RECONNECT + AUTO RELOG
-#   by: Wardz | versi: 2.7 (Fix Double-Launch Private Server Crash)
+#   by: Wardz | versi: 2.8 (Fix Logcat Backlog Replay + Floating-Only)
 #   Perbaikan: - JOIN LOCK: crash_monitor & logcat_detector skip saat proses join
 #              - wait_ingame: fallback PID+dumpsys, tidak hanya "Connection accepted"
 #              - join_server: am start diperbaiki (-p flag) + JOIN_LOCK set/release
@@ -17,15 +17,29 @@
 #                Sekarang lock direfresh aktif di wait_ingame +
 #                verify_ingame_stable, JOIN_LOCK_TIMEOUT 180→240s, dan
 #                miss_count crash_monitor 2→3 sebagai buffer tambahan.
-#              - ROOT CAUSE FIX crash Private Server: join_server sebelumnya
-#                pakai `am start -p pkg || am start` — exit code am start
-#                TIDAK KONSISTEN, sering bikin `||` menembak am start KEDUA
-#                tepat setelah yang pertama (double-launch), app kelihatan
-#                blank/close sebentar (restart genuine, bukan cuma false
-#                detect). Diganti pakai get_view_activity() (fungsi yang
-#                sudah stabil dipakai di split/floating) untuk resolve
-#                component -n pkg/activity secara deterministik — cuma SATU
-#                am start, tidak ada lagi double-launch.
+#              - ROOT CAUSE FIX crash Private Server (double-launch):
+#                join_server sebelumnya pakai `am start -p pkg || am start`
+#                — exit code am start TIDAK KONSISTEN, sering bikin `||`
+#                menembak am start KEDUA tepat setelah yang pertama, app
+#                kelihatan blank/close sebentar. Diganti pakai
+#                get_view_activity() untuk resolve component -n pkg/activity
+#                secara deterministik — cuma SATU am start.
+#              - ROOT CAUSE FIX crash loop pasca-join (logcat backlog
+#                replay): logcat_crash_detector & monitor_events sebelumnya
+#                panggil `logcat -b crash -b main` TANPA filter waktu (-T).
+#                Tanpa -T, logcat SELALU dump SELURUH buffer historis dulu
+#                (ribuan baris sejak boot) sebelum streaming live — termasuk
+#                tombstone/native-crash LAMA yang sudah lama selesai. Proses
+#                "mengunyah" backlog itu makan waktu nyata & kebetulan
+#                bertepatan dengan event lain (mis. verify_ingame_stable
+#                selesai) → kelihatan seperti crash baru padahal cuma entry
+#                lama. Tiap restart pipe = backlog terbaca ulang = loop
+#                tak berkesudahan. FIX: -T "$(date ...)" di-generate ULANG
+#                tiap iterasi outer loop, jadi logcat cuma kasih baris BARU.
+#              - Fitur SPLIT SCREEN dihapus sepenuhnya (try_split_screen,
+#                SPLIT_ENABLED, embed case "split", menu text) — PKG2
+#                sekarang SELALU pakai floating/freeform window langsung,
+#                tanpa percobaan split screen dulu.
 # ─────────────────────────────────────────
 
 PKG1=""
@@ -60,9 +74,8 @@ DISCORD_ENABLED=0
 IS_CLONE_APP=""
 DETECTED_USER_ID=""
 
-# Split mode
+# Multi package (kedua akun/app dijalankan bersamaan via floating window)
 USE_MULTI_PKG=0
-SPLIT_ENABLED=0
 
 # Join lock — cegah crash_monitor/logcat_detector intervensi saat proses join
 JOIN_LOCK_DIR="${STATE_BASE_DIR}"
@@ -248,7 +261,7 @@ send_discord_notification() {
             embed_color=16776960
             app_icon="🔄"; app_status="Re-logging"
             online_c=0; offline_c=1 ;;
-        "split"|"floating")
+        "floating")
             embed_color=3447003
             app_icon="📱"; app_status="Multi-Window"
             online_c=1; offline_c=0 ;;
@@ -954,7 +967,7 @@ menu_setup_discord() {
 }
 
 # ─────────────────────────────────────────
-#   SPLIT SCREEN / FLOATING (FIXED)
+#   FLOATING WINDOW (Split screen dihapus — freeform only)
 # ─────────────────────────────────────────
 
 # Fungsi untuk mendapatkan activity yang menangani intent VIEW untuk package tertentu
@@ -989,41 +1002,15 @@ check_windowing_mode() {
     dumpsys activity activities 2>/dev/null | grep -A10 "package=$pkg" | grep -oE "windowingMode=[0-9]+" | head -1
 }
 
-try_split_screen() {
-    local pkg2=$1
-    local url2=$2
-
-    log "📱 Mencoba split screen (windowingMode=4) untuk: $pkg2"
-
-    local activity
-    activity=$(get_view_activity "$pkg2" "$url2")
-    log "🔍 Menggunakan activity: $activity"
-
-    am start -a android.intent.action.VIEW -d "$url2" -n "$activity" -f 0x10000000 --windowingMode 4 2>/dev/null
-    sleep 3
-
-    local actual_mode
-    actual_mode=$(check_windowing_mode "$pkg2")
-
-    if echo "$actual_mode" | grep -q "windowingMode=4"; then
-        log "✅ Split screen berhasil ($actual_mode)"
-        send_discord_notification "split" "$pkg2" "$PKG1"
-        SPLIT_ENABLED=1
-        return 0
-    fi
-
-    log "⚠️ Split screen gagal/tidak didukung (status: ${actual_mode:-tidak terdeteksi})"
-    return 1
-}
-
 try_floating_window() {
     local pkg2=$1
     local url2=$2
 
-    log "🪟 Fallback: freeform window (windowingMode=5) untuk $pkg2"
+    log "🪟 Membuka floating/freeform window (windowingMode=5) untuk: $pkg2"
 
     local activity
     activity=$(get_view_activity "$pkg2" "$url2")
+    log "🔍 Menggunakan activity: $activity"
 
     am start -a android.intent.action.VIEW -d "$url2" -n "$activity" -f 0x10000000 --windowingMode 5 2>/dev/null
     sleep 3
@@ -1225,8 +1212,8 @@ join_server() {
     # kena karena skemanya lebih konsisten di-resolve dengan -p.
     #
     # FIX: resolve activity spesifik SEKALI pakai get_view_activity (fungsi
-    # yang sama yang sudah dipakai & terbukti stabil di try_split_screen /
-    # try_floating_window), lalu -n pkg/activity — deterministik, cuma SATU
+    # yang sama yang dipakai & terbukti stabil di try_floating_window),
+    # lalu -n pkg/activity — deterministik, cuma SATU
     # am start, tidak ada lagi gambling exit code / double-launch.
     local activity
     activity=$(get_view_activity "$pkg" "$url")
@@ -1377,6 +1364,12 @@ monitor_events() {
     while true; do
         log "🔍 Monitor aktif"
 
+        # BUG FIX: sama seperti logcat_crash_detector — tanpa -T, logcat
+        # dump seluruh buffer historis dulu tiap kali loop restart, bisa
+        # re-trigger sinyal disconnect LAMA yang sudah lama selesai.
+        local start_ts
+        start_ts=$(date '+%m-%d %H:%M:%S.000')
+
         while read -r line; do
             if echo "$line" | grep -qiE "Sending disconnect with reason|Connection lost|Lost connection|Disconnected from server"; then
                 # Skip jika join sedang berlangsung — signal disconnect bisa muncul
@@ -1407,7 +1400,7 @@ monitor_events() {
                 verify_ingame_stable "$pkg" "$cfg_file"
             fi
 
-        done < <(logcat -v time 2>/dev/null | grep --line-buffered -iE "Sending disconnect|Connection lost|Lost connection|Disconnected from server")
+        done < <(logcat -T "$start_ts" -v time 2>/dev/null | grep --line-buffered -iE "Sending disconnect|Connection lost|Lost connection|Disconnected from server")
 
         log "⚠️ logcat pipe tutup — restart monitor dalam 3s..."
         sleep 3
@@ -1544,6 +1537,24 @@ logcat_crash_detector() {
     local cfg_file=$2
 
     while true; do
+        # BUG FIX (root cause "crash terus-terusan" pasca-join): SEBELUMNYA
+        # `logcat -b crash -b main -v time` dipanggil TANPA filter waktu (-T).
+        # Tanpa -T, logcat SELALU dump SELURUH buffer historis dulu (bisa
+        # ribuan baris sejak boot/wrap terakhir) sebelum streaming live —
+        # termasuk tombstone/native-crash lama yang sudah lama kelar/ditangani.
+        # `while read` yang manggil beberapa subprocess grep per baris makan
+        # waktu NYATA untuk mengunyah backlog itu, dan waktu itu kebetulan
+        # bisa bertepatan persis dengan event lain (mis. verify_ingame_stable
+        # declare stabil) — kelihatan seolah crash baru terjadi saat itu,
+        # padahal cuma entry LAMA yang baru "ketemu" grep. Tiap kali fungsi
+        # ini restart (pipe tutup), backlog yang sama bisa terbaca ulang →
+        # loop tak berkesudahan.
+        # FIX: -T dengan timestamp "sekarang", di-generate ULANG tiap
+        # iterasi outer loop, supaya logcat cuma kasih baris BARU sejak saat
+        # itu — backlog lama tidak pernah diproses lagi.
+        local start_ts
+        start_ts=$(date '+%m-%d %H:%M:%S.000')
+
         while read -r line; do
             local is_crash=0
             local reason=""
@@ -1606,7 +1617,8 @@ logcat_crash_detector() {
 
         # BUG FIX: tambah -b crash -b main untuk capture crash buffer
         # + perluas pattern agar lebih banyak jenis crash terdeteksi
-        done < <(logcat -b crash -b main -v time 2>/dev/null | grep --line-buffered -iE \
+        # + -T "$start_ts" cegah replay backlog historis (lihat penjelasan di atas)
+        done < <(logcat -T "$start_ts" -b crash -b main -v time 2>/dev/null | grep --line-buffered -iE \
             "System\.exit called|FATAL EXCEPTION|Process.*${pkg}.*(has died|died)|Force finishing.*${pkg}|Killing.*${pkg}.*crash|Roblox has crashed|crash_dump.*${pkg}|tombstone.*${pkg}")
 
         log "⚠️ logcat crash detector pipe tutup — restart..."
@@ -1637,11 +1649,9 @@ open_second_package() {
     
     local active_url2
     active_url2=$(get_active_url "$mode2" "$url2")
-    
-    # Try split, fallback to floating
-    if ! try_split_screen "$PKG2" "$active_url2"; then
-        try_floating_window "$PKG2" "$active_url2"
-    fi
+
+    # Split screen dihapus — langsung pakai floating/freeform window
+    try_floating_window "$PKG2" "$active_url2"
 }
 
 # ─────────────────────────────────────────
@@ -1662,7 +1672,7 @@ echo ""
 echo "  Mau setup untuk berapa package?"
 echo ""
 echo "  1) 1 Package"
-echo "  2) 2 Package (Split + Floating)"
+echo "  2) 2 Package (Floating Window)"
 echo ""
 printf "  Pilih: "
 read -r SETUP_CHOICE
