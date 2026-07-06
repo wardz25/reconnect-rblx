@@ -129,76 +129,93 @@ send_discord_notification() {
     local event_type=$1
     local details=$2
     local pkg=$3
-    
-    if [ "$DISCORD_ENABLED" != "1" ] || [ -z "$DISCORD_WEBHOOK" ]; then
-        return
-    fi
-    
-    local timestamp
-    timestamp=$(date '+%Y-%m-%d %H:%M:%S')
-    
-    local embed_color="16711680"
-    local embed_title="⚠️ Event"
-    local embed_description=""
-    
+
+    [ "$DISCORD_ENABLED" != "1" ] || [ -z "$DISCORD_WEBHOOK" ] && return
+
+    # ── Collect system stats ───────────────────────────────────────────────
+    local timestamp device cpu ram_free ram_free_pct temp
+
+    timestamp=$(date '+%B %d, %Y %I:%M %p')
+    device=$(getprop ro.product.model 2>/dev/null || echo "Unknown")
+
+    # CPU via loadavg (non-blocking)
+    local nproc_n
+    nproc_n=$(nproc 2>/dev/null \
+        || grep -c "^processor" /proc/cpuinfo 2>/dev/null \
+        || echo 1)
+    cpu=$(awk -v n="$nproc_n" '{printf "%.0f", ($1 * 100) / n}' \
+        /proc/loadavg 2>/dev/null || echo "N/A")
+
+    # RAM free (MB) dan free percentage
+    ram_free=$(awk '/^MemAvailable:/{printf "%d", $2/1024}' \
+        /proc/meminfo 2>/dev/null || echo "N/A")
+    ram_free_pct=$(awk \
+        '/^MemTotal:/{t=$2}/^MemAvailable:/{a=$2}END{if(t>0)printf "%.0f",a*100/t;else print "N/A"}' \
+        /proc/meminfo 2>/dev/null || echo "N/A")
+
+    # Temperature dari thermal zone
+    temp="N/A"
+    for zone in /sys/class/thermal/thermal_zone*/temp; do
+        [ -f "$zone" ] || continue
+        local raw; raw=$(cat "$zone" 2>/dev/null)
+        [ -n "$raw" ] && [ "$raw" -gt 20000 ] && [ "$raw" -lt 85000 ] && {
+            temp=$(( raw / 1000 )); break
+        }
+    done
+
+    # ── Status per event type ─────────────────────────────────────────────
+    local app_icon app_status online_c offline_c
     case $event_type in
-        "disconnect")
-            embed_title="❌ Disconnected"
-            embed_description="**Alasan:** $details\n**Waktu:** $timestamp"
-            embed_color="16711680"
-            ;;
-        "crash")
-            embed_title="💥 Crash"
-            embed_description="**Waktu:** $timestamp"
-            embed_color="16711680"
-            ;;
-        "relog")
-            embed_title="🔄 Relog"
-            embed_description="**Waktu:** $timestamp"
-            embed_color="16776960"
-            ;;
         "reconnect_success")
-            embed_title="✅ Connected"
-            embed_description="**Server IP:** $details\n**Waktu:** $timestamp"
-            embed_color="65280"
-            ;;
-        "split")
-            embed_title="📱 Split Screen"
-            embed_description="**2nd Package:** $details\n**Waktu:** $timestamp"
-            embed_color="255255"
-            ;;
-        "floating")
-            embed_title="🪟 Floating Window"
-            embed_description="**Package:** $details\n**Waktu:** $timestamp"
-            embed_color="16711935"
-            ;;
+            app_icon="🟢"; app_status="Online"
+            online_c=1; offline_c=0 ;;
+        "disconnect"|"crash")
+            app_icon="🔴"; app_status="Offline"
+            online_c=0; offline_c=1 ;;
+        "relog")
+            app_icon="🔄"; app_status="Re-logging"
+            online_c=0; offline_c=1 ;;
+        "split"|"floating")
+            app_icon="📱"; app_status="Multi-Window"
+            online_c=1; offline_c=0 ;;
+        *)
+            app_icon="🟡"; app_status="${event_type}"
+            online_c=0; offline_c=0 ;;
     esac
-    
+    local total_c=$(( online_c + offline_c ))
+
+    # ── Build message ─────────────────────────────────────────────────────
     local mention=""
-    if [ -n "$DISCORD_USER_ID" ]; then
-        mention="<@$DISCORD_USER_ID> "
-    fi
-    
-    local payload=$(cat <<EOF
-{
-  "content": "$mention",
-  "embeds": [{
-    "title": "$embed_title",
-    "description": "$embed_description",
-    "color": $embed_color,
-    "fields": [
-      {
-        "name": "Package",
-        "value": "$pkg",
-        "inline": true
-      }
-    ],
-    "timestamp": "$(date -u +%Y-%m-%dT%H:%M:%S.000Z)"
-  }]
-}
-EOF
-)
-    
+    [ -n "$DISCORD_USER_ID" ] && mention="<@${DISCORD_USER_ID}>"$'\n'
+
+    local SEP="─────────────────────────"
+    local content
+    content="${mention}**Last Updated:** ${timestamp} (just now)"$'\n'
+    content+=""$'\n'
+    content+="📱 **Device** \`${device}\`"$'\n'
+    content+=""$'\n'
+    content+="${SEP}"$'\n'
+    content+="💻 **System Stats**"$'\n'
+    content+="⚡ CPU: **${cpu}%**"$'\n'
+    content+="🐏 RAM: **${ram_free}MB** free (${ram_free_pct}%)"$'\n'
+    content+="🌡️ Temp: **${temp}°C**"$'\n'
+    content+=""$'\n'
+    content+="${SEP}"$'\n'
+    content+="📊 **Status Overview**"$'\n'
+    content+="🟢 Online: **${online_c}**  ┊  🔴 Offline: **${offline_c}**  ┊  👥 Total: **${total_c}**"$'\n'
+    content+=""$'\n'
+    content+="${SEP}"$'\n'
+    content+="📦 **Application Details**"$'\n'
+    content+="${app_icon} ||${pkg}||  —  ${app_status}"
+
+    # ── JSON encode dan kirim (pure bash/sed/awk, tanpa python3) ─────────
+    local escaped
+    escaped=$(printf '%s' "$content" \
+        | sed 's/\\/\\\\/g' \
+        | sed 's/"/\\"/g' \
+        | awk 'NR>1{printf "\\n"}{printf "%s", $0}')
+    local payload="{\"content\":\"${escaped}\"}"
+
     curl -s -X POST "$DISCORD_WEBHOOK" \
         -H "Content-Type: application/json" \
         -d "$payload" > /dev/null 2>&1 &
@@ -224,7 +241,21 @@ save_config() {
     local reconnect=$6
     local restart=$7
     local home=$8
-    
+
+    # BUG FIX: Discord setup terjadi SETELAH package setup.
+    # Kalau save_config dipanggil dari wizard/menu sebelum Discord diinput
+    # (globals masih kosong), webhook yang sudah tersimpan bakal ketimpa "".
+    # Solusi: baca dari file dulu jika global kosong.
+    local disc_enabled="${DISCORD_ENABLED:-0}"
+    local disc_webhook="${DISCORD_WEBHOOK}"
+    local disc_uid="${DISCORD_USER_ID}"
+
+    if [ -z "$disc_webhook" ] && [ -f "$cfg_file" ]; then
+        disc_enabled=$(grep '^DISCORD_ENABLED=' "$cfg_file" | head -1 | cut -d= -f2)
+        disc_webhook=$(grep '^DISCORD_WEBHOOK=' "$cfg_file" | head -1 | cut -d'"' -f2)
+        disc_uid=$(grep '^DISCORD_USER_ID=' "$cfg_file" | head -1 | cut -d'"' -f2)
+    fi
+
     cat > "$cfg_file" <<EOF
 # Config untuk: $pkg
 
@@ -234,9 +265,9 @@ RELOG_SETIAP_JAM=$relog
 RECONNECT_OTOMATIS=$reconnect
 RESTART_KALAU_CRASH=$restart
 RECONNECT_SAAT_HOME=$home
-DISCORD_ENABLED=$DISCORD_ENABLED
-DISCORD_WEBHOOK="$DISCORD_WEBHOOK"
-DISCORD_USER_ID="$DISCORD_USER_ID"
+DISCORD_ENABLED=${disc_enabled:-0}
+DISCORD_WEBHOOK="${disc_webhook}"
+DISCORD_USER_ID="${disc_uid}"
 EOF
 }
 
@@ -607,6 +638,10 @@ menu_ganti_url_mode_pkg() {
 
     local new_mode new_url
     setup_mode_and_url "Ganti Mode & URL — Package $pkg_num ($pkg)" new_mode new_url
+
+    # BUG FIX: user pilih "5) Kembali" → setup_mode_and_url return 1
+    # Sebelumnya save_config tetap dipanggil dengan new_mode="" → MODE="Unknown"
+    [ $? -ne 0 ] && return
 
     save_config "$cfg_file" "$pkg" "$new_url" "$new_mode" \
         "$keep_relog" "$keep_reconnect" "$keep_restart" "$keep_home"
