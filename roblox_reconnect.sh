@@ -11,6 +11,12 @@
 #              - Discord: embed diubah ke layout "Sphinx Status Update"
 #                (title tetap, description markdown + divider + emoji,
 #                 thumbnail & footer icon logo Sphinx)
+#              - Bug fix: JOIN LOCK basi di tengah loading Private Server
+#                (lock tidak pernah di-refresh → expired sebelum join selesai
+#                → crash_monitor salah kill proses yang sebenarnya sehat).
+#                Sekarang lock direfresh aktif di wait_ingame +
+#                verify_ingame_stable, JOIN_LOCK_TIMEOUT 180→240s, dan
+#                miss_count crash_monitor 2→3 sebagai buffer tambahan.
 # ─────────────────────────────────────────
 
 PKG1=""
@@ -51,7 +57,11 @@ SPLIT_ENABLED=0
 
 # Join lock — cegah crash_monitor/logcat_detector intervensi saat proses join
 JOIN_LOCK_DIR="${STATE_BASE_DIR}"
-JOIN_LOCK_TIMEOUT=180   # detik — maks waktu loading private server sebelum lock expired
+# BUG FIX: 180 → 240. Lock sekarang di-refresh aktif tiap iterasi selama
+# wait_ingame/verify_ingame_stable berjalan (lihat fungsi terkait), jadi nilai
+# ini murni jadi "safety ceiling" kalau proses join benar-benar hang/macet —
+# 240s ngasih buffer ekstra untuk private server berat yang loadingnya lama.
+JOIN_LOCK_TIMEOUT=240   # detik — maks waktu loading private server sebelum lock dianggap hang
 
 # ─────────────────────────────────────────
 #   PATH PER-PACKAGE
@@ -1189,11 +1199,20 @@ wait_ingame() {
     fi
 
     # ── Metode 2: Fallback — cek PID hidup + activity foreground ─────────
+    # BUG FIX: refresh join lock di sini. Metode 1 sendirian bisa makan ~120s,
+    # kalau ditambah metode 2 (~60s) totalnya pas/lewat JOIN_LOCK_TIMEOUT lama
+    # (180s) — apalagi kalau device lagi berat (CPU tinggi, private server
+    # berat). Lock basi = crash_monitor/logcat_detector aktif lagi DI TENGAH
+    # loading yang masih wajar → PID hilang sesaat (Roblox restart proses
+    # internal saat pindah ke private server) kebaca CRASH → am force-stop
+    # proses yang sebenarnya masih sehat/berhasil join.
     log "⏱️ logcat timeout — fallback cek PID & activity..."
+    acquire_join_lock "$pkg"   # refresh sebelum mulai fallback
     local waited=0
     while [ $waited -lt 30 ]; do
         sleep 2
         waited=$(( waited + 2 ))
+        acquire_join_lock "$pkg"   # refresh tiap iterasi — cegah lock basi selagi masih nunggu
 
         local pid
         pid=$(get_pid_for_pkg "$pkg")
@@ -1239,6 +1258,7 @@ verify_ingame_stable() {
     log "🔁 Tight-monitor 20s pasca-join (join lock aktif)..."
     while [ $checks -lt 20 ]; do
         sleep 1
+        acquire_join_lock "$pkg"   # refresh — jaga lock tetap fresh selama tight-monitor
         local main_pid
         main_pid=$(get_pid_for_pkg "$pkg")
         local alive=0
@@ -1399,9 +1419,13 @@ crash_monitor() {
         fi
 
         # ── Deklarasi crash ───────────────────────────────────────────────
+        # BUG FIX: 2 → 3 miss beruntun (±9s, bukan ±6s) sebelum declare crash.
+        # Nambah sedikit buffer terhadap hiccup PID sesaat (mis. Roblox
+        # restart proses internal saat transisi private server) yang lolos
+        # dari JOIN_LOCK karena kejadian pas di tepi window join.
         if [ "$app_alive" = "0" ]; then
             miss_count=$((miss_count + 1))
-            if [ "$miss_count" -ge 2 ]; then
+            if [ "$miss_count" -ge 3 ]; then
                 miss_count=0
 
                 # Double-check join lock sekali lagi sebelum trigger crash
