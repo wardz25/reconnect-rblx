@@ -2,12 +2,15 @@
 
 # ─────────────────────────────────────────
 #   ROBLOX AUTO RECONNECT + AUTO RELOG
-#   by: Wardz | versi: 2.5 (Join Lock + Discord Embeds)
+#   by: Wardz | versi: 2.6 (Join Lock + Sphinx Status Update Embed)
 #   Perbaikan: - JOIN LOCK: crash_monitor & logcat_detector skip saat proses join
 #              - wait_ingame: fallback PID+dumpsys, tidak hanya "Connection accepted"
 #              - join_server: am start diperbaiki (-p flag) + JOIN_LOCK set/release
 #              - Discord: full Embed (color, fields, thumbnail, footer)
 #              - Bug fix: menu_edit_settings_pkg pilihan 3 argumen salah (extra $cur_restart)
+#              - Discord: embed diubah ke layout "Sphinx Status Update"
+#                (title tetap, description markdown + divider + emoji,
+#                 thumbnail & footer icon logo Sphinx)
 # ─────────────────────────────────────────
 
 PKG1=""
@@ -172,44 +175,40 @@ send_discord_notification() {
     done
 
     # ── Status per event type ─────────────────────────────────────────────
-    local embed_color embed_title app_icon app_status online_c offline_c
+    local embed_color app_icon app_status online_c offline_c
     case $event_type in
         "reconnect_success")
             embed_color=3066993
-            embed_title="Reconnect Berhasil"
             app_icon="🟢"; app_status="Online"
             online_c=1; offline_c=0 ;;
         "disconnect")
             embed_color=15158332
-            embed_title="Disconnected"
             app_icon="🔴"; app_status="Offline"
             online_c=0; offline_c=1 ;;
         "crash")
             embed_color=10038562
-            embed_title="Crash Terdeteksi"
             app_icon="🔴"; app_status="Crashed"
             online_c=0; offline_c=1 ;;
         "relog")
             embed_color=16776960
-            embed_title="Re-logging"
             app_icon="🔄"; app_status="Re-logging"
             online_c=0; offline_c=1 ;;
         "split"|"floating")
             embed_color=3447003
-            embed_title="Multi-Window Aktif"
             app_icon="📱"; app_status="Multi-Window"
             online_c=1; offline_c=0 ;;
         *)
             embed_color=9807270
-            embed_title="${event_type}"
             app_icon="🟡"; app_status="${event_type}"
             online_c=0; offline_c=0 ;;
     esac
     local total_c=$(( online_c + offline_c ))
 
-    # ── ISO 8601 timestamp untuk Discord embed ────────────────────────────
-    local iso_ts
+    # ── Timestamp: ISO (embed), format panjang (Last Updated), footer ────
+    local iso_ts last_updated footer_ts
     iso_ts=$(date -u '+%Y-%m-%dT%H:%M:%SZ' 2>/dev/null || echo "")
+    last_updated=$(date '+%B %d, %Y %I:%M %p' 2>/dev/null || echo "$timestamp")
+    footer_ts="${timestamp%:*}"   # buang detik: "DD/MM/YYYY HH:MM:SS" -> "DD/MM/YYYY HH:MM"
 
     # ── Helper escape JSON ────────────────────────────────────────────────
     # BUG FIX: definisikan di scope subshell ini (bukan di dalam heredoc)
@@ -220,36 +219,55 @@ send_discord_notification() {
             | awk '{if(NR>1)printf "\\n"; printf "%s",$0}'
     }
 
-    local esc_pkg esc_device esc_details esc_status esc_ts esc_title esc_mention
+    local esc_pkg esc_device esc_details esc_status esc_ts esc_mention esc_last_updated esc_footer_ts
     esc_pkg=$(_jesc "$pkg")
     esc_device=$(_jesc "$device")
     esc_details=$(_jesc "${details:--}")
     esc_status=$(_jesc "$app_status")
     esc_ts=$(_jesc "$timestamp")
-    esc_title=$(_jesc "$embed_title")
+    esc_last_updated=$(_jesc "$last_updated")
+    esc_footer_ts=$(_jesc "$footer_ts")
 
     local mention_str=""
     [ -n "$DISCORD_USER_ID" ] && mention_str="<@${DISCORD_USER_ID}>"
     esc_mention=$(_jesc "$mention_str")
 
+    # ── Aset visual "Sphinx Status Update" ────────────────────────────────
+    local sphinx_icon_url="https://raw.githubusercontent.com/wardz25/updater/main/sphinx.png"
+    local divider="────────────────────"
+
+    # ── Susun description — layout disamakan 1:1 dengan referensi "Sphinx
+    #    Status Update": Last Updated, Device, System Stats, Status
+    #    Overview, Application Details, dipisah garis divider.
+    #    (bukan lagi pakai "fields" Discord — semua jadi satu blok markdown)
+    local description
+    description="**Last Updated:** ${esc_last_updated} (just now)\n\n"
+    description+="📱 **Device** \`${esc_device}\`\n"
+    description+="${divider}\n"
+    description+="🖥️ **System Stats**\n"
+    description+="⚡ CPU: **${cpu}%**\n"
+    description+="💾 RAM: **${ram_free}MB** free (${ram_free_pct}%)\n"
+    description+="🌡️ Temp: **${temp}°C**\n"
+    description+="${divider}\n"
+    description+="📊 **Status Overview**\n"
+    description+="🟢 Online: **${online_c}**  ⋮  🔴 Offline: **${offline_c}**  ⋮  👤 Total: **${total_c}**\n"
+    description+="${divider}\n"
+    description+="📦 **Application Details**\n"
+    description+="${app_icon} ||${esc_pkg}|| — ${esc_status}"
+    [ "${esc_details}" != "-" ] && description+="\n*${esc_details}*"
+
     # ── Build JSON dengan printf ──────────────────────────────────────────
     # BUG FIX: heredoc multiline menyebabkan payload corrupt saat di-pass ke curl.
     # printf memberikan kontrol penuh — output dijamin satu string tanpa newline liar.
     local payload
-    payload=$(printf '{"content":"%s","embeds":[{"title":"%s","color":%d,"timestamp":"%s","fields":[{"name":"Device","value":"`%s`","inline":false},{"name":"CPU","value":"%s%%","inline":true},{"name":"RAM Free","value":"%sMB (%s%%)","inline":true},{"name":"Temp","value":"%s C","inline":true},{"name":"Status","value":"Online: **%d**  |  Offline: **%d**  |  Total: **%d**","inline":false},{"name":"Package","value":"||%s||","inline":true},{"name":"App Status","value":"%s %s","inline":true},{"name":"Detail","value":"%s","inline":false}],"footer":{"text":"Sphinx Monitor - %s - %s"}}]}' \
+    payload=$(printf '{"content":"%s","embeds":[{"title":"📊 Sphinx Status Update","description":"%s","color":%d,"timestamp":"%s","thumbnail":{"url":"%s"},"footer":{"text":"Sphinx Monitor • %s • %s","icon_url":"%s"}}]}' \
         "$esc_mention" \
-        "$esc_title" \
+        "$description" \
         "$embed_color" \
         "$iso_ts" \
-        "$esc_device" \
-        "$cpu" \
-        "$ram_free" "$ram_free_pct" \
-        "$temp" \
-        "$online_c" "$offline_c" "$total_c" \
-        "$esc_pkg" \
-        "$app_icon" "$esc_status" \
-        "$esc_details" \
-        "$esc_device" "$esc_ts")
+        "$sphinx_icon_url" \
+        "$esc_device" "$esc_footer_ts" \
+        "$sphinx_icon_url")
 
     # ── Kirim via temp file — hindari shell expansion corrupt payload ─────
     # BUG FIX: curl -d "$payload" gagal jika payload mengandung newline/spasi
