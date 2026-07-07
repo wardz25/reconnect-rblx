@@ -2,7 +2,7 @@
 
 # ─────────────────────────────────────────
 #   ROBLOX AUTO RECONNECT + AUTO RELOG
-#   by: Wardz | versi: 2.8 (Fix Logcat Backlog Replay + Floating-Only)
+#   by: Wardz | versi: 2.9 (Fix False-Positive Crash dari Sub-Process Roblox)
 #   Perbaikan: - JOIN LOCK: crash_monitor & logcat_detector skip saat proses join
 #              - wait_ingame: fallback PID+dumpsys, tidak hanya "Connection accepted"
 #              - join_server: am start diperbaiki (-p flag) + JOIN_LOCK set/release
@@ -40,6 +40,22 @@
 #                SPLIT_ENABLED, embed case "split", menu text) — PKG2
 #                sekarang SELALU pakai floating/freeform window langsung,
 #                tanpa percobaan split screen dulu.
+#              - ROOT CAUSE FIX "black screen" saat loading Private Server
+#                BERAT (mis. Grow a Garden): Roblox pakai arsitektur MULTI-
+#                PROCESS — ada sub-process terpisah (mis. "pkg:renderer",
+#                "pkg:sandboxed_process0") yang wajar mati/restart sendiri
+#                saat loading asset berat, BUKAN crash fatal. Regex crash
+#                logcat_crash_detector pakai SUBSTRING match, jadi baris
+#                seperti "Process com.roblox.client:renderer has died" ikut
+#                ke-match walau yang mati cuma sub-process — script SALAH
+#                force-stop app yang SEBENARNYA SEHAT (black screen yang
+#                user lihat = ulah script sendiri, bukan Roblox crash asli).
+#                FIX 2 lapis: (1) abaikan baris log yang jelas menyebut
+#                proses ber-suffix ":nama" setelah nama package, (2) SEBELUM
+#                bertindak, cross-verify PID utama via get_pid_for_pkg()
+#                (exact-match, sudah aman dari sub-process) — kalau PID
+#                utama masih hidup & sehat, sinyal crash logcat diabaikan,
+#                tidak ada force-stop.
 # ─────────────────────────────────────────
 
 PKG1=""
@@ -1556,6 +1572,24 @@ logcat_crash_detector() {
         start_ts=$(date '+%m-%d %H:%M:%S.000')
 
         while read -r line; do
+            # BUG FIX (root cause "black screen" saat loading Private Server
+            # berat): Roblox pakai arsitektur MULTI-PROCESS — ada sub-process
+            # terpisah (mis. "com.roblox.client:renderer", "com.roblox.
+            # client:sandboxed_process0") yang dipakai untuk render/GPU/
+            # sandbox. Sub-process ini BOLEH mati & restart sendiri sebagai
+            # bagian NORMAL loading asset berat (private server besar sekelas
+            # "Grow a Garden") — bukan crash fatal. Regex crash kita di bawah
+            # pakai SUBSTRING match ("${pkg}" ada di mana saja dalam baris),
+            # jadi baris seperti "Process com.roblox.client:renderer has died"
+            # IKUT ke-match walau yang mati cuma sub-process — bikin kita
+            # SALAH force-stop app yang sebenarnya SEHAT (black screen yang
+            # user lihat itu ULAH SCRIPT SENDIRI, bukan Roblox yang crash).
+            # FIX lapis 1: abaikan baris yang jelas-jelas menyebut nama
+            # PROSES BER-SUFFIX ":something" setelah nama package.
+            if echo "$line" | grep -qE "${pkg}:[A-Za-z_]"; then
+                continue
+            fi
+
             local is_crash=0
             local reason=""
 
@@ -1589,13 +1623,32 @@ logcat_crash_detector() {
                     continue
                 fi
 
+                # FIX lapis 2 (paling penting): CROSS-VERIFY PID sebelum
+                # bertindak. Satu baris logcat SAJA tidak cukup dipercaya —
+                # get_pid_for_pkg() sudah exact-match aman (tidak akan
+                # ke-match ke sub-process ":renderer" dkk, lihat definisinya).
+                # Kalau PID utama masih hidup & sehat, sinyal "crash" di atas
+                # hampir pasti cuma noise dari sub-process yang sudah pulih
+                # sendiri — JANGAN force-stop app yang sehat.
+                sleep 1
+                local verify_pid
+                verify_pid=$(get_pid_for_pkg "$pkg")
+                if [ -n "$verify_pid" ] && [ -d "/proc/$verify_pid" ]; then
+                    local vstate
+                    vstate=$(grep -m1 "^State:" "/proc/$verify_pid/status" 2>/dev/null | awk '{print $2}')
+                    if [ "$vstate" != "Z" ] && [ "$vstate" != "X" ]; then
+                        log "ℹ️ logcat_detector: sinyal '$reason' terdeteksi, tapi PID utama ($verify_pid) masih hidup & sehat — kemungkinan cuma sub-process (renderer/sandbox) restart. Diabaikan, TIDAK force-stop."
+                        continue
+                    fi
+                fi
+
                 # Cegah race condition dengan crash_monitor
                 if ! acquire_crash_lock "$pkg"; then
                     log "⏭️ logcat_detector: crash_monitor sudah handle — skip ($reason)"
                     continue
                 fi
 
-                log "💥 CRASH DETECTED via logcat — $reason"
+                log "💥 CRASH DETECTED via logcat — $reason (PID utama terkonfirmasi hilang)"
                 send_discord_notification "crash" "$reason" "$pkg"
                 sleep 5
 
