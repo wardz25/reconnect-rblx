@@ -1205,9 +1205,6 @@ join_server() {
     local url=$2
     local mode=$3
 
-    log "🚀 Jalanin: $pkg"
-    log "🔗 Join URL: $url"
-
     # Set JOIN LOCK sebelum force-stop agar crash_monitor tidak intervensi
     # selama proses loading berlangsung
     acquire_join_lock "$pkg"
@@ -1233,11 +1230,10 @@ join_server() {
     # am start, tidak ada lagi gambling exit code / double-launch.
     local activity
     activity=$(get_view_activity "$pkg" "$url")
-    log "🔍 Menggunakan activity: $activity"
 
     am start -a android.intent.action.VIEW -d "$url" -n "$activity" 2>/dev/null
 
-    log "✅ Launched — menunggu loading..."
+    log "🚀 Join: $pkg → $url (activity: $activity) — menunggu loading..."
 }
 
 wait_ingame() {
@@ -1378,8 +1374,6 @@ monitor_events() {
     # return saat pipe selesai → background process mati → wait di MAIN
     # kehabisan job → script exit ke Termux shell.
     while true; do
-        log "🔍 Monitor aktif"
-
         # BUG FIX: sama seperti logcat_crash_detector — tanpa -T, logcat
         # dump seluruh buffer historis dulu tiap kali loop restart, bisa
         # re-trigger sinyal disconnect LAMA yang sudah lama selesai.
@@ -1418,7 +1412,6 @@ monitor_events() {
 
         done < <(logcat -T "$start_ts" -v time 2>/dev/null | grep --line-buffered -iE "Sending disconnect|Connection lost|Lost connection|Disconnected from server")
 
-        log "⚠️ logcat pipe tutup — restart monitor dalam 3s..."
         sleep 3
     done
 }
@@ -1674,7 +1667,6 @@ logcat_crash_detector() {
         done < <(logcat -T "$start_ts" -b crash -b main -v time 2>/dev/null | grep --line-buffered -iE \
             "System\.exit called|FATAL EXCEPTION|Process.*${pkg}.*(has died|died)|Force finishing.*${pkg}|Killing.*${pkg}.*crash|Roblox has crashed|crash_dump.*${pkg}|tombstone.*${pkg}")
 
-        log "⚠️ logcat crash detector pipe tutup — restart..."
         sleep 3
     done
 }
