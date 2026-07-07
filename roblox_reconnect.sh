@@ -1028,7 +1028,7 @@ try_floating_window() {
     activity=$(get_view_activity "$pkg2" "$url2")
     log "🔍 Menggunakan activity: $activity"
 
-    am start -a android.intent.action.VIEW -d "$url2" -n "$activity" -f 0x10000000 --windowingMode 5 >/dev/null 2>/dev/null
+    { am start -a android.intent.action.VIEW -d "$url2" -n "$activity" -f 0x10000000 --windowingMode 5 </dev/null >/dev/null 2>&1; }
     sleep 3
 
     local actual_mode
@@ -1231,7 +1231,7 @@ join_server() {
     local activity
     activity=$(get_view_activity "$pkg" "$url")
 
-    am start -a android.intent.action.VIEW -d "$url" -n "$activity" >/dev/null 2>/dev/null
+    { am start -a android.intent.action.VIEW -d "$url" -n "$activity" </dev/null >/dev/null 2>&1; }
 
     log "🚀 Joining Server"
 }
