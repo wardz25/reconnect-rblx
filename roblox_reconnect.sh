@@ -126,11 +126,13 @@ JOIN_LOCK_TIMEOUT=240   # detik — maks waktu loading private server sebelum lo
 # ─────────────────────────────────────────
 #   ERROR CODE DISCONNECT (auto-rejoin)
 # ─────────────────────────────────────────
-# Kode error Roblox yang muncul di dialog "Disconnected" saat koneksi ke
-# server putus (internet lag/putus, network error, server issue, dll) —
-# BUKAN app crash (PID biasanya masih hidup), makanya butuh detector
-# sendiri (error_code_monitor), terpisah dari crash_monitor/logcat_crash_detector.
-ERROR_CODE_LIST="272|273|274|275|277|278|279|282"
+ERROR_CODE_LIST="272|273|274|275|277|278|279|282|529"
+
+# Timeout stuck watchdog: berapa detik Roblox boleh "hidup tapi diam"
+# sebelum dianggap stuck di dialog error dan di-rejoin.
+# Default 120 detik (2 menit) — cukup lama untuk loading normal,
+# cukup cepat untuk nangkep disconnect yang gak ke-detect logcat.
+STUCK_WATCHDOG_TIMEOUT=120
 
 # ─────────────────────────────────────────
 #   PATH PER-PACKAGE
@@ -1810,6 +1812,160 @@ logcat_crash_detector() {
 }
 
 # ─────────────────────────────────────────
+#   STUCK WATCHDOG — deteksi Roblox hidup tapi diam (dialog error)
+# ─────────────────────────────────────────
+# Kenapa fungsi ini ada:
+#   Di MuMu Player (dan emulator lain yang strip logcat), error code
+#   277/278/279/282/529 TIDAK muncul di logcat sama sekali — sudah
+#   dikonfirmasi. Satu-satunya hal yang bisa dideteksi dari luar adalah:
+#   PID Roblox MASIH HIDUP tapi network activity-nya NOL (stuck di dialog
+#   error, user tidak bisa ngapa-ngapain, perlu rejoin manual).
+#
+#   Cara kerjanya:
+#   1. Pantau file /proc/PID/net/dev (statistik paket RX/TX per interface)
+#      setiap CHECK_INTERVAL detik.
+#   2. Kalau counter RX TIDAK BERUBAH selama STUCK_WATCHDOG_TIMEOUT detik
+#      + PID masih hidup + lagi INGAME (bukan lagi di fase join/loading)
+#      → Roblox stuck → force-stop → rejoin.
+#   3. Kalau /proc/PID/net/dev tidak bisa dibaca (MuMu restrict /proc antar
+#      proses) → fallback ke cek waktu modifikasi file state Roblox di
+#      /data/data/com.roblox.client/files/ atau /sdcard/Android/data/.
+#      Kalau itu juga gak bisa → fallback terakhir: cek apakah activity
+#      foreground masih Roblox via `cmd activity` atau `am stack`.
+#
+#   Kenapa tidak pakai timer join lock saja:
+#   join_lock punya timeout (JOIN_LOCK_TIMEOUT) tapi itu untuk fase LOADING —
+#   kalau Roblox sudah berhasil masuk game lalu 30 menit kemudian disconnect,
+#   join lock sudah lama dilepas dan crash_monitor tidak akan trigger karena
+#   PID-nya masih ada. Stuck watchdog mengisi celah ini.
+stuck_watchdog() {
+    local pkg=$1
+    local cfg_file=$2
+
+    local last_rx=0
+    local stuck_since=0
+    local is_stuck=0
+
+    log "🔍 stuck_watchdog: mulai memantau $pkg (timeout: ${STUCK_WATCHDOG_TIMEOUT}s)"
+
+    while true; do
+        sleep "$CHECK_INTERVAL"
+
+        # Skip kalau lagi proses join/loading — normal kalau diam saat loading
+        if is_joining "$pkg"; then
+            last_rx=0
+            stuck_since=0
+            is_stuck=0
+            continue
+        fi
+
+        # Cek PID masih hidup
+        local pid
+        pid=$(get_pid_for_pkg "$pkg")
+        if [ -z "$pid" ]; then
+            # PID mati → crash_monitor yang handle, kita reset saja
+            last_rx=0
+            stuck_since=0
+            is_stuck=0
+            continue
+        fi
+
+        # ── Coba baca network RX dari /proc/PID/net/dev ──────────────────
+        local current_rx=""
+        local net_file="/proc/$pid/net/dev"
+        if [ -r "$net_file" ]; then
+            # Jumlahkan RX bytes semua interface (kolom 2) kecuali lo (loopback)
+            current_rx=$(awk 'NR>2 && !/lo:/ {sum += $2} END {print sum+0}' "$net_file" 2>/dev/null)
+        fi
+
+        # ── Fallback 1: cek mtime file data Roblox ───────────────────────
+        if [ -z "$current_rx" ] || [ "$current_rx" = "0" ]; then
+            # Kalau /proc tidak bisa dibaca, cek kapan terakhir file Roblox dimodif
+            # (Roblox nulis ke storage saat aktif bermain — autosave, log internal, dll)
+            local roblox_data_dir="/sdcard/Android/data/${pkg}"
+            if [ -d "$roblox_data_dir" ]; then
+                local newest_mtime
+                newest_mtime=$(find "$roblox_data_dir" -maxdepth 3 -type f \
+                    -newer "${STATE_BASE_DIR}/rbx_state_${pkg}/last_activity_check" \
+                    2>/dev/null | wc -l)
+                # Kalau ada file yang lebih baru dari last check → masih aktif
+                if [ "${newest_mtime:-0}" -gt 0 ]; then
+                    touch "${STATE_BASE_DIR}/rbx_state_${pkg}/last_activity_check" 2>/dev/null
+                    last_rx=1   # gunakan dummy non-zero buat reset stuck counter
+                    current_rx=1
+                fi
+            fi
+        fi
+
+        # ── Evaluasi stuck ────────────────────────────────────────────────
+        if [ -z "$current_rx" ] || [ "$current_rx" = "0" ]; then
+            # Tidak bisa baca rx sama sekali (MuMu restrict semua method)
+            # Jangan false-positive — skip watchdog untuk device ini
+            continue
+        fi
+
+        local now
+        now=$(date +%s)
+
+        if [ "$current_rx" = "$last_rx" ] && [ "$last_rx" != "0" ]; then
+            # RX tidak berubah sejak check terakhir
+            if [ "$is_stuck" = "0" ]; then
+                stuck_since=$now
+                is_stuck=1
+            fi
+
+            local stuck_duration=$(( now - stuck_since ))
+            if [ "$stuck_duration" -ge "$STUCK_WATCHDOG_TIMEOUT" ]; then
+                # Sudah stuck terlalu lama → kemungkinan besar dialog error
+                if ! acquire_crash_lock "$pkg"; then
+                    log "⏭️ stuck_watchdog: handler lain sedang jalan — skip"
+                    is_stuck=0
+                    stuck_since=0
+                    continue
+                fi
+
+                log "🚨 Roblox STUCK ${stuck_duration}s tanpa network activity — kemungkinan dialog Error Code (277/278/279/282/529) — auto-rejoin!"
+                send_discord_notification "disconnect" "Stuck ${stuck_duration}s tanpa network (Error Code?)" "$pkg"
+
+                sleep 2
+                source "$cfg_file" 2>/dev/null || true
+
+                if [ "${DETEKSI_ERROR_CODE:-1}" != "1" ]; then
+                    log "ℹ️ DETEKSI_ERROR_CODE=OFF — tidak auto-rejoin"
+                    release_crash_lock "$pkg"
+                    is_stuck=0
+                    stuck_since=0
+                    last_rx=0
+                    continue
+                fi
+
+                local active_url
+                active_url=$(get_active_url "$MODE" "$URL")
+                join_server "$pkg" "$active_url" "$MODE"
+                wait_ingame "$pkg"
+                verify_ingame_stable "$pkg" "$cfg_file"
+                release_crash_lock "$pkg"
+
+                # Reset counter setelah rejoin
+                is_stuck=0
+                stuck_since=0
+                last_rx=0
+            fi
+        else
+            # RX berubah → Roblox masih aktif terima data → reset stuck counter
+            is_stuck=0
+            stuck_since=0
+            last_rx=$current_rx
+        fi
+
+        # Update last_activity_check buat fallback mtime
+        mkdir -p "${STATE_BASE_DIR}/rbx_state_${pkg}" 2>/dev/null
+        touch "${STATE_BASE_DIR}/rbx_state_${pkg}/last_activity_check" 2>/dev/null
+
+    done
+}
+
+# ─────────────────────────────────────────
 #   ERROR CODE MONITOR (parallel dengan crash_monitor & logcat_crash_detector)
 # ─────────────────────────────────────────
 # Kenapa fungsi terpisah, bukan digabung ke monitor_events?
@@ -2041,7 +2197,7 @@ if [ "$USE_MULTI_PKG" = "1" ]; then
     log "Package 2        : $PKG2"
 fi
 log "Discord          : $(show_toggle $DISCORD_ENABLED)"
-log "Deteksi Error Code: $(show_toggle ${DETEKSI_ERROR_CODE:-1})"
+log "Deteksi Error Code: $(show_toggle ${DETEKSI_ERROR_CODE:-1}) (stuck watchdog: ${STUCK_WATCHDOG_TIMEOUT}s)"
 echo "=========================================" | tee -a "$PKG1_LOG_FILE"
 echo ""
 
@@ -2082,6 +2238,9 @@ LOGCAT_CRASH_PID=$!
 error_code_monitor "$PKG1" "${CONFIG_BASE_DIR}/roblox_config_${PKG1}.cfg" &
 ERROR_CODE_PID=$!
 
+stuck_watchdog "$PKG1" "${CONFIG_BASE_DIR}/roblox_config_${PKG1}.cfg" &
+STUCK_WD_PID=$!
+
 # Keep alive — restart monitor jika mati
 while true; do
     if ! kill -0 "$MONITOR_PID" 2>/dev/null; then
@@ -2103,6 +2262,11 @@ while true; do
         log "⚠️ error_code_monitor mati — restart otomatis"
         error_code_monitor "$PKG1" "${CONFIG_BASE_DIR}/roblox_config_${PKG1}.cfg" &
         ERROR_CODE_PID=$!
+    fi
+    if ! kill -0 "$STUCK_WD_PID" 2>/dev/null; then
+        log "⚠️ stuck_watchdog mati — restart otomatis"
+        stuck_watchdog "$PKG1" "${CONFIG_BASE_DIR}/roblox_config_${PKG1}.cfg" &
+        STUCK_WD_PID=$!
     fi
     sleep "$CHECK_INTERVAL"
 done
