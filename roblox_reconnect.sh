@@ -2,7 +2,29 @@
 
 # ─────────────────────────────────────────
 #   ROBLOX AUTO RECONNECT + AUTO RELOG
-#   by: Wardz | versi: 2.9 (Fix False-Positive Crash dari Sub-Process Roblox)
+#   by: Wardz | versi: 3.0 (+ Error Code Disconnect Detector)
+#   Perbaikan (3.0): - Fitur baru: error_code_monitor() — deteksi kode
+#                error disconnect Roblox (272/273/274/275/277/278/279/282)
+#                via logcat, lalu auto-rejoin. Ini beda dari crash_monitor:
+#                error code muncul saat KONEKSI ke server Roblox putus
+#                (internet lag/putus, server issue) — app-nya sendiri
+#                BELUM TENTU mati/hilang PID-nya, jadi butuh detector
+#                terpisah yang tidak nunggu PID hilang dulu.
+#              - Toggle baru per-package: DETEKSI_ERROR_CODE (default ON),
+#                bisa di-ubah lewat menu "Ubah setting".
+#              - Kenapa logcat, bukan OCR screen: dialog error Roblox
+#                di-render di dalam game engine sendiri (GL surface),
+#                BUKAN native Android View — jadi `uiautomator dump`
+#                (baca teks dari accessibility tree) tidak akan bisa
+#                "melihat" teks itu sama sekali. Opsi yang tersisa cuma
+#                screenshot + OCR (tesseract), yang jauh lebih berat &
+#                rapuh (tergantung resolusi/font/posisi dialog) dibanding
+#                logcat yang sudah jadi fondasi semua detector lain di
+#                script ini. Kalau nanti terbukti kode errornya TIDAK
+#                muncul di logcat sama sekali di device kamu, screenshot+
+#                OCR jadi fallback yang bisa ditambahkan belakangan.
+#   ---
+#   versi: 2.9 (Fix False-Positive Crash dari Sub-Process Roblox)
 #   Perbaikan: - JOIN LOCK: crash_monitor & logcat_detector skip saat proses join
 #              - wait_ingame: fallback PID+dumpsys, tidak hanya "Connection accepted"
 #              - join_server: am start diperbaiki (-p flag) + JOIN_LOCK set/release
@@ -100,6 +122,15 @@ JOIN_LOCK_DIR="${STATE_BASE_DIR}"
 # ini murni jadi "safety ceiling" kalau proses join benar-benar hang/macet —
 # 240s ngasih buffer ekstra untuk private server berat yang loadingnya lama.
 JOIN_LOCK_TIMEOUT=240   # detik — maks waktu loading private server sebelum lock dianggap hang
+
+# ─────────────────────────────────────────
+#   ERROR CODE DISCONNECT (auto-rejoin)
+# ─────────────────────────────────────────
+# Kode error Roblox yang muncul di dialog "Disconnected" saat koneksi ke
+# server putus (internet lag/putus, network error, server issue, dll) —
+# BUKAN app crash (PID biasanya masih hidup), makanya butuh detector
+# sendiri (error_code_monitor), terpisah dari crash_monitor/logcat_crash_detector.
+ERROR_CODE_LIST="272|273|274|275|277|278|279|282"
 
 # ─────────────────────────────────────────
 #   PATH PER-PACKAGE
@@ -391,6 +422,7 @@ save_config() {
     local reconnect=$6
     local restart=$7
     local home=$8
+    local error_code=${9:-1}
 
     # BUG FIX: Discord setup terjadi SETELAH package setup.
     # Kalau save_config dipanggil dari wizard/menu sebelum Discord diinput
@@ -415,6 +447,7 @@ RELOG_SETIAP_JAM=$relog
 RECONNECT_OTOMATIS=$reconnect
 RESTART_KALAU_CRASH=$restart
 RECONNECT_SAAT_HOME=$home
+DETEKSI_ERROR_CODE=$error_code
 DISCORD_ENABLED=${disc_enabled:-0}
 DISCORD_WEBHOOK="${disc_webhook}"
 DISCORD_USER_ID="${disc_uid}"
@@ -424,7 +457,7 @@ EOF
 persist_discord_settings() {
     local cfg_file=$1
     local pkg=$2
-    local saved_url saved_mode saved_relog saved_reconnect saved_restart saved_home
+    local saved_url saved_mode saved_relog saved_reconnect saved_restart saved_home saved_error_code
 
     if [ -f "$cfg_file" ]; then
         saved_url=$(grep '^URL=' "$cfg_file" | head -1 | cut -d'"' -f2)
@@ -433,10 +466,12 @@ persist_discord_settings() {
         saved_reconnect=$(grep '^RECONNECT_OTOMATIS=' "$cfg_file" | head -1 | cut -d= -f2)
         saved_restart=$(grep '^RESTART_KALAU_CRASH=' "$cfg_file" | head -1 | cut -d= -f2)
         saved_home=$(grep '^RECONNECT_SAAT_HOME=' "$cfg_file" | head -1 | cut -d= -f2)
+        saved_error_code=$(grep '^DETEKSI_ERROR_CODE=' "$cfg_file" | head -1 | cut -d= -f2)
     fi
 
     save_config "$cfg_file" "$pkg" "$saved_url" "$saved_mode" \
-        "$saved_relog" "$saved_reconnect" "$saved_restart" "$saved_home"
+        "$saved_relog" "$saved_reconnect" "$saved_restart" "$saved_home" \
+        "${saved_error_code:-1}"
 }
 
 # ─────────────────────────────────────────
@@ -481,6 +516,90 @@ validate_discord_webhook() {
     echo "$url" | grep -qE '^https://(discord|discordapp)\.com/api/webhooks/[0-9]{17,20}/[A-Za-z0-9_-]{60,90}(\?[A-Za-z0-9_=&-]*)?$'
 }
 
+# ─────────────────────────────────────────
+#   VALIDASI LIVE — cek webhook ke server Discord asli
+# ─────────────────────────────────────────
+# validate_discord_webhook() di atas cuma cek FORMAT (regex) — URL bisa
+# aja formatnya benar tapi webhook-nya sendiri sudah dihapus/direset di
+# Discord (mis. channel dihapus, integrasi di-revoke). Fungsi ini nembak
+# GET ke endpoint webhook itu sendiri: Discord balas 200 kalau valid &
+# masih aktif, 404/401 kalau sudah tidak valid.
+check_discord_webhook_live() {
+    local url=$1
+    local http_code
+    http_code=$(curl -s -o /dev/null -w "%{http_code}" --connect-timeout 8 -m 12 "$url" 2>/dev/null)
+    echo "${http_code:-000}"
+}
+
+# Loop input webhook: validasi format DULU (looping sampai bener/batal),
+# baru setelah format lolos, cek live ke Discord. Hasil akhir (webhook
+# yang mau dipakai) ditaruh ke variabel dengan nama $1 (indirect, sama
+# gaya kayak setup_mode_and_url()). Return 0 = ada webhook yang disimpan,
+# return 1 = user ketik "batal".
+prompt_discord_webhook() {
+    local var_name=$1
+
+    while true; do
+        echo ""
+        echo "  Paste webhook URL Discord:"
+        echo "  Contoh: https://discord.com/api/webhooks/123456789012345678/AbCdEf..."
+        echo "  (ketik 'batal' untuk skip)"
+        printf "  > "
+        local input_webhook
+        read -r input_webhook
+
+        if [ "$input_webhook" = "batal" ]; then
+            return 1
+        fi
+
+        if [ -z "$input_webhook" ]; then
+            echo "  ⚠ URL tidak boleh kosong!"
+            continue
+        fi
+
+        if ! validate_discord_webhook "$input_webhook"; then
+            echo "  ⚠ Format salah! Harus: https://discord.com/api/webhooks/{id}/{token}"
+            continue
+        fi
+
+        echo "  🔎 Mengecek webhook ke Discord..."
+        local http_code
+        http_code=$(check_discord_webhook_live "$input_webhook")
+
+        case "$http_code" in
+            200)
+                echo "  ✅ Webhook valid & aktif!"
+                printf -v "$var_name" '%s' "$input_webhook"
+                return 0
+                ;;
+            401|404)
+                echo "  ⚠ Format URL benar, tapi Discord MENOLAK webhook ini"
+                echo "     (kemungkinan sudah dihapus/direset di sisi Discord)."
+                echo "  1) Masukkan ulang   2) Tetap pakai ini"
+                printf "  Pilih (1/2): "
+                local force
+                read -r force
+                if [ "$force" = "2" ]; then
+                    printf -v "$var_name" '%s' "$input_webhook"
+                    return 0
+                fi
+                ;;
+            000|"")
+                echo "  ⚠ Gagal konek ke Discord (cek internet/data seluler)."
+                echo "     Format URL sudah benar — disimpan tanpa verifikasi live."
+                printf -v "$var_name" '%s' "$input_webhook"
+                return 0
+                ;;
+            *)
+                echo "  ⚠ Discord merespons kode $http_code (tidak terduga) — format OK,"
+                echo "     disimpan tanpa verifikasi live."
+                printf -v "$var_name" '%s' "$input_webhook"
+                return 0
+                ;;
+        esac
+    done
+}
+
 validate_private_server_url() {
     local url=$1
 
@@ -507,6 +626,7 @@ show_current_config() {
     local reconnect=$4
     local restart=$5
     local home=$6
+    local error_code=${7:-1}
     
     echo ""
     echo "  Mode aktif  : $(get_mode_label $mode)"
@@ -515,6 +635,7 @@ show_current_config() {
     echo "  Reconnect   : $(show_toggle $reconnect)"
     echo "  Restart     : $(show_toggle $restart)"
     echo "  Home RC     : $(show_toggle $home)"
+    echo "  Error Code  : $(show_toggle $error_code)"
     echo ""
 }
 
@@ -731,7 +852,7 @@ wizard_setup_pkg() {
     echo "  🎯 SETUP PACKAGE $pkg_num: $pkg"
     echo ""
     
-    local mode url relog reconnect restart home
+    local mode url relog reconnect restart home error_code
     
     # Mode & URL
     setup_mode_and_url "Setup Mode & URL untuk Package $pkg_num" mode url
@@ -766,9 +887,17 @@ wizard_setup_pkg() {
     read -r home
     if [ "$home" != "1" ]; then home=0; fi
     
+    echo ""
+    echo "  Deteksi Error Code disconnect (internet putus/lag)?"
+    echo "  Auto-rejoin kalau muncul Error Code: 272/273/274/275/277/278/279/282"
+    echo "  (1=ON, 0=OFF, default: 1)"
+    printf "  > "
+    read -r error_code
+    if [ "$error_code" != "0" ]; then error_code=1; fi
+    
     # Save
     local cfg_file="${CONFIG_BASE_DIR}/roblox_config_${pkg}.cfg"
-    save_config "$cfg_file" "$pkg" "$url" "$mode" "$relog" "$reconnect" "$restart" "$home"
+    save_config "$cfg_file" "$pkg" "$url" "$mode" "$relog" "$reconnect" "$restart" "$home" "$error_code"
     
     echo ""
     echo "  ✅ Config Package $pkg_num tersimpan!"
@@ -780,11 +909,12 @@ menu_ganti_url_mode_pkg() {
     local pkg_num=$2
     local cfg_file=$3
 
-    local keep_relog keep_reconnect keep_restart keep_home
+    local keep_relog keep_reconnect keep_restart keep_home keep_error_code
     keep_relog=$(grep '^RELOG_SETIAP_JAM=' "$cfg_file" | head -1 | cut -d= -f2)
     keep_reconnect=$(grep '^RECONNECT_OTOMATIS=' "$cfg_file" | head -1 | cut -d= -f2)
     keep_restart=$(grep '^RESTART_KALAU_CRASH=' "$cfg_file" | head -1 | cut -d= -f2)
     keep_home=$(grep '^RECONNECT_SAAT_HOME=' "$cfg_file" | head -1 | cut -d= -f2)
+    keep_error_code=$(grep '^DETEKSI_ERROR_CODE=' "$cfg_file" | head -1 | cut -d= -f2)
 
     local new_mode new_url
     setup_mode_and_url "Ganti Mode & URL — Package $pkg_num ($pkg)" new_mode new_url
@@ -794,7 +924,8 @@ menu_ganti_url_mode_pkg() {
     [ $? -ne 0 ] && return
 
     save_config "$cfg_file" "$pkg" "$new_url" "$new_mode" \
-        "$keep_relog" "$keep_reconnect" "$keep_restart" "$keep_home"
+        "$keep_relog" "$keep_reconnect" "$keep_restart" "$keep_home" \
+        "${keep_error_code:-1}"
 
     echo ""
     echo "  ✅ Mode & URL diupdate, setting lain tetap."
@@ -806,26 +937,29 @@ menu_edit_settings_pkg() {
     local cfg_file=$2
 
     while true; do
-        local cur_url cur_mode cur_relog cur_reconnect cur_restart cur_home
+        local cur_url cur_mode cur_relog cur_reconnect cur_restart cur_home cur_error_code
         cur_url=$(grep '^URL=' "$cfg_file" | head -1 | cut -d'"' -f2)
         cur_mode=$(grep '^MODE=' "$cfg_file" | head -1 | cut -d'"' -f2)
         cur_relog=$(grep '^RELOG_SETIAP_JAM=' "$cfg_file" | head -1 | cut -d= -f2)
         cur_reconnect=$(grep '^RECONNECT_OTOMATIS=' "$cfg_file" | head -1 | cut -d= -f2)
         cur_restart=$(grep '^RESTART_KALAU_CRASH=' "$cfg_file" | head -1 | cut -d= -f2)
         cur_home=$(grep '^RECONNECT_SAAT_HOME=' "$cfg_file" | head -1 | cut -d= -f2)
+        cur_error_code=$(grep '^DETEKSI_ERROR_CODE=' "$cfg_file" | head -1 | cut -d= -f2)
+        cur_error_code="${cur_error_code:-1}"
 
         clr
         header
         echo ""
         echo "  ⚙️ UBAH SETTING — $pkg"
-        show_current_config "$cur_url" "$cur_mode" "$cur_relog" "$cur_reconnect" "$cur_restart" "$cur_home"
+        show_current_config "$cur_url" "$cur_mode" "$cur_relog" "$cur_reconnect" "$cur_restart" "$cur_home" "$cur_error_code"
         echo "  1) Relog interval        (sekarang: ${cur_relog} jam)"
         echo "  2) Reconnect otomatis    (sekarang: $(show_toggle $cur_reconnect))"
         echo "  3) Restart kalau crash   (sekarang: $(show_toggle $cur_restart))"
         echo "  4) Reconnect saat home   (sekarang: $(show_toggle $cur_home))"
-        echo "  5) Kembali"
+        echo "  5) Deteksi Error Code    (sekarang: $(show_toggle $cur_error_code))"
+        echo "  6) Kembali"
         echo ""
-        printf "  Pilih (1-5): "
+        printf "  Pilih (1-6): "
         read -r PILIHAN
 
         case $PILIHAN in
@@ -835,7 +969,7 @@ menu_edit_settings_pkg() {
                 printf "  > "
                 read -r V
                 if [[ "$V" =~ ^[0-9]+$ ]]; then
-                    save_config "$cfg_file" "$pkg" "$cur_url" "$cur_mode" "$V" "$cur_reconnect" "$cur_restart" "$cur_home"
+                    save_config "$cfg_file" "$pkg" "$cur_url" "$cur_mode" "$V" "$cur_reconnect" "$cur_restart" "$cur_home" "$cur_error_code"
                     echo "  ✅ Disimpan!"
                 else
                     echo "  ⚠ Masukkan angka!"
@@ -844,24 +978,30 @@ menu_edit_settings_pkg() {
                 ;;
             2)
                 local new_val; new_val=$([ "$cur_reconnect" = "1" ] && echo 0 || echo 1)
-                save_config "$cfg_file" "$pkg" "$cur_url" "$cur_mode" "$cur_relog" "$new_val" "$cur_restart" "$cur_home"
+                save_config "$cfg_file" "$pkg" "$cur_url" "$cur_mode" "$cur_relog" "$new_val" "$cur_restart" "$cur_home" "$cur_error_code"
                 echo "  ✅ Reconnect: $(show_toggle $new_val)"
                 sleep 1
                 ;;
             3)
                 local new_val; new_val=$([ "$cur_restart" = "1" ] && echo 0 || echo 1)
-                save_config "$cfg_file" "$pkg" "$cur_url" "$cur_mode" "$cur_relog" "$cur_reconnect" "$new_val" "$cur_home"
+                save_config "$cfg_file" "$pkg" "$cur_url" "$cur_mode" "$cur_relog" "$cur_reconnect" "$new_val" "$cur_home" "$cur_error_code"
                 echo "  ✅ Restart: $(show_toggle $new_val)"
                 sleep 1
                 ;;
             4)
                 local new_val; new_val=$([ "$cur_home" = "1" ] && echo 0 || echo 1)
-                save_config "$cfg_file" "$pkg" "$cur_url" "$cur_mode" "$cur_relog" "$cur_reconnect" "$cur_restart" "$new_val" "$cur_home"
+                save_config "$cfg_file" "$pkg" "$cur_url" "$cur_mode" "$cur_relog" "$cur_reconnect" "$cur_restart" "$new_val" "$cur_error_code"
                 echo "  ✅ Home RC: $(show_toggle $new_val)"
                 sleep 1
                 ;;
-            5) return ;;
-            *) echo "  ⚠ Pilih 1-5"; sleep 1 ;;
+            5)
+                local new_val; new_val=$([ "$cur_error_code" = "1" ] && echo 0 || echo 1)
+                save_config "$cfg_file" "$pkg" "$cur_url" "$cur_mode" "$cur_relog" "$cur_reconnect" "$cur_restart" "$cur_home" "$new_val"
+                echo "  ✅ Deteksi Error Code: $(show_toggle $new_val)"
+                sleep 1
+                ;;
+            6) return ;;
+            *) echo "  ⚠ Pilih 1-6"; sleep 1 ;;
         esac
     done
 }
@@ -877,19 +1017,21 @@ setup_or_load_pkg() {
     fi
 
     while true; do
-        local saved_url saved_mode saved_relog saved_reconnect saved_restart saved_home
+        local saved_url saved_mode saved_relog saved_reconnect saved_restart saved_home saved_error_code
         saved_url=$(grep '^URL=' "$cfg_file" | head -1 | cut -d'"' -f2)
         saved_mode=$(grep '^MODE=' "$cfg_file" | head -1 | cut -d'"' -f2)
         saved_relog=$(grep '^RELOG_SETIAP_JAM=' "$cfg_file" | head -1 | cut -d= -f2)
         saved_reconnect=$(grep '^RECONNECT_OTOMATIS=' "$cfg_file" | head -1 | cut -d= -f2)
         saved_restart=$(grep '^RESTART_KALAU_CRASH=' "$cfg_file" | head -1 | cut -d= -f2)
         saved_home=$(grep '^RECONNECT_SAAT_HOME=' "$cfg_file" | head -1 | cut -d= -f2)
+        saved_error_code=$(grep '^DETEKSI_ERROR_CODE=' "$cfg_file" | head -1 | cut -d= -f2)
+        saved_error_code="${saved_error_code:-1}"
 
         clr
         header
         echo ""
         echo "  📦 Config Package $pkg_num ($pkg) ditemukan dari run sebelumnya:"
-        show_current_config "$saved_url" "$saved_mode" "$saved_relog" "$saved_reconnect" "$saved_restart" "$saved_home"
+        show_current_config "$saved_url" "$saved_mode" "$saved_relog" "$saved_reconnect" "$saved_restart" "$saved_home" "$saved_error_code"
         echo "  1) Pakai config ini, langsung jalan"
         echo "  2) Ganti mode / URL"
         echo "  3) Ubah setting (relog/reconnect/restart/home)"
@@ -959,15 +1101,11 @@ menu_setup_discord() {
             sleep 1
             ;;
         2)
-            echo ""
-            echo "  Paste webhook URL:"
-            printf "  > "
-            read -r DISCORD_WEBHOOK
-            if validate_discord_webhook "$DISCORD_WEBHOOK"; then
+            if prompt_discord_webhook DISCORD_WEBHOOK; then
                 DISCORD_ENABLED=1
                 echo "  ✅ Webhook updated!"
             else
-                echo "  ⚠ Invalid! Format harus: https://discord.com/api/webhooks/{id}/{token}"
+                echo "  ℹ️ Dibatalkan — webhook tidak diubah."
             fi
             sleep 1
             ;;
@@ -1672,6 +1810,108 @@ logcat_crash_detector() {
 }
 
 # ─────────────────────────────────────────
+#   ERROR CODE MONITOR (parallel dengan crash_monitor & logcat_crash_detector)
+# ─────────────────────────────────────────
+# Kenapa fungsi terpisah, bukan digabung ke monitor_events?
+#   monitor_events sudah nangkep frasa disconnect GENERIK ("Sending
+#   disconnect with reason", "Connection lost", dll) — tapi TIDAK berhenti
+#   di angka kode error spesifik. Kode 272/273/274/275/277/278/279/282
+#   adalah kode disconnect Roblox yang paling sering muncul akibat internet
+#   putus/lag/network error (BUKAN Roblox lagi nge-crash — PID app biasanya
+#   masih hidup, cuma koneksi socket ke server yang terputus). Karena app
+#   tidak mati, crash_monitor (yang nunggu PID hilang) & logcat_crash_detector
+#   (yang nunggu pola FATAL EXCEPTION/tombstone) TIDAK akan pernah trigger
+#   untuk kasus ini — makanya perlu detector sendiri yang langsung rejoin
+#   begitu kode errornya ketemu, tanpa nunggu app "keliatan mati" dulu.
+#
+# Catatan soal metode deteksi (dijawab dari yang user tanya: "cara lain?"):
+#   Dialog "Disconnected... Error Code: 277" itu di-render Roblox DI DALAM
+#   game engine-nya sendiri (GL surface / canvas internal), BUKAN native
+#   Android View/TextView. Konsekuensinya:
+#     - `uiautomator dump` (baca teks lewat accessibility tree) TIDAK akan
+#       bisa "melihat" teks itu — accessibility tree cuma tahu ada satu
+#       SurfaceView kosong, tanpa isi teks di dalamnya.
+#     - Screenshot + OCR (tesseract) SECARA TEKNIS bisa baca teks itu, tapi:
+#         a) butuh install tesseract-ocr + trained data di Termux (berat),
+#         b) akurasi tergantung resolusi/DPI/font/posisi dialog per device,
+#         c) tiap check = screencap + OCR = jauh lebih lambat & lebih makan
+#            baterai/CPU dibanding grep logcat yang instan.
+#   Makanya dipilih LOGCAT — sama seperti fondasi semua detector lain di
+#   script ini (monitor_events, crash_monitor, logcat_crash_detector).
+#   Roblox Android mencatat reason disconnect ke logcat saat dialog error
+#   itu muncul. KALAU ternyata di device kamu kode errornya TIDAK pernah
+#   nongol di logcat (format log Roblox beda-beda per versi app), OCR bisa
+#   ditambahkan belakangan sebagai fallback — tinggal bilang aja.
+#
+# Cara verifikasi/tuning pattern-nya di device asli (kalau ternyata tidak
+# ke-detect): saat lagi reproduce error (mis. matiin data/wifi sebentar
+# sampai muncul dialog Error Code), jalankan di sesi Termux LAIN:
+#   logcat -v time | grep -i "error\|disconnect"
+# lalu lihat format baris persis yang muncul, dan sesuaikan pattern grep
+# di bawah (variabel ERROR_CODE_LIST + kata kunci "error code"/"disconnect").
+error_code_monitor() {
+    local pkg=$1
+    local cfg_file=$2
+
+    while true; do
+        # Sama seperti detector lain: -T "sekarang" di-generate ULANG tiap
+        # iterasi outer loop, cegah replay backlog logcat lama.
+        local start_ts
+        start_ts=$(date '+%m-%d %H:%M:%S.000')
+
+        while read -r line; do
+            # Skip kalau proses join lagi berlangsung — dialog error code
+            # kadang ikut kesebut sekilas di log waktu Roblox pindah server,
+            # bukan disconnect asli yang butuh rejoin manual.
+            if is_joining "$pkg"; then
+                continue
+            fi
+
+            # Ambil kode yang match persis (hindari nyangkut ke substring,
+            # mis. "1277" ke-anggap "277" — makanya dibatasi bukan-digit
+            # di kedua sisi, bukan pakai \b yang belum tentu didukung
+            # grep -E di Android/toybox).
+            local code
+            code=$(echo "$line" \
+                | grep -oE "(^|[^0-9])(${ERROR_CODE_LIST})([^0-9]|\$)" \
+                | head -1 \
+                | grep -oE "[0-9]+")
+            [ -z "$code" ] && continue
+
+            # Cegah race/double-handle dengan crash_monitor & logcat_crash_detector
+            # (mis. kasus disconnect yang ujung-ujungnya bikin app force-close juga)
+            if ! acquire_crash_lock "$pkg"; then
+                log "⏭️ error_code_monitor: handler lain sudah handling — skip (Error Code $code)"
+                continue
+            fi
+
+            log "🌐 ERROR CODE $code TERDETEKSI — kemungkinan internet putus/lag, auto-rejoin..."
+            send_discord_notification "disconnect" "Error Code: $code (internet putus/lag)" "$pkg"
+
+            sleep 3
+            source "$cfg_file" 2>/dev/null || true
+
+            if [ "${DETEKSI_ERROR_CODE:-1}" != "1" ]; then
+                log "ℹ️ DETEKSI_ERROR_CODE=OFF — tidak auto-rejoin"
+                release_crash_lock "$pkg"
+                continue
+            fi
+
+            local active_url
+            active_url=$(get_active_url "$MODE" "$URL")
+            join_server "$pkg" "$active_url" "$MODE"
+            wait_ingame "$pkg"
+            verify_ingame_stable "$pkg" "$cfg_file"
+            release_crash_lock "$pkg"
+
+        done < <(logcat -T "$start_ts" -b main -b system -b crash -v time 2>/dev/null | grep --line-buffered -iE \
+            "(error.{0,3}code|disconnect(ed)?).{0,60}(^|[^0-9])(${ERROR_CODE_LIST})([^0-9]|\$)|(^|[^0-9])(${ERROR_CODE_LIST})([^0-9]|\$).{0,60}(error.{0,3}code|disconnect(ed)?)")
+
+        sleep 3
+    done
+}
+
+# ─────────────────────────────────────────
 #   OPEN SECOND PACKAGE (menggunakan perbaikan)
 # ─────────────────────────────────────────
 
@@ -1764,12 +2004,7 @@ fi
 printf "  (1=YES, 0=NO/biarkan): "
 read -r SETUP_DISCORD
 if [ "$SETUP_DISCORD" = "1" ]; then
-    echo ""
-    echo "  Webhook URL:"
-    printf "  > "
-    read -r DISCORD_WEBHOOK
-    
-    if validate_discord_webhook "$DISCORD_WEBHOOK"; then
+    if prompt_discord_webhook DISCORD_WEBHOOK; then
         DISCORD_ENABLED=1
         echo ""
         echo "  User ID (opsional):"
@@ -1778,8 +2013,7 @@ if [ "$SETUP_DISCORD" = "1" ]; then
         echo ""
         echo "  ✅ Discord configured!"
     else
-        DISCORD_ENABLED=0
-        echo "  ⚠️ Invalid webhook! Format harus: https://discord.com/api/webhooks/{id}/{token}"
+        echo "  ℹ️ Dibatalkan — Discord tidak di-setup."
     fi
     sleep 2
 fi
@@ -1807,6 +2041,7 @@ if [ "$USE_MULTI_PKG" = "1" ]; then
     log "Package 2        : $PKG2"
 fi
 log "Discord          : $(show_toggle $DISCORD_ENABLED)"
+log "Deteksi Error Code: $(show_toggle ${DETEKSI_ERROR_CODE:-1})"
 echo "=========================================" | tee -a "$PKG1_LOG_FILE"
 echo ""
 
@@ -1844,6 +2079,9 @@ CRASH_PID=$!
 logcat_crash_detector "$PKG1" "${CONFIG_BASE_DIR}/roblox_config_${PKG1}.cfg" &
 LOGCAT_CRASH_PID=$!
 
+error_code_monitor "$PKG1" "${CONFIG_BASE_DIR}/roblox_config_${PKG1}.cfg" &
+ERROR_CODE_PID=$!
+
 # Keep alive — restart monitor jika mati
 while true; do
     if ! kill -0 "$MONITOR_PID" 2>/dev/null; then
@@ -1860,6 +2098,11 @@ while true; do
         log "⚠️ logcat_crash_detector mati — restart otomatis"
         logcat_crash_detector "$PKG1" "${CONFIG_BASE_DIR}/roblox_config_${PKG1}.cfg" &
         LOGCAT_CRASH_PID=$!
+    fi
+    if ! kill -0 "$ERROR_CODE_PID" 2>/dev/null; then
+        log "⚠️ error_code_monitor mati — restart otomatis"
+        error_code_monitor "$PKG1" "${CONFIG_BASE_DIR}/roblox_config_${PKG1}.cfg" &
+        ERROR_CODE_PID=$!
     fi
     sleep "$CHECK_INTERVAL"
 done
