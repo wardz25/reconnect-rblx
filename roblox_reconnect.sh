@@ -2211,10 +2211,6 @@ error_code_monitor() {
     done
 }
 
-        sleep 3
-    done
-}
-
 # ─────────────────────────────────────────
 #   OCR ERROR CODE MONITOR
 #   Baca layar langsung via screencap + tesseract.
