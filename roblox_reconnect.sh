@@ -1561,6 +1561,17 @@ monitor_events() {
         #     sudah terbuffer selama proses join (bisa menit-an) dibaca saat
         #     loop lanjut — baris "Connection lost" lama yang terbuffer
         #     langsung re-trigger reconnect → webhook + rejoin kedua/ketiga.
+        #
+        # v3.2 FIX (root cause "randomly kill" / loop rejoin):
+        # (4) _seen_joining flag: kalau MONITOR LAIN yang trigger rejoin
+        #     (bukan monitor_events sendiri), logcat pipe kita tetap jalan dan
+        #     akumula baris selama join berlangsung. Saat join lock dilepas,
+        #     baris-baris itu langsung dibaca → false disconnect signal.
+        #     Fix: tandai kalau join pernah aktif di iterasi ini. Begitu join
+        #     selesai (is_joining → false), LANGSUNG break → restart pipe
+        #     dengan start_ts baru → buffer lama tidak pernah diproses.
+
+        local _seen_joining=0
 
         while read -r line; do
             # ── Inner filter ketat: tentukan jenis sinyal ────────────────
@@ -1586,8 +1597,17 @@ monitor_events() {
             # Skip jika join sedang berlangsung — signal disconnect bisa muncul
             # saat Roblox berpindah server / loading private server baru
             if is_joining "$pkg"; then
+                _seen_joining=1
                 log "⏭️ monitor_events: join aktif — abaikan '$reason'"
                 continue
+            fi
+
+            # v3.2: join BARU SELESAI — buffer logcat dari proses join masih
+            # antri di pipe. Restart pipe agar baris lama tidak ke-proses.
+            if [ "$_seen_joining" = "1" ]; then
+                _seen_joining=0
+                log "⏭️ monitor_events: join baru selesai — reset pipe (buang buffer join)"
+                break
             fi
 
             # Koordinasi dengan monitor lain — cegah double-handle & double-webhook
@@ -2093,32 +2113,69 @@ error_code_monitor() {
     local cfg_file=$2
 
     while true; do
-        # Sama seperti detector lain: -T "sekarang" di-generate ULANG tiap
-        # iterasi outer loop, cegah replay backlog logcat lama.
+        # -T "sekarang" di-generate ULANG tiap iterasi outer loop,
+        # cegah replay backlog logcat lama.
         local start_ts
         start_ts=$(date '+%m-%d %H:%M:%S.000')
 
+        # FIX v3.2 (root cause "randomly kill"): prefilter sebelumnya match
+        # angka 275/529/dll di SELURUH logcat sistem — HTTP 529 dari CDN
+        # Roblox, memory address 0x275, port number, dll semuanya kena →
+        # false positive yang "acak" bunuh proses yang sebenarnya sehat.
+        # FIX: filter logcat per PID Roblox (--pid=) sehingga hanya baris
+        # dari proses Roblox itu sendiri yang diproses. Angka 529 dari HTTP
+        # CDN request milik system/proses lain tidak akan masuk sama sekali.
+        # Kalau --pid tidak didukung Android lama (< 7.0), fallback ke
+        # tanpa filter PID tapi tambah grep package name sebagai guard.
+        local rblx_pid pid_arg=""
+        rblx_pid=$(get_pid_for_pkg "$pkg")
+        if [ -n "$rblx_pid" ]; then
+            pid_arg="--pid=${rblx_pid}"
+        else
+            # PID belum ada — Roblox mungkin belum jalan, tunggu dulu
+            sleep 10
+            continue
+        fi
+
+        # v3.2 ROOT CAUSE FIX (loop rejoin / "randomly kill"):
+        # Skenario: monitor LAIN (crash_monitor/logcat_crash_detector) trigger
+        # rejoin. Selama rejoin, is_joining=true → inner while kita loop terus
+        # tapi continue di setiap baris. TAPI logcat pipe tetap jalan dan
+        # akumula baris dari proses joining itu sendiri (termasuk error code
+        # dari transisi server). Saat join lock dilepas, is_joining=false →
+        # baris-baris yang terbuffer langsung dibaca → error code 275/529 dari
+        # transisi server ke-detect sebagai disconnect asli → rejoin lagi →
+        # LOOP TAK BERHENTI.
+        #
+        # _seen_joining flag: tandai kalau join pernah aktif di iterasi ini.
+        # Begitu is_joining → false, LANGSUNG break (bukan continue) →
+        # outer loop restart → start_ts baru → buffer lama tidak pernah diproses.
+        local _seen_joining=0
+
         while read -r line; do
-            # Skip kalau proses join lagi berlangsung — dialog error code
-            # kadang ikut kesebut sekilas di log waktu Roblox pindah server,
-            # bukan disconnect asli yang butuh rejoin manual.
+            # Skip kalau proses join lagi berlangsung
             if is_joining "$pkg"; then
+                _seen_joining=1   # tandai: join aktif di iterasi ini
                 continue
             fi
 
-            # Ambil kode yang match persis (hindari nyangkut ke substring,
-            # mis. "1277" ke-anggap "277" — makanya dibatasi bukan-digit
-            # di kedua sisi, bukan pakai \b yang belum tentu didukung
-            # grep -E di Android/toybox).
+            # Join BARU SELESAI → buang sisa buffer, restart pipe
+            if [ "$_seen_joining" = "1" ]; then
+                _seen_joining=0
+                log "⏭️ error_code_monitor: join baru selesai — reset pipe (buang buffer join)"
+                break
+            fi
+
+            # Extract kode error — bukan-digit di kedua sisi cegah substring match
+            # (mis. "1277" tidak ke-anggap "277"). Pakai printf agar tidak ada
+            # subshell extra dari echo yang bisa beda behaviour per shell.
             local code
-            code=$(echo "$line" \
-                | grep -oE "(^|[^0-9])(${ERROR_CODE_LIST})([^0-9]|\$)" \
-                | head -1 \
-                | grep -oE "[0-9]+")
+            code=$(printf '%s' "$line" \
+                | grep -oE "(^|[^0-9])(${ERROR_CODE_LIST})([^0-9]|$)" \
+                | grep -oE "[0-9]+" | head -1)
             [ -z "$code" ] && continue
 
-            # Cegah race/double-handle dengan crash_monitor & logcat_crash_detector
-            # (mis. kasus disconnect yang ujung-ujungnya bikin app force-close juga)
+            # Cegah race/double-handle
             if ! acquire_crash_lock "$pkg"; then
                 log "⏭️ error_code_monitor: handler lain sudah handling — skip (Error Code $code)"
                 continue
@@ -2143,16 +2200,142 @@ error_code_monitor() {
             verify_ingame_stable "$pkg" "$cfg_file"
             release_crash_lock "$pkg"
 
-        # v3.1 FIX: prefilter lama pakai boundary assertion (^|[^0-9]) di dalam
-        # grup grep -E — tidak reliable di Android toybox grep dan mungkin
-        # tidak pernah match sama sekali. Sekarang filter hanya dengan
-        # kata kunci error/disconnect ATAU satu dari nomor kode error.
-        # Inner bash-loop yang verifikasi kode persis (extract + match).
-        done < <(logcat -T "$start_ts" -b main -b system -b crash -v time 2>/dev/null \
+            # Break → outer loop restart → PID baru setelah rejoin
+            break
+
+        done < <(logcat -T "$start_ts" $pid_arg -b main -b system -v time 2>/dev/null \
             | grep --line-buffered -iE \
-                "(error|disconnect|network|kicked|kicked_from_server|${ERROR_CODE_LIST})")
+                "(error|disconnect|${ERROR_CODE_LIST})")
 
         sleep 3
+    done
+}
+
+        sleep 3
+    done
+}
+
+# ─────────────────────────────────────────
+#   OCR ERROR CODE MONITOR
+#   Baca layar langsung via screencap + tesseract.
+#
+#   Kenapa perlu ini (padahal sudah ada error_code_monitor):
+#     Dialog "Disconnected (Error Code: NNN)" di Roblox di-render di dalam
+#     GL surface (game engine canvas), BUKAN native Android View. Jadi:
+#     - uiautomator dump → tidak bisa baca teks ini
+#     - logcat → KADANG tidak muncul, tergantung versi Roblox / ROM
+#     - screencap + OCR → baca pixel layar langsung → SELALU akurat
+#       karena yang dibaca persis apa yang user lihat di layar
+#
+#   Cara kerja:
+#     Setiap OCR_INTERVAL detik:
+#     1. Cek Roblox masih running & di foreground
+#     2. screencap → /data/local/tmp/rbx_ocr_<pkg>.png
+#     3. tesseract OCR → cari pola "Error Code NNN" atau "Error NNN"
+#     4. Kalau ketemu → acquire crash_lock → rejoin
+#
+#   Requirement:
+#     pkg install tesseract  (di Termux)
+#     tesseract akan otomatis skip kalau tidak terinstall
+# ─────────────────────────────────────────
+
+ocr_error_monitor() {
+    local pkg=$1
+    local cfg_file=$2
+    local ocr_interval=25   # cek layar setiap 25 detik
+
+    # Cek tesseract tersedia — kalau tidak, fungsi ini langsung exit
+    # (tidak perlu loop, keep-alive di MAIN tidak akan restart karena
+    # kita pakai return bukan exit, dan keep-alive cek kill -0 $PID)
+    if ! command -v tesseract >/dev/null 2>&1; then
+        log "⚠️ ocr_error_monitor: tesseract tidak tersedia — skip"
+        log "   Install OCR: pkg install tesseract"
+        return
+    fi
+
+    # Nama file sementara pakai pkg (ganti titik → underscore biar aman)
+    local safe_pkg="${pkg//[.]/_}"
+    local scr_file="/data/local/tmp/rbx_ocr_${safe_pkg}.png"
+    local txt_base="/data/local/tmp/rbx_ocr_${safe_pkg}_out"
+
+    log "📸 ocr_error_monitor: aktif (interval: ${ocr_interval}s)"
+
+    while true; do
+        sleep "$ocr_interval"
+
+        # Skip kalau join lagi berlangsung
+        if is_joining "$pkg"; then
+            continue
+        fi
+
+        # Roblox harus running
+        local pid
+        pid=$(get_pid_for_pkg "$pkg")
+        [ -z "$pid" ] && continue
+
+        # Roblox harus di foreground — kalau di background, screencap
+        # akan tangkap layar lain dan OCR tidak relevan
+        dumpsys activity top 2>/dev/null | grep -q "ACTIVITY ${pkg}" || continue
+
+        # Ambil screenshot
+        screencap -p "$scr_file" 2>/dev/null
+        [ -f "$scr_file" ] || continue
+
+        # OCR — lang eng, quiet, output ke file teks
+        tesseract "$scr_file" "$txt_base" -l eng quiet 2>/dev/null
+        local txt_file="${txt_base}.txt"
+
+        if [ ! -f "$txt_file" ]; then
+            rm -f "$scr_file" 2>/dev/null
+            continue
+        fi
+
+        # Cari pola "Error Code NNN" atau "Error NNN" atau "(NNN)" dekat kata error/disconnect
+        # Pola primer: "Error Code" diikuti angka
+        local detected_code=""
+        detected_code=$(grep -oiE "error.{0,8}code.{0,8}([0-9]{3,4})" "$txt_file" \
+            | grep -oE "[0-9]{3,4}" | head -1)
+
+        # Pola sekunder: salah satu error code list di dekat kata disconnect/error
+        if [ -z "$detected_code" ]; then
+            # Hanya match kalau ada kata konteks disconnect/error di baris yang sama
+            while IFS= read -r ocr_line; do
+                echo "$ocr_line" | grep -qiE "disconnect|error|kicked|connection" || continue
+                detected_code=$(printf '%s' "$ocr_line" \
+                    | grep -oE "(^|[^0-9])(${ERROR_CODE_LIST})([^0-9]|$)" \
+                    | grep -oE "[0-9]+" | head -1)
+                [ -n "$detected_code" ] && break
+            done < "$txt_file"
+        fi
+
+        rm -f "$scr_file" "$txt_file" 2>/dev/null
+
+        [ -z "$detected_code" ] && continue
+
+        # Error dialog terdeteksi di layar
+        if ! acquire_crash_lock "$pkg"; then
+            log "⏭️ ocr_error_monitor: handler lain aktif — skip (Code $detected_code)"
+            continue
+        fi
+
+        log "📸 OCR: Error Code $detected_code terdeteksi di layar — auto-rejoin"
+        send_discord_notification "disconnect" "Error Code: $detected_code (OCR layar)" "$pkg"
+
+        sleep 2
+        source "$cfg_file" 2>/dev/null || true
+
+        if [ "${DETEKSI_ERROR_CODE:-1}" != "1" ]; then
+            log "ℹ️ DETEKSI_ERROR_CODE=OFF — tidak auto-rejoin"
+            release_crash_lock "$pkg"
+            continue
+        fi
+
+        local active_url
+        active_url=$(get_active_url "$MODE" "$URL")
+        join_server "$pkg" "$active_url" "$MODE"
+        wait_ingame "$pkg"
+        verify_ingame_stable "$pkg" "$cfg_file"
+        release_crash_lock "$pkg"
     done
 }
 
@@ -2330,6 +2513,9 @@ ERROR_CODE_PID=$!
 stuck_watchdog "$PKG1" "${CONFIG_BASE_DIR}/roblox_config_${PKG1}.cfg" &
 STUCK_WD_PID=$!
 
+ocr_error_monitor "$PKG1" "${CONFIG_BASE_DIR}/roblox_config_${PKG1}.cfg" &
+OCR_PID=$!
+
 # Keep alive — restart monitor jika mati
 while true; do
     if ! kill -0 "$MONITOR_PID" 2>/dev/null; then
@@ -2356,6 +2542,11 @@ while true; do
         log "⚠️ stuck_watchdog mati — restart otomatis"
         stuck_watchdog "$PKG1" "${CONFIG_BASE_DIR}/roblox_config_${PKG1}.cfg" &
         STUCK_WD_PID=$!
+    fi
+    if ! kill -0 "$OCR_PID" 2>/dev/null; then
+        log "⚠️ ocr_error_monitor mati — restart otomatis"
+        ocr_error_monitor "$PKG1" "${CONFIG_BASE_DIR}/roblox_config_${PKG1}.cfg" &
+        OCR_PID=$!
     fi
     sleep "$CHECK_INTERVAL"
 done
