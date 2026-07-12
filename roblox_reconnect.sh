@@ -1,5 +1,9 @@
 #!/data/data/com.termux/files/usr/bin/bash
 
+# Pastikan PATH Termux tersedia saat jalan sebagai root (exec su -c tidak
+# inherit PATH user) — tanpa ini, pkg/curl/awk/dll tidak ketemu di root shell
+export PATH="/data/data/com.termux/files/usr/bin:/data/data/com.termux/files/usr/sbin:$PATH"
+
 # ─────────────────────────────────────────
 #   ROBLOX AUTO RECONNECT + AUTO RELOG
 #   by: Wardz | versi: 3.0 (+ Error Code Disconnect Detector)
