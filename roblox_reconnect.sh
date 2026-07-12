@@ -2115,7 +2115,7 @@ error_code_monitor() {
     # sebagai disconnect asli. OCR baca pixel layar langsung → hanya fire
     # kalau dialog error BENAR-BENAR tampil di layar sekarang.
     # Sleep infinity agar keep-alive tidak restart terus (proses tetap "hidup").
-    sleep infinity
+    while true; do sleep 86400; done
 }
 
 
@@ -2161,7 +2161,7 @@ ocr_error_monitor() {
         if ! command -v tesseract >/dev/null 2>&1; then
             log "⚠️ ocr_error_monitor: gagal install tesseract — idle"
             log "   Install manual: pkg install tesseract"
-            sleep infinity
+            while true; do sleep 86400; done
             return
         fi
         log "✅ ocr_error_monitor: tesseract siap"
