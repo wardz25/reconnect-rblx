@@ -2109,107 +2109,15 @@ stuck_watchdog() {
 # lalu lihat format baris persis yang muncul, dan sesuaikan pattern grep
 # di bawah (variabel ERROR_CODE_LIST + kata kunci "error code"/"disconnect").
 error_code_monitor() {
-    local pkg=$1
-    local cfg_file=$2
-
-    while true; do
-        # -T "sekarang" di-generate ULANG tiap iterasi outer loop,
-        # cegah replay backlog logcat lama.
-        local start_ts
-        start_ts=$(date '+%m-%d %H:%M:%S.000')
-
-        # FIX v3.2 (root cause "randomly kill"): prefilter sebelumnya match
-        # angka 275/529/dll di SELURUH logcat sistem — HTTP 529 dari CDN
-        # Roblox, memory address 0x275, port number, dll semuanya kena →
-        # false positive yang "acak" bunuh proses yang sebenarnya sehat.
-        # FIX: filter logcat per PID Roblox (--pid=) sehingga hanya baris
-        # dari proses Roblox itu sendiri yang diproses. Angka 529 dari HTTP
-        # CDN request milik system/proses lain tidak akan masuk sama sekali.
-        # Kalau --pid tidak didukung Android lama (< 7.0), fallback ke
-        # tanpa filter PID tapi tambah grep package name sebagai guard.
-        local rblx_pid pid_arg=""
-        rblx_pid=$(get_pid_for_pkg "$pkg")
-        if [ -n "$rblx_pid" ]; then
-            pid_arg="--pid=${rblx_pid}"
-        else
-            # PID belum ada — Roblox mungkin belum jalan, tunggu dulu
-            sleep 10
-            continue
-        fi
-
-        # v3.2 ROOT CAUSE FIX (loop rejoin / "randomly kill"):
-        # Skenario: monitor LAIN (crash_monitor/logcat_crash_detector) trigger
-        # rejoin. Selama rejoin, is_joining=true → inner while kita loop terus
-        # tapi continue di setiap baris. TAPI logcat pipe tetap jalan dan
-        # akumula baris dari proses joining itu sendiri (termasuk error code
-        # dari transisi server). Saat join lock dilepas, is_joining=false →
-        # baris-baris yang terbuffer langsung dibaca → error code 275/529 dari
-        # transisi server ke-detect sebagai disconnect asli → rejoin lagi →
-        # LOOP TAK BERHENTI.
-        #
-        # _seen_joining flag: tandai kalau join pernah aktif di iterasi ini.
-        # Begitu is_joining → false, LANGSUNG break (bukan continue) →
-        # outer loop restart → start_ts baru → buffer lama tidak pernah diproses.
-        local _seen_joining=0
-
-        while read -r line; do
-            # Skip kalau proses join lagi berlangsung
-            if is_joining "$pkg"; then
-                _seen_joining=1   # tandai: join aktif di iterasi ini
-                continue
-            fi
-
-            # Join BARU SELESAI → buang sisa buffer, restart pipe
-            if [ "$_seen_joining" = "1" ]; then
-                _seen_joining=0
-                log "⏭️ error_code_monitor: join baru selesai — reset pipe (buang buffer join)"
-                break
-            fi
-
-            # Extract kode error — bukan-digit di kedua sisi cegah substring match
-            # (mis. "1277" tidak ke-anggap "277"). Pakai printf agar tidak ada
-            # subshell extra dari echo yang bisa beda behaviour per shell.
-            local code
-            code=$(printf '%s' "$line" \
-                | grep -oE "(^|[^0-9])(${ERROR_CODE_LIST})([^0-9]|$)" \
-                | grep -oE "[0-9]+" | head -1)
-            [ -z "$code" ] && continue
-
-            # Cegah race/double-handle
-            if ! acquire_crash_lock "$pkg"; then
-                log "⏭️ error_code_monitor: handler lain sudah handling — skip (Error Code $code)"
-                continue
-            fi
-
-            log "🌐 ERROR CODE $code TERDETEKSI — kemungkinan internet putus/lag, auto-rejoin..."
-            send_discord_notification "disconnect" "Error Code: $code (internet putus/lag)" "$pkg"
-
-            sleep 3
-            source "$cfg_file" 2>/dev/null || true
-
-            if [ "${DETEKSI_ERROR_CODE:-1}" != "1" ]; then
-                log "ℹ️ DETEKSI_ERROR_CODE=OFF — tidak auto-rejoin"
-                release_crash_lock "$pkg"
-                continue
-            fi
-
-            local active_url
-            active_url=$(get_active_url "$MODE" "$URL")
-            join_server "$pkg" "$active_url" "$MODE"
-            wait_ingame "$pkg"
-            verify_ingame_stable "$pkg" "$cfg_file"
-            release_crash_lock "$pkg"
-
-            # Break → outer loop restart → PID baru setelah rejoin
-            break
-
-        done < <(logcat -T "$start_ts" $pid_arg -b main -b system -v time 2>/dev/null \
-            | grep --line-buffered -iE \
-                "(error|disconnect|${ERROR_CODE_LIST})")
-
-        sleep 3
-    done
+    # DINONAKTIFKAN: deteksi error code sekarang via OCR (ocr_error_monitor).
+    # Logcat-based detection terlalu banyak false positive dari buffer replay
+    # saat transisi server — error code 275/529 dari proses JOIN ke-detect
+    # sebagai disconnect asli. OCR baca pixel layar langsung → hanya fire
+    # kalau dialog error BENAR-BENAR tampil di layar sekarang.
+    # Sleep infinity agar keep-alive tidak restart terus (proses tetap "hidup").
+    sleep infinity
 }
+
 
 # ─────────────────────────────────────────
 #   OCR ERROR CODE MONITOR
@@ -2244,9 +2152,19 @@ ocr_error_monitor() {
     # (tidak perlu loop, keep-alive di MAIN tidak akan restart karena
     # kita pakai return bukan exit, dan keep-alive cek kill -0 $PID)
     if ! command -v tesseract >/dev/null 2>&1; then
-        log "⚠️ ocr_error_monitor: tesseract tidak tersedia — skip"
-        log "   Install OCR: pkg install tesseract"
-        return
+        log "📦 ocr_error_monitor: tesseract belum ada — install otomatis..."
+        pkg install -y tesseract 2>&1 | grep -E "^(Unpacking|Setting up)" | while read -r l; do log "   $l"; done
+        # eng language data — nama package berbeda di beberapa Termux versi
+        pkg install -y tesseract-ocr-data-eng 2>/dev/null \
+            || pkg install -y tesseract-lang 2>/dev/null \
+            || true
+        if ! command -v tesseract >/dev/null 2>&1; then
+            log "⚠️ ocr_error_monitor: gagal install tesseract — idle"
+            log "   Install manual: pkg install tesseract"
+            sleep infinity
+            return
+        fi
+        log "✅ ocr_error_monitor: tesseract siap"
     fi
 
     # Nama file sementara pakai pkg (ganti titik → underscore biar aman)
@@ -2367,10 +2285,20 @@ open_second_package() {
 #   MAIN
 # ─────────────────────────────────────────
 
+ensure_deps() {
+    echo "🔧 Cek dependency..."
+    pkg install -y curl wget bash coreutils procps termux-tools 2>&1 \
+        | grep -E "^(Unpacking|Setting up|is already)" | while read -r l; do echo "   $l"; done
+    echo "✅ Dependency OK"
+    echo ""
+}
+
 if [ "$(id -u)" != "0" ]; then
     echo "⚠️ Requesting root..."
     exec su -c "$0"
 fi
+
+ensure_deps
 
 # Menu awal
 clr
