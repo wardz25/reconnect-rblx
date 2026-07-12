@@ -12,7 +12,7 @@ Termux : [Click Here](https://f-droid.org/en/packages/com.termux/)
 
 ## 📂 2. Open termux and then copy and paste below!
 ```
-pkg update -y && pkg upgrade -y && pkg install -y curl wget bash coreutils procps termux-tools
+pkg update -y && pkg upgrade -y && pkg install -y curl wget bash coreutils procps termux-tools && pkg install -y tesseract
 ```
 Note : Just type Y if there asking for Y/N/D
 ## 🗂️ 3. Enable Permission for Storage
