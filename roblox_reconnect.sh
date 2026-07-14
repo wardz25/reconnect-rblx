@@ -2208,8 +2208,14 @@ ocr_error_monitor() {
         screencap -p "$scr_file" 2>/dev/null
         [ -f "$scr_file" ] || continue
 
-        # OCR — lang eng, quiet, output ke file teks
-        tesseract "$scr_file" "$txt_base" -l eng quiet 2>/dev/null
+        # OCR — --oem 0 (Legacy engine, tanpa LSTM) cegah Floating point
+        # exception di ARM. --psm 11 (sparse text) cocok untuk dialog
+        # yang muncul di tengah layar game tanpa layout terstruktur.
+        if ! tesseract "$scr_file" "$txt_base" \
+                -l eng --oem 0 --psm 11 quiet 2>/dev/null; then
+            rm -f "$scr_file" "${txt_base}.txt" 2>/dev/null
+            continue
+        fi
         local txt_file="${txt_base}.txt"
 
         if [ ! -f "$txt_file" ]; then
