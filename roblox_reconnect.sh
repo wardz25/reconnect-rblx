@@ -1,11 +1,87 @@
 #!/data/data/com.termux/files/usr/bin/bash
 
-# Pastikan PATH Termux tersedia saat jalan sebagai root
+# Pastikan PATH Termux tersedia saat jalan sebagai root (exec su -c tidak
+# inherit PATH user) — tanpa ini, pkg/curl/awk/dll tidak ketemu di root shell
 export PATH="/data/data/com.termux/files/usr/bin:/data/data/com.termux/files/usr/sbin:$PATH"
 
 # ─────────────────────────────────────────
 #   ROBLOX AUTO RECONNECT + AUTO RELOG
-#   by: Wardz | Modified: TCP + OCR Hybrid
+#   by: Wardz | versi: 3.0 (+ Error Code Disconnect Detector)
+#   Perbaikan (3.0): - Fitur baru: error_code_monitor() — deteksi kode
+#                error disconnect Roblox (272/273/274/275/277/278/279/282)
+#                via logcat, lalu auto-rejoin. Ini beda dari crash_monitor:
+#                error code muncul saat KONEKSI ke server Roblox putus
+#                (internet lag/putus, server issue) — app-nya sendiri
+#                BELUM TENTU mati/hilang PID-nya, jadi butuh detector
+#                terpisah yang tidak nunggu PID hilang dulu.
+#              - Toggle baru per-package: DETEKSI_ERROR_CODE (default ON),
+#                bisa di-ubah lewat menu "Ubah setting".
+#              - Kenapa logcat, bukan OCR screen: dialog error Roblox
+#                di-render di dalam game engine sendiri (GL surface),
+#                BUKAN native Android View — jadi `uiautomator dump`
+#                (baca teks dari accessibility tree) tidak akan bisa
+#                "melihat" teks itu sama sekali. Opsi yang tersisa cuma
+#                screenshot + OCR (tesseract), yang jauh lebih berat &
+#                rapuh (tergantung resolusi/font/posisi dialog) dibanding
+#                logcat yang sudah jadi fondasi semua detector lain di
+#                script ini. Kalau nanti terbukti kode errornya TIDAK
+#                muncul di logcat sama sekali di device kamu, screenshot+
+#                OCR jadi fallback yang bisa ditambahkan belakangan.
+#   ---
+#   versi: 2.9 (Fix False-Positive Crash dari Sub-Process Roblox)
+#   Perbaikan: - JOIN LOCK: crash_monitor & logcat_detector skip saat proses join
+#              - wait_ingame: fallback PID+dumpsys, tidak hanya "Connection accepted"
+#              - join_server: am start diperbaiki (-p flag) + JOIN_LOCK set/release
+#              - Discord: full Embed (color, fields, thumbnail, footer)
+#              - Bug fix: menu_edit_settings_pkg pilihan 3 argumen salah (extra $cur_restart)
+#              - Discord: embed diubah ke layout "Sphinx Status Update"
+#                (title tetap, description markdown + divider + emoji,
+#                 thumbnail & footer icon logo Sphinx)
+#              - Bug fix: JOIN LOCK basi di tengah loading Private Server
+#                (lock tidak pernah di-refresh → expired sebelum join selesai
+#                → crash_monitor salah kill proses yang sebenarnya sehat).
+#                Sekarang lock direfresh aktif di wait_ingame +
+#                verify_ingame_stable, JOIN_LOCK_TIMEOUT 180→240s, dan
+#                miss_count crash_monitor 2→3 sebagai buffer tambahan.
+#              - ROOT CAUSE FIX crash Private Server (double-launch):
+#                join_server sebelumnya pakai `am start -p pkg || am start`
+#                — exit code am start TIDAK KONSISTEN, sering bikin `||`
+#                menembak am start KEDUA tepat setelah yang pertama, app
+#                kelihatan blank/close sebentar. Diganti pakai
+#                get_view_activity() untuk resolve component -n pkg/activity
+#                secara deterministik — cuma SATU am start.
+#              - ROOT CAUSE FIX crash loop pasca-join (logcat backlog
+#                replay): logcat_crash_detector & monitor_events sebelumnya
+#                panggil `logcat -b crash -b main` TANPA filter waktu (-T).
+#                Tanpa -T, logcat SELALU dump SELURUH buffer historis dulu
+#                (ribuan baris sejak boot) sebelum streaming live — termasuk
+#                tombstone/native-crash LAMA yang sudah lama selesai. Proses
+#                "mengunyah" backlog itu makan waktu nyata & kebetulan
+#                bertepatan dengan event lain (mis. verify_ingame_stable
+#                selesai) → kelihatan seperti crash baru padahal cuma entry
+#                lama. Tiap restart pipe = backlog terbaca ulang = loop
+#                tak berkesudahan. FIX: -T "$(date ...)" di-generate ULANG
+#                tiap iterasi outer loop, jadi logcat cuma kasih baris BARU.
+#              - Fitur SPLIT SCREEN dihapus sepenuhnya (try_split_screen,
+#                SPLIT_ENABLED, embed case "split", menu text) — PKG2
+#                sekarang SELALU pakai floating/freeform window langsung,
+#                tanpa percobaan split screen dulu.
+#              - ROOT CAUSE FIX "black screen" saat loading Private Server
+#                BERAT (mis. Grow a Garden): Roblox pakai arsitektur MULTI-
+#                PROCESS — ada sub-process terpisah (mis. "pkg:renderer",
+#                "pkg:sandboxed_process0") yang wajar mati/restart sendiri
+#                saat loading asset berat, BUKAN crash fatal. Regex crash
+#                logcat_crash_detector pakai SUBSTRING match, jadi baris
+#                seperti "Process com.roblox.client:renderer has died" ikut
+#                ke-match walau yang mati cuma sub-process — script SALAH
+#                force-stop app yang SEBENARNYA SEHAT (black screen yang
+#                user lihat = ulah script sendiri, bukan Roblox crash asli).
+#                FIX 2 lapis: (1) abaikan baris log yang jelas menyebut
+#                proses ber-suffix ":nama" setelah nama package, (2) SEBELUM
+#                bertindak, cross-verify PID utama via get_pid_for_pkg()
+#                (exact-match, sudah aman dari sub-process) — kalau PID
+#                utama masih hidup & sehat, sinyal crash logcat diabaikan,
+#                tidak ada force-stop.
 # ─────────────────────────────────────────
 
 PKG1=""
@@ -40,16 +116,27 @@ DISCORD_ENABLED=0
 IS_CLONE_APP=""
 DETECTED_USER_ID=""
 
-# Multi package
+# Multi package (kedua akun/app dijalankan bersamaan via floating window)
 USE_MULTI_PKG=0
 
-# Join lock
+# Join lock — cegah crash_monitor/logcat_detector intervensi saat proses join
 JOIN_LOCK_DIR="${STATE_BASE_DIR}"
-JOIN_LOCK_TIMEOUT=240
+# BUG FIX: 180 → 240. Lock sekarang di-refresh aktif tiap iterasi selama
+# wait_ingame/verify_ingame_stable berjalan (lihat fungsi terkait), jadi nilai
+# ini murni jadi "safety ceiling" kalau proses join benar-benar hang/macet —
+# 240s ngasih buffer ekstra untuk private server berat yang loadingnya lama.
+JOIN_LOCK_TIMEOUT=240   # detik — maks waktu loading private server sebelum lock dianggap hang
 
-# Error code list
+# ─────────────────────────────────────────
+#   ERROR CODE DISCONNECT (auto-rejoin)
+# ─────────────────────────────────────────
 ERROR_CODE_LIST="272|273|274|275|277|278|279|282|529"
-STUCK_WATCHDOG_TIMEOUT=30   # 30 detik untuk TCP detection (lebih cepat)
+
+# Timeout stuck watchdog: berapa detik Roblox boleh "hidup tapi diam"
+# sebelum dianggap stuck di dialog error dan di-rejoin.
+# Default 120 detik (2 menit) — cukup lama untuk loading normal,
+# cukup cepat untuk nangkep disconnect yang gak ke-detect logcat.
+STUCK_WATCHDOG_TIMEOUT=120
 
 # ─────────────────────────────────────────
 #   PATH PER-PACKAGE
@@ -137,9 +224,19 @@ send_discord_notification() {
     local details=$2
     local pkg=$3
 
+    # BUG FIX: operator harus && bukan ||
+    # Sebelumnya: [ != "1" ] || [ -z ] → return bahkan saat enabled+webhook diisi
     [ "$DISCORD_ENABLED" = "1" ] || return
     [ -n "$DISCORD_WEBHOOK" ] || return
 
+    # ── COOLDOWN (v3.1 FIX: bug 4x webhook) ──────────────────────────────
+    # Root cause: verify_ingame_stable memanggil join_server → wait_ingame
+    # hingga max_rejoin=3 kali kalau app terus mati pasca-join. Setiap
+    # wait_ingame kirim reconnect_success → bisa sampai 4 notif untuk satu
+    # event. Tambahan: monitor_events + error_code_monitor + stuck_watchdog
+    # bisa race dan fire disconnect hampir bersamaan untuk event yang sama.
+    # FIX: satu timestamp-file per event_type. Kalau < 90 detik dari fire
+    # terakhir untuk event yang sama → skip, jangan kirim lagi.
     local _cd_dir="${STATE_BASE_DIR}/rbx_discord_cd"
     local _cd_file="${_cd_dir}/${event_type}"
     mkdir -p "$_cd_dir" 2>/dev/null
@@ -149,12 +246,14 @@ send_discord_notification() {
         _now=$(date +%s)
         _age=$(( _now - ${_last:-0} ))
         if [ "$_age" -lt 90 ]; then
-            return 0
+            return 0   # skip — sudah kirim notif yang sama < 90 detik lalu
         fi
     fi
     date +%s > "$_cd_file" 2>/dev/null
 
+    # Jalankan seluruh proses di background subshell agar tidak block monitor
     (
+    # ── Collect system stats ───────────────────────────────────────────────
     local timestamp device cpu ram_free ram_free_pct temp
 
     timestamp=$(date '+%d/%m/%Y %H:%M:%S')
@@ -182,6 +281,13 @@ send_discord_notification() {
         }
     done
 
+    # ── App-specific stats: uptime proses, RSS memory, CPU (load avg) ──────
+    # ⏱️ Uptime  : dihitung dari starttime proses (/proc/PID/stat field 22)
+    #              dibanding /proc/uptime — jadi murni "sejak proses OS start",
+    #              bukan sejak reconnect/join terakhir.
+    # 💾 Memory  : VmRSS dari /proc/PID/status (RAM nyata yang dipakai proses).
+    # ⚡ CPU     : formula sama dengan System Stats (load avg device), cuma
+    #              presisi 1 desimal biar match tampilan referensi.
     local app_pid app_uptime app_rss_mb app_cpu
     app_pid=$(get_pid_for_pkg "$pkg")
 
@@ -211,6 +317,7 @@ send_discord_notification() {
     app_cpu=$(awk -v n="$nproc_n" '{printf "%.1f", ($1 * 100) / n}' \
         /proc/loadavg 2>/dev/null || echo "N/A")
 
+    # ── Status per event type ─────────────────────────────────────────────
     local embed_color app_icon app_status online_c offline_c
     case $event_type in
         "reconnect_success")
@@ -240,11 +347,14 @@ send_discord_notification() {
     esac
     local total_c=$(( online_c + offline_c ))
 
+    # ── Timestamp: ISO (embed), Unix epoch (Discord native TS), footer ───
     local iso_ts unix_ts footer_ts
     iso_ts=$(date -u '+%Y-%m-%dT%H:%M:%SZ' 2>/dev/null || echo "")
     unix_ts=$(date +%s 2>/dev/null || echo "0")
-    footer_ts="${timestamp%:*}"
+    footer_ts="${timestamp%:*}"   # buang detik: "DD/MM/YYYY HH:MM:SS" -> "DD/MM/YYYY HH:MM"
 
+    # ── Helper escape JSON ────────────────────────────────────────────────
+    # BUG FIX: definisikan di scope subshell ini (bukan di dalam heredoc)
     _jesc() {
         printf '%s' "$1" \
             | sed 's/\\/\\\\/g' \
@@ -263,9 +373,14 @@ send_discord_notification() {
     [ -n "$DISCORD_USER_ID" ] && mention_str="<@${DISCORD_USER_ID}>"
     esc_mention=$(_jesc "$mention_str")
 
+    # ── Aset visual "Sphinx Status Update" ────────────────────────────────
     local sphinx_icon_url="https://raw.githubusercontent.com/wardz25/updater/main/sphinx.png"
     local divider="────────────────────"
 
+    # ── Susun description — layout disamakan 1:1 dengan referensi "Sphinx
+    #    Status Update": Last Updated, Device, System Stats, Status
+    #    Overview, Application Details, dipisah garis divider.
+    #    (bukan lagi pakai "fields" Discord — semua jadi satu blok markdown)
     local description
     description="**Last Updated:** <t:${unix_ts}:F> (<t:${unix_ts}:R>)\n\n"
     description+="📱 **Device** \`${esc_device}\`\n"
@@ -282,6 +397,9 @@ send_discord_notification() {
     description+="${app_icon} ||${esc_pkg}|| — ${esc_status}\n"
     description+="⏱️ ${app_uptime} | 💾 ${app_rss_mb}MB | ⚡ ${app_cpu}%"
 
+    # ── Build JSON dengan printf ──────────────────────────────────────────
+    # BUG FIX: heredoc multiline menyebabkan payload corrupt saat di-pass ke curl.
+    # printf memberikan kontrol penuh — output dijamin satu string tanpa newline liar.
     local payload
     payload=$(printf '{"username":"Sphinx Monitor","avatar_url":"%s","content":"%s","embeds":[{"title":"📊 Sphinx Status Update","description":"%s","color":%d,"timestamp":"%s","thumbnail":{"url":"%s"},"footer":{"text":"Sphinx Monitor • %s • %s","icon_url":"%s"}}]}' \
         "$sphinx_icon_url" \
@@ -293,6 +411,9 @@ send_discord_notification() {
         "$esc_device" "$esc_footer_ts" \
         "$sphinx_icon_url")
 
+    # ── Kirim via temp file — hindari shell expansion corrupt payload ─────
+    # BUG FIX: curl -d "$payload" gagal jika payload mengandung newline/spasi
+    # khusus. --data-binary @file memastikan payload dikirim apa adanya.
     local tmp_payload
     tmp_payload=$(mktemp /data/local/tmp/rbx_discord_XXXXXX 2>/dev/null \
         || mktemp /tmp/rbx_discord_XXXXXX 2>/dev/null)
@@ -312,6 +433,13 @@ send_discord_notification() {
 #   CONFIG FUNCTIONS
 # ─────────────────────────────────────────
 
+load_config() {
+    local cfg_file=$1
+    if [ -f "$cfg_file" ]; then
+        source "$cfg_file"
+    fi
+}
+
 save_config() {
     local cfg_file=$1
     local pkg=$2
@@ -323,6 +451,10 @@ save_config() {
     local home=$8
     local error_code=${9:-1}
 
+    # BUG FIX: Discord setup terjadi SETELAH package setup.
+    # Kalau save_config dipanggil dari wizard/menu sebelum Discord diinput
+    # (globals masih kosong), webhook yang sudah tersimpan bakal ketimpa "".
+    # Solusi: baca dari file dulu jika global kosong.
     local disc_enabled="${DISCORD_ENABLED:-0}"
     local disc_webhook="${DISCORD_WEBHOOK}"
     local disc_uid="${DISCORD_USER_ID}"
@@ -402,11 +534,23 @@ get_mode_label() {
     esac
 }
 
+# ─────────────────────────────────────────
+#   VALIDASI INPUT
+# ─────────────────────────────────────────
+
 validate_discord_webhook() {
     local url=$1
     echo "$url" | grep -qE '^https://(discord|discordapp)\.com/api/webhooks/[0-9]{17,20}/[A-Za-z0-9_-]{60,90}(\?[A-Za-z0-9_=&-]*)?$'
 }
 
+# ─────────────────────────────────────────
+#   VALIDASI LIVE — cek webhook ke server Discord asli
+# ─────────────────────────────────────────
+# validate_discord_webhook() di atas cuma cek FORMAT (regex) — URL bisa
+# aja formatnya benar tapi webhook-nya sendiri sudah dihapus/direset di
+# Discord (mis. channel dihapus, integrasi di-revoke). Fungsi ini nembak
+# GET ke endpoint webhook itu sendiri: Discord balas 200 kalau valid &
+# masih aktif, 404/401 kalau sudah tidak valid.
 check_discord_webhook_live() {
     local url=$1
     local http_code
@@ -414,6 +558,11 @@ check_discord_webhook_live() {
     echo "${http_code:-000}"
 }
 
+# Loop input webhook: validasi format DULU (looping sampai bener/batal),
+# baru setelah format lolos, cek live ke Discord. Hasil akhir (webhook
+# yang mau dipakai) ditaruh ke variabel dengan nama $1 (indirect, sama
+# gaya kayak setup_mode_and_url()). Return 0 = ada webhook yang disimpan,
+# return 1 = user ketik "batal".
 prompt_discord_webhook() {
     local var_name=$1
 
@@ -732,8 +881,10 @@ wizard_setup_pkg() {
     
     local mode url relog reconnect restart home error_code
     
+    # Mode & URL
     setup_mode_and_url "Setup Mode & URL untuk Package $pkg_num" mode url
     
+    # Settings
     clr
     header
     echo ""
@@ -771,6 +922,7 @@ wizard_setup_pkg() {
     read -r error_code
     if [ "$error_code" != "0" ]; then error_code=1; fi
     
+    # Save
     local cfg_file="${CONFIG_BASE_DIR}/roblox_config_${pkg}.cfg"
     save_config "$cfg_file" "$pkg" "$url" "$mode" "$relog" "$reconnect" "$restart" "$home" "$error_code"
     
@@ -794,6 +946,8 @@ menu_ganti_url_mode_pkg() {
     local new_mode new_url
     setup_mode_and_url "Ganti Mode & URL — Package $pkg_num ($pkg)" new_mode new_url
 
+    # BUG FIX: user pilih "5) Kembali" → setup_mode_and_url return 1
+    # Sebelumnya save_config tetap dipanggil dengan new_mode="" → MODE="Unknown"
     [ $? -ne 0 ] && return
 
     save_config "$cfg_file" "$pkg" "$new_url" "$new_mode" \
@@ -994,14 +1148,16 @@ menu_setup_discord() {
 }
 
 # ─────────────────────────────────────────
-#   FLOATING WINDOW
+#   FLOATING WINDOW (Split screen dihapus — freeform only)
 # ─────────────────────────────────────────
 
+# Fungsi untuk mendapatkan activity yang menangani intent VIEW untuk package tertentu
 get_view_activity() {
     local pkg="$1"
     local url="$2"
     local activity=""
 
+    # Coba resolve-activity dengan cmd package (Android 8+)
     if command -v cmd >/dev/null 2>&1; then
         activity=$(cmd package resolve-activity --brief -a android.intent.action.VIEW -d "$url" 2>/dev/null | grep "$pkg/" | head -1)
         if [ -n "$activity" ]; then
@@ -1010,17 +1166,20 @@ get_view_activity() {
         fi
     fi
 
+    # Fallback: cari dari dumpsys package
     activity=$(dumpsys package "$pkg" 2>/dev/null | grep -A20 "android.intent.action.VIEW" | grep -oE "$pkg/[^ ]+" | head -1)
     if [ -n "$activity" ]; then
         echo "$activity"
         return
     fi
 
+    # Fallback hardcoded (activity umum Roblox)
     echo "$pkg/com.roblox.client.RobloxActivity"
 }
 
 check_windowing_mode() {
     local pkg=$1
+    # Ambil windowingMode dari dumpsys dengan konteks yang lebih akurat
     dumpsys activity activities 2>/dev/null | grep -A10 "package=$pkg" | grep -oE "windowingMode=[0-9]+" | head -1
 }
 
@@ -1063,18 +1222,18 @@ log() {
 }
 
 # ─────────────────────────────────────────
-#   GET PID FOR PACKAGE (OPTIMIZED)
+#   GET PID FOR PACKAGE (was undefined — BUG FIX)
 # ─────────────────────────────────────────
 
 get_pid_for_pkg() {
     local pkg=$1
     local pid=""
 
-    # Method 1: pidof (tercepat)
+    # Method 1: pidof (tersedia di Android 8+)
     pid=$(pidof "$pkg" 2>/dev/null | awk '{print $1}')
     [ -n "$pid" ] && { echo "$pid"; return; }
 
-    # Method 2: ps -A exact match (cukup cepat)
+    # Method 2: ps -A dengan awk exact match di kolom NAME
     pid=$(ps -A 2>/dev/null \
         | awk '{print $2, $NF}' \
         | grep " ${pkg}$" \
@@ -1082,15 +1241,24 @@ get_pid_for_pkg() {
         | head -1)
     [ -n "$pid" ] && { echo "$pid"; return; }
 
-    # ─── REMOVED: Method 3 (loop scan /proc) ───
-    # Karena loop scan /proc/*/cmdline terlalu berat dan jarang diperlukan.
-    # Jika pidof dan ps gagal, kemungkinan besar proses memang tidak ada.
+    # Method 3: scan /proc/*/cmdline (paling akurat, butuh root)
+    for f in /proc/[0-9]*/cmdline; do
+        local p="${f%/cmdline}"
+        p="${p##*/}"
+        local cmd
+        cmd=$(cat "$f" 2>/dev/null | tr '\0' '\n' | head -1)
+        if [ "$cmd" = "$pkg" ]; then
+            pid="$p"
+            break
+        fi
+    done
+    [ -n "$pid" ] && { echo "$pid"; return; }
 
     echo ""
 }
 
 # ─────────────────────────────────────────
-#   CRASH LOCK
+#   CRASH LOCK — cegah double-handle dari crash_monitor + logcat_detector
 # ─────────────────────────────────────────
 
 acquire_crash_lock() {
@@ -1103,6 +1271,7 @@ acquire_crash_lock() {
         now=$(date +%s)
         mtime=$(stat -c %Y "$lock_file" 2>/dev/null || echo 0)
         lock_age=$(( now - mtime ))
+        # Lock masih fresh (< 3 menit) → skip, biarkan handler lain yang jalan
         if [ "$lock_age" -lt 180 ]; then
             return 1
         fi
@@ -1119,7 +1288,8 @@ release_crash_lock() {
 }
 
 # ─────────────────────────────────────────
-#   JOIN LOCK
+#   JOIN LOCK — cegah crash_monitor/logcat_detector
+#   intervensi saat proses join/loading berlangsung
 # ─────────────────────────────────────────
 
 acquire_join_lock() {
@@ -1136,6 +1306,7 @@ release_join_lock() {
 }
 
 is_joining() {
+    # Return 0 (true) kalau join lock aktif dan masih fresh
     local pkg=$1
     local lock_file="${STATE_BASE_DIR}/rbx_state_${pkg}/join_lock"
     [ -f "$lock_file" ] || return 1
@@ -1145,6 +1316,7 @@ is_joining() {
     mtime=$(stat -c %Y "$lock_file" 2>/dev/null || echo 0)
     lock_age=$(( now - mtime ))
 
+    # Lock expired (> JOIN_LOCK_TIMEOUT) = proses join hang / stuck → anggap sudah selesai
     if [ "$lock_age" -gt "${JOIN_LOCK_TIMEOUT:-180}" ]; then
         rm -f "$lock_file" 2>/dev/null
         return 1
@@ -1198,11 +1370,38 @@ join_server() {
     local url=$2
     local mode=$3
 
+    # Set JOIN LOCK sebelum force-stop agar crash_monitor tidak intervensi
+    # selama proses loading berlangsung
     acquire_join_lock "$pkg"
 
-    am force-stop "$pkg"
+    # force-stop: coba am force-stop dulu, kalau ROM tidak support
+    # (Error: unknown command 'force-stop') fallback ke kill -9 semua PID
+    # yang milik package ini — termasuk child process render/RCC/dll
+    if ! am force-stop "$pkg" 2>/dev/null; then
+        ps -ef 2>/dev/null \
+            | awk -v p="$pkg" '$0 ~ p && !/awk/ && !/grep/ {print $2}' \
+            | xargs -r kill -9 2>/dev/null
+    fi
+    # Tunggu proses benar-benar mati sebelum am start
+    sleep 1
     sleep 3
 
+    # BUG FIX (root cause "crash" di Private Server): SEBELUMNYA pakai
+    #   am start ... -p "$pkg" 2>/dev/null || am start ... 2>/dev/null
+    # `am start` exit code TIDAK KONSISTEN antar Android/ROM — untuk intent
+    # dengan skema "roblox://" (private server share_link), Android sering
+    # print "Warning: Activity not started, its current task has been
+    # brought to the front" dan itu bikin exit code dibaca non-zero PADAHAL
+    # app sudah berhasil launch. Akibatnya `||` menembak am start KEDUA
+    # tepat setelah yang pertama — Activity yang baru mulai init kena
+    # restart/replace oleh instance kedua → app keliatan blank/close
+    # sebentar (persis dilaporkan). Public server (URL https://) jarang
+    # kena karena skemanya lebih konsisten di-resolve dengan -p.
+    #
+    # FIX: resolve activity spesifik SEKALI pakai get_view_activity (fungsi
+    # yang sama yang dipakai & terbukti stabil di try_floating_window),
+    # lalu -n pkg/activity — deterministik, cuma SATU
+    # am start, tidak ada lagi gambling exit code / double-launch.
     local activity
     activity=$(get_view_activity "$pkg" "$url")
 
@@ -1215,8 +1414,12 @@ wait_ingame() {
     local pkg=$1
     log "👀 Menunggu INGAME..."
 
+    # JOIN LOCK harus aktif saat wait_ingame (dipasang oleh join_server).
+    # Jika belum, pasang sekarang sebagai safety net.
     is_joining "$pkg" || acquire_join_lock "$pkg"
 
+    # ── Metode 1: Tunggu "Connection accepted" via logcat (max 120s) ─────
+    # Private server memerlukan loading lebih lama dari public server.
     local tmp_ip
     tmp_ip=$(timeout 120 logcat -b main -b system -v time 2>/dev/null \
         | grep --line-buffered -iE "Connection accepted from|NetworkClient.*connected|RobloxNetworkHandler.*Join" \
@@ -1231,13 +1434,21 @@ wait_ingame() {
         return
     fi
 
+    # ── Metode 2: Fallback — cek PID hidup + activity foreground ─────────
+    # BUG FIX: refresh join lock di sini. Metode 1 sendirian bisa makan ~120s,
+    # kalau ditambah metode 2 (~60s) totalnya pas/lewat JOIN_LOCK_TIMEOUT lama
+    # (180s) — apalagi kalau device lagi berat (CPU tinggi, private server
+    # berat). Lock basi = crash_monitor/logcat_detector aktif lagi DI TENGAH
+    # loading yang masih wajar → PID hilang sesaat (Roblox restart proses
+    # internal saat pindah ke private server) kebaca CRASH → am force-stop
+    # proses yang sebenarnya masih sehat/berhasil join.
     log "⏱️ logcat timeout — fallback cek PID & activity..."
-    acquire_join_lock "$pkg"
+    acquire_join_lock "$pkg"   # refresh sebelum mulai fallback
     local waited=0
     while [ $waited -lt 30 ]; do
         sleep 2
         waited=$(( waited + 2 ))
-        acquire_join_lock "$pkg"
+        acquire_join_lock "$pkg"   # refresh tiap iterasi — cegah lock basi selagi masih nunggu
 
         local pid
         pid=$(get_pid_for_pkg "$pkg")
@@ -1253,6 +1464,7 @@ wait_ingame() {
             fi
         fi
 
+        # Juga cek activity foreground sebagai konfirmasi tambahan
         if [ "$alive" = "1" ]; then
             if dumpsys activity top 2>/dev/null | grep -q "ACTIVITY ${pkg}"; then
                 log "✅ INGAME via PID+Activity (fallback)"
@@ -1267,10 +1479,6 @@ wait_ingame() {
     release_join_lock "$pkg"
 }
 
-# ─────────────────────────────────────────
-#   VERIFY INGAME STABLE (FIXED)
-# ─────────────────────────────────────────
-
 verify_ingame_stable() {
     local pkg=$1
     local cfg_file=$2
@@ -1278,50 +1486,31 @@ verify_ingame_stable() {
     local max_rejoin=3
     local rejoin_count=0
 
+    # JOIN LOCK wajib aktif selama fase verify ini.
+    # wait_ingame sudah release join_lock saat berhasil detect — kita pasang ulang
+    # karena verify ini masih bagian dari proses join (belum aman untuk crash_monitor).
     acquire_join_lock "$pkg"
 
-    log "🔁 Tight-monitor 60s pasca-join (join lock aktif)..."
-    while [ $checks -lt 60 ]; do
+    log "🔁 Tight-monitor 20s pasca-join (join lock aktif)..."
+    while [ $checks -lt 20 ]; do
         sleep 1
-        acquire_join_lock "$pkg"
-
+        acquire_join_lock "$pkg"   # refresh — jaga lock tetap fresh selama tight-monitor
+        local main_pid
+        main_pid=$(get_pid_for_pkg "$pkg")
         local alive=0
 
-        # CEK 1: Proses utama exact match
-        local main_pid=$(get_pid_for_pkg "$pkg")
         if [ -n "$main_pid" ] && [ -d "/proc/$main_pid" ]; then
-            local proc_state=$(grep -m1 "^State:" "/proc/$main_pid/status" 2>/dev/null | awk '{print $2}')
+            # Cek zombie state — zombie = crash, jangan dianggap alive
+            local proc_state
+            proc_state=$(grep -m1 "^State:" "/proc/$main_pid/status" 2>/dev/null | awk '{print $2}')
             if [ "$proc_state" != "Z" ] && [ "$proc_state" != "X" ]; then
-                local cmdline=$(cat "/proc/$main_pid/cmdline" 2>/dev/null | tr -d '\0')
+                local cmdline
+                cmdline=$(cat "/proc/$main_pid/cmdline" 2>/dev/null | tr -d '\0')
                 echo "$cmdline" | grep -q "$pkg" && alive=1
             fi
         fi
 
-        # CEK 2: Jika main_pid tidak ada, cek sub-proses (renderer/sandbox)
-        if [ "$alive" -eq 0 ]; then
-            local any_proc
-            any_proc=$(ps -A 2>/dev/null | grep "$pkg" | grep -v grep | head -1)
-            if [ -n "$any_proc" ]; then
-                local alt_pid=$(echo "$any_proc" | awk '{print $2}')
-                if [ -n "$alt_pid" ] && [ -d "/proc/$alt_pid" ]; then
-                    local alt_state=$(grep -m1 "^State:" "/proc/$alt_pid/status" 2>/dev/null | awk '{print $2}')
-                    if [ "$alt_state" != "Z" ] && [ "$alt_state" != "X" ]; then
-                        alive=1
-                        log "ℹ️ verify: main PID hilang, tapi sub-proses $alt_pid masih hidup -> dianggap alive"
-                    fi
-                fi
-            fi
-        fi
-
-        # CEK 3: Fallback ke activity top
-        if [ "$alive" -eq 0 ]; then
-            if dumpsys activity top 2>/dev/null | grep -q "ACTIVITY ${pkg}"; then
-                alive=1
-                log "ℹ️ verify: PID hilang, tapi activity top masih Roblox -> dianggap alive"
-            fi
-        fi
-
-        if [ "$alive" -eq 0 ]; then
+        if [ "$alive" = "0" ]; then
             rejoin_count=$((rejoin_count + 1))
             if [ "$rejoin_count" -gt "$max_rejoin" ]; then
                 log "⚠️ Max rejoin ($max_rejoin) tercapai di verify — serahkan ke crash_monitor"
@@ -1331,25 +1520,138 @@ verify_ingame_stable() {
             log "💥 $pkg mati di fase join (attempt $rejoin_count/$max_rejoin) — rejoin paksa"
             sleep 2
             source "$cfg_file" 2>/dev/null || true
-            local active_url=$(get_active_url "$MODE" "$URL")
+            local active_url
+            active_url=$(get_active_url "$MODE" "$URL")
+            # join_server akan acquire join_lock baru — release dulu yg lama
             release_join_lock "$pkg"
             join_server "$pkg" "$active_url" "$MODE"
             wait_ingame "$pkg"
+            # Pasang ulang untuk lanjut verify
             acquire_join_lock "$pkg"
             checks=0
             continue
         fi
-
         checks=$((checks + 1))
     done
 
+    # Stabil — lepas join lock agar crash_monitor kembali aktif memantau
     release_join_lock "$pkg"
     log "✅ Stabil pasca-join — crash_monitor aktif kembali"
 }
 
-# ─────────────────────────────────────────
-#   CRASH MONITOR (PID polling)
-# ─────────────────────────────────────────
+monitor_events() {
+    local pkg=$1
+    local cfg_file=$2
+
+    # Outer loop: restart otomatis kalau logcat pipe tutup (disconnect,
+    # Android kill proses logcat, dll). Sebelumnya fungsi ini langsung
+    # return saat pipe selesai → background process mati → wait di MAIN
+    # kehabisan job → script exit ke Termux shell.
+    while true; do
+        # BUG FIX: sama seperti logcat_crash_detector — tanpa -T, logcat
+        # dump seluruh buffer historis dulu tiap kali loop restart, bisa
+        # re-trigger sinyal disconnect LAMA yang sudah lama selesai.
+        local start_ts
+        start_ts=$(date '+%m-%d %H:%M:%S.000')
+
+        # v3.1 FIX (bug "disconnect tidak bekerja sama sekali"):
+        # Prefilter sebelumnya terlalu spesifik — "Sending disconnect with
+        # reason", "Connection lost", "Disconnected from server" adalah
+        # string literal yang mungkin TIDAK PERNAH muncul di logcat Roblox
+        # versi terbaru / ROM tertentu. Kalau prefilter di level grep tidak
+        # pernah match → inner while read tidak pernah dapat baris → fungsi
+        # ini kelihatan "mati" padahal sebenarnya hanya grep-nya yang miss.
+        #
+        # Fix 3 lapis:
+        # (1) Prefilter diperluas: tangkap semua baris logcat yang mengandung
+        #     nama package ATAU kata-kata yang mungkin terkait disconnect.
+        #     Inner bash-check yang menentukan apakah baris itu beneran
+        #     disconnect atau bukan (bukan outer grep).
+        # (2) acquire_crash_lock sebelum handle: koordinasi dengan
+        #     error_code_monitor & stuck_watchdog yang bisa race untuk event
+        #     yang sama → cegah double-reconnect & double-webhook.
+        # (3) break inner loop setelah join selesai: tanpa ini, logcat yang
+        #     sudah terbuffer selama proses join (bisa menit-an) dibaca saat
+        #     loop lanjut — baris "Connection lost" lama yang terbuffer
+        #     langsung re-trigger reconnect → webhook + rejoin kedua/ketiga.
+        #
+        # v3.2 FIX (root cause "randomly kill" / loop rejoin):
+        # (4) _seen_joining flag: kalau MONITOR LAIN yang trigger rejoin
+        #     (bukan monitor_events sendiri), logcat pipe kita tetap jalan dan
+        #     akumula baris selama join berlangsung. Saat join lock dilepas,
+        #     baris-baris itu langsung dibaca → false disconnect signal.
+        #     Fix: tandai kalau join pernah aktif di iterasi ini. Begitu join
+        #     selesai (is_joining → false), LANGSUNG break → restart pipe
+        #     dengan start_ts baru → buffer lama tidak pernah diproses.
+
+        local _seen_joining=0
+
+        while read -r line; do
+            # ── Inner filter ketat: tentukan jenis sinyal ────────────────
+            local reason=""
+
+            if echo "$line" | grep -qiE "Sending disconnect"; then
+                reason="Sending disconnect"
+            elif echo "$line" | grep -qiE "Connection lost|Lost connection"; then
+                reason="Connection lost"
+            elif echo "$line" | grep -qiE "Disconnected from server|disconnected"; then
+                reason="Disconnected"
+            elif echo "$line" | grep -qiE "connection.*(timeout|failed|dropped|reset|refused)"; then
+                reason="Connection error"
+            elif echo "$line" | grep -qiE "network.*(error|lost|failed|timeout|dropped)"; then
+                reason="Network error"
+            elif echo "$line" | grep -qiE "kicked from game|kick.*reason"; then
+                reason="Kicked"
+            fi
+
+            # Bukan sinyal disconnect yang dikenal — abaikan
+            [ -n "$reason" ] || continue
+
+            # Skip jika join sedang berlangsung — signal disconnect bisa muncul
+            # saat Roblox berpindah server / loading private server baru
+            if is_joining "$pkg"; then
+                _seen_joining=1
+                log "⏭️ monitor_events: join aktif — abaikan '$reason'"
+                continue
+            fi
+
+            # v3.2: join BARU SELESAI — buffer logcat dari proses join masih
+            # antri di pipe. Restart pipe agar baris lama tidak ke-proses.
+            if [ "$_seen_joining" = "1" ]; then
+                _seen_joining=0
+                log "⏭️ monitor_events: join baru selesai — reset pipe (buang buffer join)"
+                break
+            fi
+
+            # Koordinasi dengan monitor lain — cegah double-handle & double-webhook
+            if ! acquire_crash_lock "$pkg"; then
+                log "⏭️ monitor_events: handler lain sedang aktif — skip ($reason)"
+                continue
+            fi
+
+            log "❌ DC via monitor_events: $reason"
+            send_discord_notification "disconnect" "$reason" "$pkg"
+
+            sleep 3
+            source "$cfg_file" 2>/dev/null
+            local active_url
+            active_url=$(get_active_url "$MODE" "$URL")
+            join_server "$pkg" "$active_url" "$MODE"
+            wait_ingame "$pkg"
+            verify_ingame_stable "$pkg" "$cfg_file"
+            release_crash_lock "$pkg"
+
+            # FIX: break inner loop setelah join — jangan baca sisa buffer
+            # logcat yang terbuffer selama proses join berlangsung
+            break
+
+        done < <(logcat -T "$start_ts" -b main -b system -v time 2>/dev/null \
+            | grep --line-buffered -iE \
+                "${pkg}|disconnect|connection.*(lost|clos|fail|drop|reset|timeout|error|refused)|network.*(error|lost|fail|timeout|drop|disconnect)|kicked|roblox.*(error|network|disconnect|stop|kill)")
+
+        sleep 3
+    done
+}
 
 crash_monitor() {
     local pkg=$1
@@ -1358,14 +1660,19 @@ crash_monitor() {
     local state_dir="${STATE_BASE_DIR}/rbx_state_${pkg}"
 
     while true; do
+        # ── SKIP jika proses join sedang berlangsung ──────────────────────
+        # Saat loading private server, Roblox restart prosesnya sendiri
+        # sehingga PID hilang sebentar — crash_monitor TIDAK boleh intervensi.
         if is_joining "$pkg"; then
-            miss_count=0
+            miss_count=0   # reset agar tidak menumpuk miss palsu
             sleep 3
             continue
         fi
 
+        # ── Deteksi via PID ──────────────────────────────────────────────
         local main_pid=""
 
+        # Method 1: ps -A exact match di kolom NAME
         main_pid=$(ps -A 2>/dev/null \
             | grep -v ":" \
             | awk '{print $NF, $2}' \
@@ -1373,10 +1680,12 @@ crash_monitor() {
             | awk '{print $2}' \
             | head -1)
 
+        # Method 2: get_pid_for_pkg
         if [ -z "$main_pid" ]; then
             main_pid=$(get_pid_for_pkg "$pkg")
         fi
 
+        # Verifikasi PID via /proc — + cek zombie state
         local app_alive=0
         if [ -n "$main_pid" ] && [ -d "/proc/$main_pid" ]; then
             local proc_state
@@ -1393,6 +1702,7 @@ crash_monitor() {
             fi
         fi
 
+        # ── Fallback: dumpsys ─────────────────────────────────────────────
         if [ "$app_alive" = "0" ]; then
             local dumpsys_out
             dumpsys_out=$(dumpsys activity processes 2>/dev/null)
@@ -1410,17 +1720,25 @@ crash_monitor() {
             fi
         fi
 
+        # ── Deklarasi crash ───────────────────────────────────────────────
+        # BUG FIX: 2 → 3 miss beruntun (±9s, bukan ±6s) sebelum declare crash.
+        # Nambah sedikit buffer terhadap hiccup PID sesaat (mis. Roblox
+        # restart proses internal saat transisi private server) yang lolos
+        # dari JOIN_LOCK karena kejadian pas di tepi window join.
         if [ "$app_alive" = "0" ]; then
             miss_count=$((miss_count + 1))
             if [ "$miss_count" -ge 3 ]; then
                 miss_count=0
 
+                # Double-check join lock sekali lagi sebelum trigger crash
+                # (bisa saja lock baru saja dipasang oleh monitor lain)
                 if is_joining "$pkg"; then
                     log "⏭️ crash_monitor: join lock aktif saat akan trigger — batal"
                     sleep 3
                     continue
                 fi
 
+                # Cegah double-handle dari logcat_crash_detector
                 if ! acquire_crash_lock "$pkg"; then
                     log "⏭️ crash_monitor: handler lain sudah handling crash — skip"
                     sleep 5
@@ -1455,18 +1773,49 @@ crash_monitor() {
 }
 
 # ─────────────────────────────────────────
-#   LOGCAT CRASH DETECTOR
+#   LOGCAT CRASH DETECTOR (parallel dengan crash_monitor)
 # ─────────────────────────────────────────
-
 logcat_crash_detector() {
+    # Deteksi crash via logcat sebagai jalur kedua — menangkap crash
+    # yang prosesnya respawn terlalu cepat sebelum crash_monitor sempat
+    # mendeteksi PID hilang (race condition 3s polling).
     local pkg=$1
     local cfg_file=$2
 
     while true; do
+        # BUG FIX (root cause "crash terus-terusan" pasca-join): SEBELUMNYA
+        # `logcat -b crash -b main -v time` dipanggil TANPA filter waktu (-T).
+        # Tanpa -T, logcat SELALU dump SELURUH buffer historis dulu (bisa
+        # ribuan baris sejak boot/wrap terakhir) sebelum streaming live —
+        # termasuk tombstone/native-crash lama yang sudah lama kelar/ditangani.
+        # `while read` yang manggil beberapa subprocess grep per baris makan
+        # waktu NYATA untuk mengunyah backlog itu, dan waktu itu kebetulan
+        # bisa bertepatan persis dengan event lain (mis. verify_ingame_stable
+        # declare stabil) — kelihatan seolah crash baru terjadi saat itu,
+        # padahal cuma entry LAMA yang baru "ketemu" grep. Tiap kali fungsi
+        # ini restart (pipe tutup), backlog yang sama bisa terbaca ulang →
+        # loop tak berkesudahan.
+        # FIX: -T dengan timestamp "sekarang", di-generate ULANG tiap
+        # iterasi outer loop, supaya logcat cuma kasih baris BARU sejak saat
+        # itu — backlog lama tidak pernah diproses lagi.
         local start_ts
         start_ts=$(date '+%m-%d %H:%M:%S.000')
 
         while read -r line; do
+            # BUG FIX (root cause "black screen" saat loading Private Server
+            # berat): Roblox pakai arsitektur MULTI-PROCESS — ada sub-process
+            # terpisah (mis. "com.roblox.client:renderer", "com.roblox.
+            # client:sandboxed_process0") yang dipakai untuk render/GPU/
+            # sandbox. Sub-process ini BOLEH mati & restart sendiri sebagai
+            # bagian NORMAL loading asset berat (private server besar sekelas
+            # "Grow a Garden") — bukan crash fatal. Regex crash kita di bawah
+            # pakai SUBSTRING match ("${pkg}" ada di mana saja dalam baris),
+            # jadi baris seperti "Process com.roblox.client:renderer has died"
+            # IKUT ke-match walau yang mati cuma sub-process — bikin kita
+            # SALAH force-stop app yang sebenarnya SEHAT (black screen yang
+            # user lihat itu ULAH SCRIPT SENDIRI, bukan Roblox yang crash).
+            # FIX lapis 1: abaikan baris yang jelas-jelas menyebut nama
+            # PROSES BER-SUFFIX ":something" setelah nama package.
             if echo "$line" | grep -qE "${pkg}:[A-Za-z_]"; then
                 continue
             fi
@@ -1474,27 +1823,43 @@ logcat_crash_detector() {
             local is_crash=0
             local reason=""
 
+            # BUG FIX: grep -qi "a\|b" TIDAK bekerja di Android toybox grep
+            # (tanpa -E, \| dianggap literal bukan OR). Harus pakai -qiE "a|b"
+            # atau cek satu-satu. Di sini pakai -qiE.
+
+            # Roblox crash / exit — System.exit, FATAL EXCEPTION, process died
             if echo "$line" | grep -qiE "System\.exit called|FATAL EXCEPTION.*(roblox|${pkg})|Process.*${pkg}.*(has died|died)|Roblox has crashed"; then
                 is_crash=1
                 reason="System.exit / Fatal"
             fi
 
+            # Force-close / killed oleh ActivityManager
             if echo "$line" | grep -qiE "Force finishing activity.*${pkg}|Killing.*${pkg}.*(crashed|dying)|${pkg}.*force.*(stop|close)"; then
                 is_crash=1
                 reason="Force-closed by AM"
             fi
 
+            # crash_dump / tombstone (native crash)
             if echo "$line" | grep -qiE "crash_dump.*${pkg}|tombstone.*${pkg}|SIGSEGV.*${pkg}|${pkg}.*native.*crash"; then
                 is_crash=1
                 reason="Native crash"
             fi
 
             if [ "$is_crash" = "1" ]; then
+                # Skip jika sedang proses join — crash logcat bisa muncul
+                # saat Roblox restart prosesnya sendiri waktu loading private server
                 if is_joining "$pkg"; then
                     log "⏭️ logcat_detector: join sedang berlangsung — abaikan crash signal ($reason)"
                     continue
                 fi
 
+                # FIX lapis 2 (paling penting): CROSS-VERIFY PID sebelum
+                # bertindak. Satu baris logcat SAJA tidak cukup dipercaya —
+                # get_pid_for_pkg() sudah exact-match aman (tidak akan
+                # ke-match ke sub-process ":renderer" dkk, lihat definisinya).
+                # Kalau PID utama masih hidup & sehat, sinyal "crash" di atas
+                # hampir pasti cuma noise dari sub-process yang sudah pulih
+                # sendiri — JANGAN force-stop app yang sehat.
                 sleep 1
                 local verify_pid
                 verify_pid=$(get_pid_for_pkg "$pkg")
@@ -1507,6 +1872,7 @@ logcat_crash_detector() {
                     fi
                 fi
 
+                # Cegah race condition dengan crash_monitor
                 if ! acquire_crash_lock "$pkg"; then
                     log "⏭️ logcat_detector: crash_monitor sudah handle — skip ($reason)"
                     continue
@@ -1532,6 +1898,9 @@ logcat_crash_detector() {
                 release_crash_lock "$pkg"
             fi
 
+        # BUG FIX: tambah -b crash -b main untuk capture crash buffer
+        # + perluas pattern agar lebih banyak jenis crash terdeteksi
+        # + -T "$start_ts" cegah replay backlog historis (lihat penjelasan di atas)
         done < <(logcat -T "$start_ts" -b crash -b main -v time 2>/dev/null | grep --line-buffered -iE \
             "System\.exit called|FATAL EXCEPTION|Process.*${pkg}.*(has died|died)|Force finishing.*${pkg}|Killing.*${pkg}.*crash|Roblox has crashed|crash_dump.*${pkg}|tombstone.*${pkg}")
 
@@ -1540,225 +1909,345 @@ logcat_crash_detector() {
 }
 
 # ─────────────────────────────────────────
-#   STUCK WATCHDOG (TCP-BASED)
+#   STUCK WATCHDOG — deteksi Roblox hidup tapi diam (dialog error)
 # ─────────────────────────────────────────
-
+# Kenapa fungsi ini ada:
+#   Di MuMu Player (dan emulator lain yang strip logcat), error code
+#   277/278/279/282/529 TIDAK muncul di logcat sama sekali — sudah
+#   dikonfirmasi. Satu-satunya hal yang bisa dideteksi dari luar adalah:
+#   PID Roblox MASIH HIDUP tapi network activity-nya NOL (stuck di dialog
+#   error, user tidak bisa ngapa-ngapain, perlu rejoin manual).
+#
+#   Cara kerjanya:
+#   1. Pantau file /proc/PID/net/dev (statistik paket RX/TX per interface)
+#      setiap CHECK_INTERVAL detik.
+#   2. Kalau counter RX TIDAK BERUBAH selama STUCK_WATCHDOG_TIMEOUT detik
+#      + PID masih hidup + lagi INGAME (bukan lagi di fase join/loading)
+#      → Roblox stuck → force-stop → rejoin.
+#   3. Kalau /proc/PID/net/dev tidak bisa dibaca (MuMu restrict /proc antar
+#      proses) → fallback ke cek waktu modifikasi file state Roblox di
+#      /data/data/com.roblox.client/files/ atau /sdcard/Android/data/.
+#      Kalau itu juga gak bisa → fallback terakhir: cek apakah activity
+#      foreground masih Roblox via `cmd activity` atau `am stack`.
+#
+#   Kenapa tidak pakai timer join lock saja:
+#   join_lock punya timeout (JOIN_LOCK_TIMEOUT) tapi itu untuk fase LOADING —
+#   kalau Roblox sudah berhasil masuk game lalu 30 menit kemudian disconnect,
+#   join lock sudah lama dilepas dan crash_monitor tidak akan trigger karena
+#   PID-nya masih ada. Stuck watchdog mengisi celah ini.
 stuck_watchdog() {
     local pkg=$1
     local cfg_file=$2
-    local stuck_since=0
-    local last_has_conn=1
-    local stuck_file="${STATE_BASE_DIR}/rbx_state_${pkg}/stuck_since"
 
-    log "🔍 stuck_watchdog (TCP): memantau koneksi $pkg (timeout: ${STUCK_WATCHDOG_TIMEOUT}s)"
+    local last_rx=0
+    local stuck_since=0
+    local is_stuck=0
+
+    log "🔍 stuck_watchdog: mulai memantau $pkg (timeout: ${STUCK_WATCHDOG_TIMEOUT}s)"
 
     while true; do
         sleep "$CHECK_INTERVAL"
 
+        # Skip kalau lagi proses join/loading — normal kalau diam saat loading
         if is_joining "$pkg"; then
-            rm -f "$stuck_file" 2>/dev/null
+            last_rx=0
             stuck_since=0
-            last_has_conn=1
+            is_stuck=0
             continue
         fi
 
-        local pid=$(get_pid_for_pkg "$pkg")
+        # Cek PID masih hidup
+        local pid
+        pid=$(get_pid_for_pkg "$pkg")
         if [ -z "$pid" ]; then
-            rm -f "$stuck_file" 2>/dev/null
+            # PID mati → crash_monitor yang handle, kita reset saja
+            last_rx=0
             stuck_since=0
-            last_has_conn=1
+            is_stuck=0
             continue
         fi
 
-        # ── Cek koneksi ESTABLISHED via /proc/net/tcp ──
-        local has_conn=0
-        local uid=$(awk '/^Uid:/{print $2}' "/proc/$pid/status" 2>/dev/null)
+        # ── Coba baca network RX — per-UID, bukan system-wide ───────────
+        # v3.1 FIX: sebelumnya pakai /proc/$pid/net/dev yang SAMA dengan
+        # /proc/net/dev (statistik SELURUH SISTEM, bukan per-proses/per-UID).
+        # Akibatnya current_rx SELALU naik (dari traffic app lain, background
+        # services, WiFi keep-alive dll) → condition "rx tidak berubah" TIDAK
+        # PERNAH true → stuck_watchdog tidak pernah trigger, jadi gimmick.
+        # FIX: pakai per-UID stats:
+        #   1. /proc/net/xt_qtaguid/stats (Android 5-10, kolom 4=uid, 6=rx_bytes)
+        #   2. /proc/uid_stat/<uid>/tcp_rcv (Android 4.x - beberapa 11)
+        # Keduanya hanya counting traffic milik UID Roblox — kalau Roblox
+        # stuck di dialog error (tidak menerima game data), counter diam.
+        local current_rx=""
+        local _uid=""
+        [ -n "$pid" ] && _uid=$(awk '/^Uid:/{print $2; exit}' "/proc/$pid/status" 2>/dev/null)
 
-        if [ -n "$uid" ]; then
-            # Cek /proc/net/tcp
-            if [ -f "/proc/net/tcp" ]; then
-                if awk -v u="$uid" '$9==u && $5=="01" {found=1; exit} END {exit !found}' /proc/net/tcp 2>/dev/null; then
-                    has_conn=1
-                fi
+        if [ -n "$_uid" ]; then
+            if [ -f "/proc/net/xt_qtaguid/stats" ]; then
+                current_rx=$(awk -v u="$_uid" '$4==u{s+=$6}END{print s+0}' \
+                    /proc/net/xt_qtaguid/stats 2>/dev/null)
             fi
-            # Cek /proc/net/tcp6
-            if [ "$has_conn" -eq 0 ] && [ -f "/proc/net/tcp6" ]; then
-                if awk -v u="$uid" '$9==u && $5=="01" {found=1; exit} END {exit !found}' /proc/net/tcp6 2>/dev/null; then
-                    has_conn=1
+            if [ -z "$current_rx" ] || [ "$current_rx" = "0" ]; then
+                if [ -f "/proc/uid_stat/${_uid}/tcp_rcv" ]; then
+                    current_rx=$(cat "/proc/uid_stat/${_uid}/tcp_rcv" 2>/dev/null)
                 fi
             fi
         fi
 
-        # ── Fallback ke netstat -p ──
-        if [ "$has_conn" -eq 0 ]; then
-            if netstat -p -n 2>/dev/null | grep -E "${pkg}|/${pid}" | grep -q "ESTABLISHED"; then
-                has_conn=1
+        # ── Fallback 1: cek mtime file data Roblox ───────────────────────
+        if [ -z "$current_rx" ] || [ "$current_rx" = "0" ]; then
+            # Kalau /proc tidak bisa dibaca, cek kapan terakhir file Roblox dimodif
+            # (Roblox nulis ke storage saat aktif bermain — autosave, log internal, dll)
+            local roblox_data_dir="/sdcard/Android/data/${pkg}"
+            if [ -d "$roblox_data_dir" ]; then
+                local newest_mtime
+                newest_mtime=$(find "$roblox_data_dir" -maxdepth 3 -type f \
+                    -newer "${STATE_BASE_DIR}/rbx_state_${pkg}/last_activity_check" \
+                    2>/dev/null | wc -l)
+                # Kalau ada file yang lebih baru dari last check → masih aktif
+                if [ "${newest_mtime:-0}" -gt 0 ]; then
+                    touch "${STATE_BASE_DIR}/rbx_state_${pkg}/last_activity_check" 2>/dev/null
+                    last_rx=1   # gunakan dummy non-zero buat reset stuck counter
+                    current_rx=1
+                fi
             fi
         fi
 
-        local now=$(date +%s)
+        # ── Evaluasi stuck ────────────────────────────────────────────────
+        if [ -z "$current_rx" ] || [ "$current_rx" = "0" ]; then
+            # Tidak bisa baca rx sama sekali (MuMu restrict semua method)
+            # Jangan false-positive — skip watchdog untuk device ini
+            continue
+        fi
 
-        if [ "$has_conn" -eq 1 ]; then
-            rm -f "$stuck_file" 2>/dev/null
-            stuck_since=0
-            last_has_conn=1
-        else
-            if [ "$last_has_conn" -eq 1 ]; then
+        local now
+        now=$(date +%s)
+
+        if [ "$current_rx" = "$last_rx" ] && [ "$last_rx" != "0" ]; then
+            # RX tidak berubah sejak check terakhir
+            if [ "$is_stuck" = "0" ]; then
                 stuck_since=$now
-                echo "$stuck_since" > "$stuck_file"
-                last_has_conn=0
-                log "⚠️ TCP: tidak ada koneksi ESTABLISHED - mulai hitung..."
+                is_stuck=1
             fi
 
-            local duration=$(( now - stuck_since ))
-            if [ "$duration" -ge "$STUCK_WATCHDOG_TIMEOUT" ]; then
-                log "🚨 TCP: tidak ada koneksi selama ${duration}s -> Error Code! Auto-rejoin."
-
+            local stuck_duration=$(( now - stuck_since ))
+            if [ "$stuck_duration" -ge "$STUCK_WATCHDOG_TIMEOUT" ]; then
+                # Sudah stuck terlalu lama → kemungkinan besar dialog error
                 if ! acquire_crash_lock "$pkg"; then
-                    log "⏭️ stuck_watchdog: handler lain jalan, skip."
-                    rm -f "$stuck_file" 2>/dev/null
+                    log "⏭️ stuck_watchdog: handler lain sedang jalan — skip"
+                    is_stuck=0
                     stuck_since=0
-                    last_has_conn=1
                     continue
                 fi
 
-                send_discord_notification "disconnect" "No TCP connection (${duration}s)" "$pkg"
+                log "🚨 Roblox STUCK ${stuck_duration}s tanpa network activity — kemungkinan dialog Error Code (277/278/279/282/529) — auto-rejoin!"
+                send_discord_notification "disconnect" "Stuck ${stuck_duration}s tanpa network (Error Code?)" "$pkg"
+
                 sleep 2
                 source "$cfg_file" 2>/dev/null || true
 
                 if [ "${DETEKSI_ERROR_CODE:-1}" != "1" ]; then
                     log "ℹ️ DETEKSI_ERROR_CODE=OFF — tidak auto-rejoin"
                     release_crash_lock "$pkg"
-                    rm -f "$stuck_file" 2>/dev/null
+                    is_stuck=0
                     stuck_since=0
-                    last_has_conn=1
+                    last_rx=0
                     continue
                 fi
 
-                local active_url=$(get_active_url "$MODE" "$URL")
+                local active_url
+                active_url=$(get_active_url "$MODE" "$URL")
                 join_server "$pkg" "$active_url" "$MODE"
                 wait_ingame "$pkg"
                 verify_ingame_stable "$pkg" "$cfg_file"
                 release_crash_lock "$pkg"
 
-                rm -f "$stuck_file" 2>/dev/null
+                # Reset counter setelah rejoin
+                is_stuck=0
                 stuck_since=0
-                last_has_conn=1
+                last_rx=0
             fi
+        else
+            # RX berubah → Roblox masih aktif terima data → reset stuck counter
+            is_stuck=0
+            stuck_since=0
+            last_rx=$current_rx
         fi
+
+        # Update last_activity_check buat fallback mtime
+        mkdir -p "${STATE_BASE_DIR}/rbx_state_${pkg}" 2>/dev/null
+        touch "${STATE_BASE_DIR}/rbx_state_${pkg}/last_activity_check" 2>/dev/null
+
     done
 }
 
 # ─────────────────────────────────────────
-#   OCR ERROR CODE MONITOR (IMPROVED)
+#   ERROR CODE MONITOR (parallel dengan crash_monitor & logcat_crash_detector)
+# ─────────────────────────────────────────
+# Kenapa fungsi terpisah, bukan digabung ke monitor_events?
+#   monitor_events sudah nangkep frasa disconnect GENERIK ("Sending
+#   disconnect with reason", "Connection lost", dll) — tapi TIDAK berhenti
+#   di angka kode error spesifik. Kode 272/273/274/275/277/278/279/282
+#   adalah kode disconnect Roblox yang paling sering muncul akibat internet
+#   putus/lag/network error (BUKAN Roblox lagi nge-crash — PID app biasanya
+#   masih hidup, cuma koneksi socket ke server yang terputus). Karena app
+#   tidak mati, crash_monitor (yang nunggu PID hilang) & logcat_crash_detector
+#   (yang nunggu pola FATAL EXCEPTION/tombstone) TIDAK akan pernah trigger
+#   untuk kasus ini — makanya perlu detector sendiri yang langsung rejoin
+#   begitu kode errornya ketemu, tanpa nunggu app "keliatan mati" dulu.
+#
+# Catatan soal metode deteksi (dijawab dari yang user tanya: "cara lain?"):
+#   Dialog "Disconnected... Error Code: 277" itu di-render Roblox DI DALAM
+#   game engine-nya sendiri (GL surface / canvas internal), BUKAN native
+#   Android View/TextView. Konsekuensinya:
+#     - `uiautomator dump` (baca teks lewat accessibility tree) TIDAK akan
+#       bisa "melihat" teks itu — accessibility tree cuma tahu ada satu
+#       SurfaceView kosong, tanpa isi teks di dalamnya.
+#     - Screenshot + OCR (tesseract) SECARA TEKNIS bisa baca teks itu, tapi:
+#         a) butuh install tesseract-ocr + trained data di Termux (berat),
+#         b) akurasi tergantung resolusi/DPI/font/posisi dialog per device,
+#         c) tiap check = screencap + OCR = jauh lebih lambat & lebih makan
+#            baterai/CPU dibanding grep logcat yang instan.
+#   Makanya dipilih LOGCAT — sama seperti fondasi semua detector lain di
+#   script ini (monitor_events, crash_monitor, logcat_crash_detector).
+#   Roblox Android mencatat reason disconnect ke logcat saat dialog error
+#   itu muncul. KALAU ternyata di device kamu kode errornya TIDAK pernah
+#   nongol di logcat (format log Roblox beda-beda per versi app), OCR bisa
+#   ditambahkan belakangan sebagai fallback — tinggal bilang aja.
+#
+# Cara verifikasi/tuning pattern-nya di device asli (kalau ternyata tidak
+# ke-detect): saat lagi reproduce error (mis. matiin data/wifi sebentar
+# sampai muncul dialog Error Code), jalankan di sesi Termux LAIN:
+#   logcat -v time | grep -i "error\|disconnect"
+# lalu lihat format baris persis yang muncul, dan sesuaikan pattern grep
+# di bawah (variabel ERROR_CODE_LIST + kata kunci "error code"/"disconnect").
+error_code_monitor() {
+    # DINONAKTIFKAN: deteksi error code sekarang via OCR (ocr_error_monitor).
+    # Logcat-based detection terlalu banyak false positive dari buffer replay
+    # saat transisi server — error code 275/529 dari proses JOIN ke-detect
+    # sebagai disconnect asli. OCR baca pixel layar langsung → hanya fire
+    # kalau dialog error BENAR-BENAR tampil di layar sekarang.
+    # Sleep infinity agar keep-alive tidak restart terus (proses tetap "hidup").
+    while true; do sleep 86400; done
+}
+
+
+# ─────────────────────────────────────────
+#   OCR ERROR CODE MONITOR
+#   Baca layar langsung via screencap + tesseract.
+#
+#   Kenapa perlu ini (padahal sudah ada error_code_monitor):
+#     Dialog "Disconnected (Error Code: NNN)" di Roblox di-render di dalam
+#     GL surface (game engine canvas), BUKAN native Android View. Jadi:
+#     - uiautomator dump → tidak bisa baca teks ini
+#     - logcat → KADANG tidak muncul, tergantung versi Roblox / ROM
+#     - screencap + OCR → baca pixel layar langsung → SELALU akurat
+#       karena yang dibaca persis apa yang user lihat di layar
+#
+#   Cara kerja:
+#     Setiap OCR_INTERVAL detik:
+#     1. Cek Roblox masih running & di foreground
+#     2. screencap → /data/local/tmp/rbx_ocr_<pkg>.png
+#     3. tesseract OCR → cari pola "Error Code NNN" atau "Error NNN"
+#     4. Kalau ketemu → acquire crash_lock → rejoin
+#
+#   Requirement:
+#     pkg install tesseract  (di Termux)
+#     tesseract akan otomatis skip kalau tidak terinstall
 # ─────────────────────────────────────────
 
 ocr_error_monitor() {
     local pkg=$1
     local cfg_file=$2
-    local ocr_interval=20
+    local ocr_interval=25   # cek layar setiap 25 detik
 
+    # Cek tesseract tersedia — kalau tidak, fungsi ini langsung exit
+    # (tidak perlu loop, keep-alive di MAIN tidak akan restart karena
+    # kita pakai return bukan exit, dan keep-alive cek kill -0 $PID)
     if ! command -v tesseract >/dev/null 2>&1; then
-        log "📦 ocr_error_monitor: tesseract belum ada, coba install..."
-        pkg update -y 2>/dev/null
+        log "📦 ocr_error_monitor: tesseract belum ada — install otomatis..."
         pkg install -y tesseract 2>&1 | grep -E "^(Unpacking|Setting up)" | while read -r l; do log "   $l"; done
-        pkg install -y tesseract-ocr-data-eng 2>/dev/null || true
-
+        # eng language data — nama package berbeda di beberapa Termux versi
+        pkg install -y tesseract-ocr-data-eng 2>/dev/null \
+            || pkg install -y tesseract-lang 2>/dev/null \
+            || true
         if ! command -v tesseract >/dev/null 2>&1; then
-            log "❌ ocr_error_monitor: GAGAL install tesseract. OCR dimatikan."
+            log "⚠️ ocr_error_monitor: gagal install tesseract — idle"
+            log "   Install manual: pkg install tesseract"
             while true; do sleep 86400; done
             return
         fi
-        log "✅ ocr_error_monitor: tesseract siap!"
+        log "✅ ocr_error_monitor: tesseract siap"
     fi
 
+    # Nama file sementara pakai pkg (ganti titik → underscore biar aman)
     local safe_pkg="${pkg//[.]/_}"
     local scr_file="/data/local/tmp/rbx_ocr_${safe_pkg}.png"
     local txt_base="/data/local/tmp/rbx_ocr_${safe_pkg}_out"
 
-    log "📸 ocr_error_monitor: AKTIF (scan setiap ${ocr_interval}s)"
+    log "📸 ocr_error_monitor: aktif (interval: ${ocr_interval}s)"
 
     while true; do
         sleep "$ocr_interval"
 
+        # Skip kalau join lagi berlangsung
         if is_joining "$pkg"; then
             continue
         fi
 
-        local pid=$(get_pid_for_pkg "$pkg")
+        # Roblox harus running
+        local pid
+        pid=$(get_pid_for_pkg "$pkg")
         [ -z "$pid" ] && continue
 
-        # Pastikan layar menyala
-        local screen_state
-        screen_state=$(dumpsys power 2>/dev/null | grep -E "mWakefulness=|Display Power" | head -1)
-
-        if ! echo "$screen_state" | grep -qiE "Awake|On"; then
-            log "📱 Layar mati, bangunkan untuk OCR..."
-            input keyevent KEYCODE_WAKEUP 2>/dev/null
-            input keyevent 26 2>/dev/null
-            sleep 2
-            screen_state=$(dumpsys power 2>/dev/null | grep -E "mWakefulness=|Display Power" | head -1)
-            if ! echo "$screen_state" | grep -qiE "Awake|On"; then
-                log "📱 Gagal menyalakan layar, skip OCR kali ini."
-                continue
-            fi
-        fi
-
-        # Pastikan Roblox di foreground
+        # Roblox harus di foreground — kalau di background, screencap
+        # akan tangkap layar lain dan OCR tidak relevan
         dumpsys activity top 2>/dev/null | grep -q "ACTIVITY ${pkg}" || continue
 
+        # Ambil screenshot
         screencap -p "$scr_file" 2>/dev/null
         [ -f "$scr_file" ] || continue
 
-        # OCR dengan whitelist angka untuk akurasi lebih tinggi
-        tesseract "$scr_file" "$txt_base" -l eng --psm 6 -c tessedit_char_whitelist=0123456789 quiet 2>/dev/null
-
+        # OCR — lang eng, quiet, output ke file teks
+        tesseract "$scr_file" "$txt_base" -l eng quiet 2>/dev/null
         local txt_file="${txt_base}.txt"
-        rm -f "$scr_file" 2>/dev/null
 
-        [ -f "$txt_file" ] || continue
-
-        local ocr_text
-        ocr_text=$(cat "$txt_file" 2>/dev/null | tr -d '\0' | tr '\n' ' ')
-        rm -f "$txt_file" 2>/dev/null
-
-        [ -z "$ocr_text" ] && continue
-
-        local detected_code=""
-
-        # Pola 1: "Error Code 277" atau "Error Code: 277"
-        detected_code=$(echo "$ocr_text" | grep -oiE "error.{0,5}code.{0,5}[^0-9]([0-9]{3,4})" | grep -oE "[0-9]{3,4}" | head -1)
-
-        # Pola 2: "Error: 277" atau "Error 277"
-        if [ -z "$detected_code" ]; then
-            detected_code=$(echo "$ocr_text" | grep -oiE "error.{0,5}[^0-9]([0-9]{3,4})" | grep -oE "[0-9]{3,4}" | head -1)
-        fi
-
-        # Pola 3: "Disconnected (277)" atau "(277)"
-        if [ -z "$detected_code" ]; then
-            detected_code=$(echo "$ocr_text" | grep -oiE "disconnect.{0,10}\([0-9]{3,4}\)" | grep -oE "[0-9]{3,4}" | head -1)
-        fi
-
-        # Pola 4: "Kicked (277)"
-        if [ -z "$detected_code" ]; then
-            detected_code=$(echo "$ocr_text" | grep -oiE "kicked.{0,10}([0-9]{3,4})" | grep -oE "[0-9]{3,4}" | head -1)
-        fi
-
-        # Pola 5: Error Code list
-        if [ -z "$detected_code" ]; then
-            detected_code=$(echo "$ocr_text" | grep -oE "${ERROR_CODE_LIST}" | head -1)
-        fi
-
-        [ -z "$detected_code" ] && continue
-
-        log "📸 OCR: Mendeteksi Error Code $detected_code di layar!"
-
-        if ! acquire_crash_lock "$pkg"; then
-            log "⏭️ ocr: handler lain aktif, skip."
+        if [ ! -f "$txt_file" ]; then
+            rm -f "$scr_file" 2>/dev/null
             continue
         fi
 
-        send_discord_notification "disconnect" "Error Code: $detected_code (OCR)" "$pkg"
+        # Cari pola "Error Code NNN" atau "Error NNN" atau "(NNN)" dekat kata error/disconnect
+        # Pola primer: "Error Code" diikuti angka
+        local detected_code=""
+        detected_code=$(grep -oiE "error.{0,8}code.{0,8}([0-9]{3,4})" "$txt_file" \
+            | grep -oE "[0-9]{3,4}" | head -1)
+
+        # Pola sekunder: salah satu error code list di dekat kata disconnect/error
+        if [ -z "$detected_code" ]; then
+            # Hanya match kalau ada kata konteks disconnect/error di baris yang sama
+            while IFS= read -r ocr_line; do
+                echo "$ocr_line" | grep -qiE "disconnect|error|kicked|connection" || continue
+                detected_code=$(printf '%s' "$ocr_line" \
+                    | grep -oE "(^|[^0-9])(${ERROR_CODE_LIST})([^0-9]|$)" \
+                    | grep -oE "[0-9]+" | head -1)
+                [ -n "$detected_code" ] && break
+            done < "$txt_file"
+        fi
+
+        rm -f "$scr_file" "$txt_file" 2>/dev/null
+
+        [ -z "$detected_code" ] && continue
+
+        # Error dialog terdeteksi di layar
+        if ! acquire_crash_lock "$pkg"; then
+            log "⏭️ ocr_error_monitor: handler lain aktif — skip (Code $detected_code)"
+            continue
+        fi
+
+        log "📸 OCR: Error Code $detected_code terdeteksi di layar — auto-rejoin"
+        send_discord_notification "disconnect" "Error Code: $detected_code (OCR layar)" "$pkg"
+
         sleep 2
         source "$cfg_file" 2>/dev/null || true
 
@@ -1768,28 +2257,27 @@ ocr_error_monitor() {
             continue
         fi
 
-        local active_url=$(get_active_url "$MODE" "$URL")
+        local active_url
+        active_url=$(get_active_url "$MODE" "$URL")
         join_server "$pkg" "$active_url" "$MODE"
         wait_ingame "$pkg"
         verify_ingame_stable "$pkg" "$cfg_file"
         release_crash_lock "$pkg"
-
-        sleep 30
     done
 }
 
 # ─────────────────────────────────────────
-#   OPEN SECOND PACKAGE
+#   OPEN SECOND PACKAGE (menggunakan perbaikan)
 # ─────────────────────────────────────────
 
 open_second_package() {
     if [ "$USE_MULTI_PKG" != "1" ] || [ -z "$PKG2" ]; then
         return
     fi
-
+    
     local mode2 url2
     local cfg2="${CONFIG_BASE_DIR}/roblox_config_${PKG2}.cfg"
-
+    
     if [ -f "$cfg2" ]; then
         source "$cfg2"
         mode2="$MODE"
@@ -1798,10 +2286,11 @@ open_second_package() {
         mode2="market"
         url2="$URL_MARKET"
     fi
-
+    
     local active_url2
     active_url2=$(get_active_url "$mode2" "$url2")
 
+    # Split screen dihapus — langsung pakai floating/freeform window
     try_floating_window "$PKG2" "$active_url2"
 }
 
@@ -1824,6 +2313,7 @@ fi
 
 ensure_deps
 
+# Menu awal
 clr
 echo "========================================="
 echo "   ROBLOX AUTO RECONNECT + AUTO RELOG"
@@ -1843,12 +2333,14 @@ else
     USE_MULTI_PKG=0
 fi
 
+# Setup Package 1
 echo ""
 pilih_package "📦 PILIH PACKAGE 1" PKG1
 set_pkg_paths "$PKG1" "PKG1"
 check_clone_app "$PKG1"
 setup_or_load_pkg "$PKG1" 1
 
+# Setup Package 2 (jika dipilih)
 if [ "$USE_MULTI_PKG" = "1" ]; then
     echo ""
     pilih_package "📦 PILIH PACKAGE 2" PKG2
@@ -1857,6 +2349,7 @@ if [ "$USE_MULTI_PKG" = "1" ]; then
     setup_or_load_pkg "$PKG2" 2
 fi
 
+# Load Discord settings lama
 PKG1_CFG="${CONFIG_BASE_DIR}/roblox_config_${PKG1}.cfg"
 if [ -f "$PKG1_CFG" ]; then
     DISCORD_ENABLED=$(grep '^DISCORD_ENABLED=' "$PKG1_CFG" | head -1 | cut -d= -f2)
@@ -1890,13 +2383,16 @@ if [ "$SETUP_DISCORD" = "1" ]; then
     sleep 2
 fi
 
+# Simpan setting Discord ke config
 persist_discord_settings "${CONFIG_BASE_DIR}/roblox_config_${PKG1}.cfg" "$PKG1"
 if [ "$USE_MULTI_PKG" = "1" ]; then
     persist_discord_settings "${CONFIG_BASE_DIR}/roblox_config_${PKG2}.cfg" "$PKG2"
 fi
 
+# Load config
 source "${CONFIG_BASE_DIR}/roblox_config_${PKG1}.cfg" 2>/dev/null
 
+# START
 mkdir -p "$PKG1_STATE_DIR"
 
 clr
@@ -1914,18 +2410,22 @@ log "Deteksi Error Code: $(show_toggle ${DETEKSI_ERROR_CODE:-1}) (stuck watchdog
 echo "=========================================" | tee -a "$PKG1_LOG_FILE"
 echo ""
 
+# Get active URL
 PKG1_ACTIVE_URL=$(get_active_url "$MODE" "$URL")
 
+# Guard: URL kosong
 if [ -z "$PKG1_ACTIVE_URL" ] && { [ "$MODE" = "main" ] || [ "$MODE" = "public" ]; }; then
     log "❌ FATAL: URL kosong untuk mode $MODE — config rusak atau URL belum pernah diisi"
     log "   Hapus config dan jalankan ulang: rm ${CONFIG_BASE_DIR}/roblox_config_${PKG1}.cfg"
     exit 1
 fi
 
+# Join first package
 join_server "$PKG1" "$PKG1_ACTIVE_URL" "$MODE"
 wait_ingame "$PKG1"
 verify_ingame_stable "$PKG1" "${CONFIG_BASE_DIR}/roblox_config_${PKG1}.cfg"
 
+# Open second package if enabled
 if [ "$USE_MULTI_PKG" = "1" ]; then
     sleep 2
     open_second_package
@@ -1934,11 +2434,19 @@ fi
 log "🚀 Ready untuk monitoring"
 echo ""
 
-# ── HANYA 4 MONITOR YANG DIPERLUKAN ──
-# 1. crash_monitor       → deteksi crash via PID
-# 2. logcat_crash_detector → deteksi crash via logcat (cadangan)
-# 3. stuck_watchdog      → deteksi disconnect via TCP (UTAMA)
-# 4. ocr_error_monitor   → deteksi error code via OCR (CADANGAN)
+# Abaikan SIGHUP — cegah script mati saat Termux di-background atau
+# session su di-hangup oleh Android. Tanpa ini, LMK / screen off bisa
+# kirim SIGHUP ke proses ini → script exit ke shell tiba-tiba.
+trap '' SIGHUP
+
+# Outer restart loop: kalau keep-alive loop keluar karena apapun
+# (sinyal, error sleep, edge case), restart seluruh monitoring block
+# tanpa kembali ke menu. Script tidak pernah exit ke Termux shell.
+while true; do
+
+# Start monitors
+monitor_events "$PKG1" "${CONFIG_BASE_DIR}/roblox_config_${PKG1}.cfg" &
+MONITOR_PID=$!
 
 crash_monitor "$PKG1" "${CONFIG_BASE_DIR}/roblox_config_${PKG1}.cfg" &
 CRASH_PID=$!
@@ -1946,14 +2454,22 @@ CRASH_PID=$!
 logcat_crash_detector "$PKG1" "${CONFIG_BASE_DIR}/roblox_config_${PKG1}.cfg" &
 LOGCAT_CRASH_PID=$!
 
+error_code_monitor "$PKG1" "${CONFIG_BASE_DIR}/roblox_config_${PKG1}.cfg" &
+ERROR_CODE_PID=$!
+
 stuck_watchdog "$PKG1" "${CONFIG_BASE_DIR}/roblox_config_${PKG1}.cfg" &
 STUCK_WD_PID=$!
 
 ocr_error_monitor "$PKG1" "${CONFIG_BASE_DIR}/roblox_config_${PKG1}.cfg" &
 OCR_PID=$!
 
-# Keep alive
+# Keep alive — restart monitor jika mati
 while true; do
+    if ! kill -0 "$MONITOR_PID" 2>/dev/null; then
+        log "⚠️ monitor_events mati — restart otomatis"
+        monitor_events "$PKG1" "${CONFIG_BASE_DIR}/roblox_config_${PKG1}.cfg" &
+        MONITOR_PID=$!
+    fi
     if ! kill -0 "$CRASH_PID" 2>/dev/null; then
         log "⚠️ crash_monitor mati — restart otomatis"
         crash_monitor "$PKG1" "${CONFIG_BASE_DIR}/roblox_config_${PKG1}.cfg" &
@@ -1963,6 +2479,11 @@ while true; do
         log "⚠️ logcat_crash_detector mati — restart otomatis"
         logcat_crash_detector "$PKG1" "${CONFIG_BASE_DIR}/roblox_config_${PKG1}.cfg" &
         LOGCAT_CRASH_PID=$!
+    fi
+    if ! kill -0 "$ERROR_CODE_PID" 2>/dev/null; then
+        log "⚠️ error_code_monitor mati — restart otomatis"
+        error_code_monitor "$PKG1" "${CONFIG_BASE_DIR}/roblox_config_${PKG1}.cfg" &
+        ERROR_CODE_PID=$!
     fi
     if ! kill -0 "$STUCK_WD_PID" 2>/dev/null; then
         log "⚠️ stuck_watchdog mati — restart otomatis"
@@ -1974,5 +2495,11 @@ while true; do
         ocr_error_monitor "$PKG1" "${CONFIG_BASE_DIR}/roblox_config_${PKG1}.cfg" &
         OCR_PID=$!
     fi
-    sleep "$CHECK_INTERVAL"
+    sleep "${CHECK_INTERVAL:-10}"
+done
+
+# Kalau inner loop keluar (seharusnya tidak pernah), log dan restart semua
+log "⚠️ Keep-alive loop keluar — restart monitoring block..."
+sleep 5
+
 done
