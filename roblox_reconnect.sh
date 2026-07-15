@@ -138,6 +138,14 @@ ERROR_CODE_LIST="272|273|274|275|277|278|279|282|529"
 # cukup cepat untuk nangkep disconnect yang gak ke-detect logcat.
 STUCK_WATCHDOG_TIMEOUT=120
 
+# Timeout wait_ingame: berapa detik tunggu logcat detect INGAME setelah join.
+# Kalau private server berat / koneksi lambat, naikkan ke 180-240.
+WAIT_INGAME_TIMEOUT=120
+
+# Verify stable duration: berapa detik tight-monitor pasca-join sebelum
+# dianggap stabil dan crash_monitor dikembalikan. Default 20 detik.
+VERIFY_STABLE_DURATION=20
+
 # ─────────────────────────────────────────
 #   PATH PER-PACKAGE
 # ─────────────────────────────────────────
@@ -451,6 +459,22 @@ save_config() {
     local home=$8
     local error_code=${9:-1}
 
+    # Timeout fields — arg 10/11/12 opsional. Kalau tidak diberikan, baca
+    # dari file existing agar nilai tidak ter-reset saat save_config dipanggil
+    # untuk ganti setting lain (mis. toggle reconnect tidak boleh reset timeout).
+    local t_wait="${10}"
+    local t_verify="${11}"
+    local t_watchdog="${12}"
+
+    if [ -f "$cfg_file" ]; then
+        [ -z "$t_wait" ]     && t_wait=$(grep '^WAIT_INGAME_TIMEOUT='    "$cfg_file" | cut -d= -f2)
+        [ -z "$t_verify" ]   && t_verify=$(grep '^VERIFY_STABLE_DURATION=' "$cfg_file" | cut -d= -f2)
+        [ -z "$t_watchdog" ] && t_watchdog=$(grep '^STUCK_WATCHDOG_TIMEOUT=' "$cfg_file" | cut -d= -f2)
+    fi
+    t_wait="${t_wait:-120}"
+    t_verify="${t_verify:-20}"
+    t_watchdog="${t_watchdog:-120}"
+
     # BUG FIX: Discord setup terjadi SETELAH package setup.
     # Kalau save_config dipanggil dari wizard/menu sebelum Discord diinput
     # (globals masih kosong), webhook yang sudah tersimpan bakal ketimpa "".
@@ -475,6 +499,12 @@ RECONNECT_OTOMATIS=$reconnect
 RESTART_KALAU_CRASH=$restart
 RECONNECT_SAAT_HOME=$home
 DETEKSI_ERROR_CODE=$error_code
+
+# Timeout settings
+WAIT_INGAME_TIMEOUT=$t_wait
+VERIFY_STABLE_DURATION=$t_verify
+STUCK_WATCHDOG_TIMEOUT=$t_watchdog
+
 DISCORD_ENABLED=${disc_enabled:-0}
 DISCORD_WEBHOOK="${disc_webhook}"
 DISCORD_USER_ID="${disc_uid}"
@@ -965,6 +995,7 @@ menu_edit_settings_pkg() {
 
     while true; do
         local cur_url cur_mode cur_relog cur_reconnect cur_restart cur_home cur_error_code
+        local cur_wait cur_verify cur_watchdog
         cur_url=$(grep '^URL=' "$cfg_file" | head -1 | cut -d'"' -f2)
         cur_mode=$(grep '^MODE=' "$cfg_file" | head -1 | cut -d'"' -f2)
         cur_relog=$(grep '^RELOG_SETIAP_JAM=' "$cfg_file" | head -1 | cut -d= -f2)
@@ -973,6 +1004,9 @@ menu_edit_settings_pkg() {
         cur_home=$(grep '^RECONNECT_SAAT_HOME=' "$cfg_file" | head -1 | cut -d= -f2)
         cur_error_code=$(grep '^DETEKSI_ERROR_CODE=' "$cfg_file" | head -1 | cut -d= -f2)
         cur_error_code="${cur_error_code:-1}"
+        cur_wait=$(grep '^WAIT_INGAME_TIMEOUT=' "$cfg_file" | cut -d= -f2); cur_wait="${cur_wait:-120}"
+        cur_verify=$(grep '^VERIFY_STABLE_DURATION=' "$cfg_file" | cut -d= -f2); cur_verify="${cur_verify:-20}"
+        cur_watchdog=$(grep '^STUCK_WATCHDOG_TIMEOUT=' "$cfg_file" | cut -d= -f2); cur_watchdog="${cur_watchdog:-120}"
 
         clr
         header
@@ -984,9 +1018,10 @@ menu_edit_settings_pkg() {
         echo "  3) Restart kalau crash   (sekarang: $(show_toggle $cur_restart))"
         echo "  4) Reconnect saat home   (sekarang: $(show_toggle $cur_home))"
         echo "  5) Deteksi Error Code    (sekarang: $(show_toggle $cur_error_code))"
-        echo "  6) Kembali"
+        echo "  6) Timeout settings      (Join: ${cur_wait}s | Verify: ${cur_verify}s | Watchdog: ${cur_watchdog}s)"
+        echo "  7) Kembali"
         echo ""
-        printf "  Pilih (1-6): "
+        printf "  Pilih (1-7): "
         read -r PILIHAN
 
         case $PILIHAN in
@@ -1027,8 +1062,83 @@ menu_edit_settings_pkg() {
                 echo "  ✅ Deteksi Error Code: $(show_toggle $new_val)"
                 sleep 1
                 ;;
-            6) return ;;
-            *) echo "  ⚠ Pilih 1-6"; sleep 1 ;;
+            6)
+                # ── Timeout sub-menu ─────────────────────────────────────
+                while true; do
+                    clr; header
+                    echo ""
+                    echo "  ⏱️ TIMEOUT SETTINGS — $pkg"
+                    echo ""
+                    echo "  1) Wait INGAME timeout    (sekarang: ${cur_wait}s)"
+                    echo "     → Berapa detik tunggu Roblox INGAME setelah join via logcat"
+                    echo "       Naikkan ke 180-240s kalau private server lambat loading"
+                    echo ""
+                    echo "  2) Verify stable duration (sekarang: ${cur_verify}s)"
+                    echo "     → Berapa detik tight-monitor pasca-join sebelum dianggap stabil"
+                    echo "       Naikkan ke 30s kalau sering crash langsung setelah join"
+                    echo ""
+                    echo "  3) Stuck watchdog timeout (sekarang: ${cur_watchdog}s)"
+                    echo "     → Berapa detik idle tanpa network sebelum auto-rejoin"
+                    echo "       Turunkan ke 60s untuk deteksi cepat, naikkan ke 180s kalau false positive"
+                    echo ""
+                    echo "  4) Kembali"
+                    echo ""
+                    printf "  Pilih (1-4): "
+                    read -r TSUB
+
+                    case $TSUB in
+                        1)
+                            echo ""
+                            printf "  Wait INGAME timeout (detik, sekarang: ${cur_wait}s) > "
+                            read -r V
+                            if [[ "$V" =~ ^[0-9]+$ ]] && [ "$V" -ge 30 ] && [ "$V" -le 600 ]; then
+                                cur_wait="$V"
+                                save_config "$cfg_file" "$pkg" "$cur_url" "$cur_mode" \
+                                    "$cur_relog" "$cur_reconnect" "$cur_restart" "$cur_home" \
+                                    "$cur_error_code" "$cur_wait" "$cur_verify" "$cur_watchdog"
+                                WAIT_INGAME_TIMEOUT="$V"
+                                echo "  ✅ Wait INGAME timeout: ${V}s"
+                            else
+                                echo "  ⚠ Masukkan angka 30-600"
+                            fi
+                            sleep 1 ;;
+                        2)
+                            echo ""
+                            printf "  Verify stable duration (detik, sekarang: ${cur_verify}s) > "
+                            read -r V
+                            if [[ "$V" =~ ^[0-9]+$ ]] && [ "$V" -ge 5 ] && [ "$V" -le 120 ]; then
+                                cur_verify="$V"
+                                save_config "$cfg_file" "$pkg" "$cur_url" "$cur_mode" \
+                                    "$cur_relog" "$cur_reconnect" "$cur_restart" "$cur_home" \
+                                    "$cur_error_code" "$cur_wait" "$cur_verify" "$cur_watchdog"
+                                VERIFY_STABLE_DURATION="$V"
+                                echo "  ✅ Verify stable duration: ${V}s"
+                            else
+                                echo "  ⚠ Masukkan angka 5-120"
+                            fi
+                            sleep 1 ;;
+                        3)
+                            echo ""
+                            printf "  Stuck watchdog timeout (detik, sekarang: ${cur_watchdog}s) > "
+                            read -r V
+                            if [[ "$V" =~ ^[0-9]+$ ]] && [ "$V" -ge 30 ] && [ "$V" -le 600 ]; then
+                                cur_watchdog="$V"
+                                save_config "$cfg_file" "$pkg" "$cur_url" "$cur_mode" \
+                                    "$cur_relog" "$cur_reconnect" "$cur_restart" "$cur_home" \
+                                    "$cur_error_code" "$cur_wait" "$cur_verify" "$cur_watchdog"
+                                STUCK_WATCHDOG_TIMEOUT="$V"
+                                echo "  ✅ Stuck watchdog timeout: ${V}s"
+                            else
+                                echo "  ⚠ Masukkan angka 30-600"
+                            fi
+                            sleep 1 ;;
+                        4) break ;;
+                        *) echo "  ⚠ Pilih 1-4"; sleep 1 ;;
+                    esac
+                done
+                ;;
+            7) return ;;
+            *) echo "  ⚠ Pilih 1-7"; sleep 1 ;;
         esac
     done
 }
@@ -1421,7 +1531,7 @@ wait_ingame() {
     # ── Metode 1: Tunggu "Connection accepted" via logcat (max 120s) ─────
     # Private server memerlukan loading lebih lama dari public server.
     local tmp_ip
-    tmp_ip=$(timeout 120 logcat -b main -b system -v time 2>/dev/null \
+    tmp_ip=$(timeout "${WAIT_INGAME_TIMEOUT:-120}" logcat -b main -b system -v time 2>/dev/null \
         | grep --line-buffered -iE "Connection accepted from|NetworkClient.*connected|RobloxNetworkHandler.*Join" \
         | head -1 \
         | grep -oE "([0-9]{1,3}\.){3}[0-9]{1,3}" \
@@ -1491,8 +1601,8 @@ verify_ingame_stable() {
     # karena verify ini masih bagian dari proses join (belum aman untuk crash_monitor).
     acquire_join_lock "$pkg"
 
-    log "🔁 Tight-monitor 20s pasca-join (join lock aktif)..."
-    while [ $checks -lt 20 ]; do
+    log "🔁 Tight-monitor ${VERIFY_STABLE_DURATION:-20}s pasca-join (join lock aktif)..."
+    while [ $checks -lt "${VERIFY_STABLE_DURATION:-20}" ]; do
         sleep 1
         acquire_join_lock "$pkg"   # refresh — jaga lock tetap fresh selama tight-monitor
         local main_pid
