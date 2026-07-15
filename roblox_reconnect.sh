@@ -1697,19 +1697,19 @@ monitor_events() {
         local _seen_joining=0
 
         while read -r line; do
-            # ── Inner filter ketat: tentukan jenis sinyal ────────────────
+            # ── Inner filter ketat: hanya explicit disconnect signal ──────
+            # "Connection error" dan "Network error" DIHAPUS — terlalu broad,
+            # match normal network activity saat loading private server dan
+            # menyebabkan false-positive rejoin. OCR monitor yang handle
+            # deteksi error code (277/278/279 dll) dari dialog layar.
             local reason=""
 
             if echo "$line" | grep -qiE "Sending disconnect"; then
                 reason="Sending disconnect"
             elif echo "$line" | grep -qiE "Connection lost|Lost connection"; then
                 reason="Connection lost"
-            elif echo "$line" | grep -qiE "Disconnected from server|disconnected"; then
+            elif echo "$line" | grep -qiE "Disconnected from server"; then
                 reason="Disconnected"
-            elif echo "$line" | grep -qiE "connection.*(timeout|failed|dropped|reset|refused)"; then
-                reason="Connection error"
-            elif echo "$line" | grep -qiE "network.*(error|lost|failed|timeout|dropped)"; then
-                reason="Network error"
             elif echo "$line" | grep -qiE "kicked from game|kick.*reason"; then
                 reason="Kicked"
             fi
@@ -1757,7 +1757,7 @@ monitor_events() {
 
         done < <(logcat -T "$start_ts" -b main -b system -v time 2>/dev/null \
             | grep --line-buffered -iE \
-                "${pkg}|disconnect|connection.*(lost|clos|fail|drop|reset|timeout|error|refused)|network.*(error|lost|fail|timeout|drop|disconnect)|kicked|roblox.*(error|network|disconnect|stop|kill)")
+                "Sending disconnect|Connection lost|Lost connection|Disconnected from server|kicked from game|kick.*reason|${pkg}.*(disconnect|kicked)")
 
         sleep 3
     done
@@ -1978,6 +1978,10 @@ logcat_crash_detector() {
                     vstate=$(grep -m1 "^State:" "/proc/$verify_pid/status" 2>/dev/null | awk '{print $2}')
                     if [ "$vstate" != "Z" ] && [ "$vstate" != "X" ]; then
                         log "ℹ️ logcat_detector: sinyal '$reason' terdeteksi, tapi PID utama ($verify_pid) masih hidup & sehat — kemungkinan cuma sub-process (renderer/sandbox) restart. Diabaikan, TIDAK force-stop."
+                        # Cooldown 30s setelah sub-process ignore — private server
+                        # loading spawn/kill banyak sub-process berurutan, tanpa ini
+                        # log spam terus dan CPU habis untuk cek PID berulang.
+                        sleep 30
                         continue
                     fi
                 fi
@@ -2318,12 +2322,33 @@ ocr_error_monitor() {
         screencap -p "$scr_file" 2>/dev/null
         [ -f "$scr_file" ] || continue
 
-        # OCR — --oem 0 (Legacy engine, tanpa LSTM) cegah Floating point
-        # exception di ARM. --psm 11 (sparse text) cocok untuk dialog
-        # yang muncul di tengah layar game tanpa layout terstruktur.
-        if ! tesseract "$scr_file" "$txt_base" \
-                -l eng --oem 0 --psm 11 quiet 2>/dev/null; then
-            rm -f "$scr_file" "${txt_base}.txt" 2>/dev/null
+        # PRE-PROCESS IMAGE sebelum OCR:
+        # screencap output PNG RGBA 32-bit → tesseract SIGFPE di ARM karena
+        # format tidak di-support langsung. Fix: convert ke grayscale 8-bit
+        # + resize 40% via ImageMagick. Grayscale juga meningkatkan akurasi
+        # OCR untuk teks putih di background gelap (dialog disconnect Roblox).
+        local ocr_input="$scr_file"
+        local proc_file="${scr_file%.png}_gray.png"
+        if command -v convert >/dev/null 2>&1; then
+            convert "$scr_file" \
+                -colorspace Gray \
+                -resize 40% \
+                -depth 8 \
+                -auto-level \
+                "$proc_file" 2>/dev/null \
+                && ocr_input="$proc_file"
+        fi
+
+        # Wrap tesseract di `bash -c` agar pesan "Floating point exception"
+        # dari sinyal SIGFPE masuk ke stderr bash subprocess → ke /dev/null.
+        # Tanpa ini, bash outer cetak pesan sinyal ke terminal meskipun
+        # tesseract sendiri sudah punya 2>/dev/null.
+        # --oem 3 = auto-select engine terbaik yang tersedia (legacy/LSTM)
+        # --psm 11 = sparse text, tidak asumsi layout — cocok dialog game
+        if ! bash -c \
+            'tesseract "$1" "$2" -l eng --oem 3 --psm 11 quiet' \
+            -- "$ocr_input" "$txt_base" 2>/dev/null; then
+            rm -f "$scr_file" "$proc_file" "${txt_base}.txt" 2>/dev/null
             continue
         fi
         local txt_file="${txt_base}.txt"
@@ -2416,7 +2441,7 @@ open_second_package() {
 
 ensure_deps() {
     echo "🔧 Cek dependency..."
-    pkg install -y curl wget bash coreutils procps termux-tools 2>&1 \
+    pkg install -y curl wget bash coreutils procps termux-tools imagemagick 2>&1 \
         | grep -E "^(Unpacking|Setting up|is already)" | while read -r l; do echo "   $l"; done
     echo "✅ Dependency OK"
     echo ""
