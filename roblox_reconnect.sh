@@ -1911,6 +1911,13 @@ logcat_crash_detector() {
         local start_ts
         start_ts=$(date '+%m-%d %H:%M:%S.000')
 
+        # _seen_joining flag — sama seperti error_code_monitor:
+        # kalau join pernah aktif di iterasi ini, saat is_joining → false
+        # langsung break → outer loop restart dengan start_ts baru →
+        # buffer crash dari sesi join sebelumnya tidak pernah diproses.
+        local _seen_joining=0
+        local _last_join_log=0   # rate-limit log "join berlangsung"
+
         while read -r line; do
             # BUG FIX (root cause "black screen" saat loading Private Server
             # berat): Roblox pakai arsitektur MULTI-PROCESS — ada sub-process
@@ -1956,11 +1963,23 @@ logcat_crash_detector() {
             fi
 
             if [ "$is_crash" = "1" ]; then
-                # Skip jika sedang proses join — crash logcat bisa muncul
-                # saat Roblox restart prosesnya sendiri waktu loading private server
                 if is_joining "$pkg"; then
-                    log "⏭️ logcat_detector: join sedang berlangsung — abaikan crash signal ($reason)"
+                    _seen_joining=1
+                    # Rate-limit: hanya log sekali per 60 detik — cegah spam
+                    # saat ada banyak baris buffered crash masuk sekaligus
+                    local _now; _now=$(date +%s)
+                    if [ $(( _now - _last_join_log )) -gt 60 ]; then
+                        log "⏭️ logcat_detector: join sedang berlangsung — abaikan crash signal ($reason)"
+                        _last_join_log=$_now
+                    fi
                     continue
+                fi
+
+                # Join BARU SELESAI → buang sisa buffer crash dari sesi join
+                if [ "$_seen_joining" = "1" ]; then
+                    _seen_joining=0
+                    log "⏭️ logcat_detector: join baru selesai — reset pipe (buang buffer crash)"
+                    break
                 fi
 
                 # FIX lapis 2 (paling penting): CROSS-VERIFY PID sebelum
@@ -2571,6 +2590,12 @@ if [ "$USE_MULTI_PKG" = "1" ]; then
     sleep 2
     open_second_package
 fi
+
+# ── Cleanup stale lock files dari sesi sebelumnya ────────────────────────
+# Kalau script di-kill paksa saat join (CTRL+C, reboot, OOM), join_lock
+# dan crash_lock tertinggal → is_joining stuck true → monitor tidak aktif.
+find "${STATE_BASE_DIR}" -name "join_lock_*" -delete 2>/dev/null
+find "${STATE_BASE_DIR}" -name "crash_lock_*" -delete 2>/dev/null
 
 log "🚀 Ready untuk monitoring"
 echo ""
