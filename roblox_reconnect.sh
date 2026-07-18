@@ -538,15 +538,20 @@ persist_discord_settings() {
 clr() { clear 2>/dev/null || printf '\033[2J\033[H'; }
 
 header() {
-    echo "========================================="
-    echo "   ROBLOX AUTO RECONNECT + AUTO RELOG"
+    if command -v figlet >/dev/null 2>&1; then
+        figlet -f small "SPHINX" 2>/dev/null || echo "  SPHINX MONITOR"
+    else
+        echo "  SPHINX MONITOR"
+    fi
+    echo "  Roblox Auto Reconnect + Auto Relog  |  by Wardz"
+    echo "  ─────────────────────────────────────────────────"
     if [ -n "$PKG1" ]; then
-        echo "   Package 1: $PKG1"
+        echo "  📦 Package 1: $PKG1"
     fi
     if [ -n "$PKG2" ] && [ "$USE_MULTI_PKG" = "1" ]; then
-        echo "   Package 2: $PKG2"
+        echo "  📦 Package 2: $PKG2"
     fi
-    echo "========================================="
+    echo ""
 }
 
 show_toggle() {
@@ -1325,10 +1330,60 @@ try_floating_window() {
 
 log() {
     local msg=$1
+    local type=${2:-info}   # info | success | error | warning
     echo "[$PKG1] [$(date +%H:%M:%S)] $msg"
     if [ -f "$PKG1_LOG_FILE" ]; then
         echo "[$(date +%H:%M:%S)] $msg" >> "$PKG1_LOG_FILE"
     fi
+    # Tulis ke dashboard events (dipakai oleh Python dashboard)
+    write_dashboard_event "$PKG1" "$msg" "$type"
+}
+
+# ─────────────────────────────────────────
+#   DASHBOARD STATE
+# ─────────────────────────────────────────
+
+DASH_DIR="/data/local/tmp/rbx_dash"
+
+update_dashboard_state() {
+    local pkg=$1 status=$2 event=$3
+    mkdir -p "$DASH_DIR" 2>/dev/null
+    local sf="${DASH_DIR}/${pkg//[^a-zA-Z0-9]/_}.json"
+
+    # Baca count dari file existing
+    local rc=0 cr=0
+    if [ -f "$sf" ]; then
+        rc=$(grep -o '"rc":[0-9]*' "$sf" | grep -o '[0-9]*' || echo 0)
+        cr=$(grep -o '"cr":[0-9]*' "$sf" | grep -o '[0-9]*' || echo 0)
+    fi
+    # Increment berdasarkan event type
+    case "$status" in
+        online)  rc=$(( rc + 1 )) ;;
+        crashed) cr=$(( cr + 1 )) ;;
+    esac
+
+    local cpu ram temp now
+    now=$(date +%s)
+    cpu=$(top -bn1 2>/dev/null | grep -i "cpu" | head -1 | grep -oE "[0-9]+\.?[0-9]*%" | head -1 || echo "?")
+    ram=$(free -m 2>/dev/null | awk 'NR==2{printf "%dMB free (%.0f%%)", $4, $4/$2*100}' || echo "?")
+    temp=$(cat /sys/class/thermal/thermal_zone0/temp 2>/dev/null | awk '{printf "%.0f°C",$1/1000}' || echo "?")
+
+    printf '{"pkg":"%s","status":"%s","event":"%s","rc":%s,"cr":%s,"ts":%s,"cpu":"%s","ram":"%s","temp":"%s"}\n' \
+        "$pkg" "$status" "$event" "${rc:-0}" "${cr:-0}" "$now" \
+        "${cpu:-?}" "${ram:-?}" "${temp:-?}" > "$sf" 2>/dev/null
+}
+
+write_dashboard_event() {
+    local pkg=$1 event=$2 type=${3:-info}
+    mkdir -p "$DASH_DIR" 2>/dev/null
+    local ef="${DASH_DIR}/${pkg//[^a-zA-Z0-9]/_}_events.jsonl"
+    local now ts
+    now=$(date +%s); ts=$(date '+%H:%M:%S')
+    printf '{"ts":%s,"t":"%s","type":"%s","ev":"%s"}\n' \
+        "$now" "$ts" "$type" "${event//\"/\'}" >> "$ef" 2>/dev/null
+    # Trim ke 30 baris terakhir
+    local lc; lc=$(wc -l < "$ef" 2>/dev/null || echo 0)
+    [ "$lc" -gt 30 ] && tail -30 "$ef" > "${ef}.tmp" && mv "${ef}.tmp" "$ef"
 }
 
 # ─────────────────────────────────────────
@@ -1538,7 +1593,8 @@ wait_ingame() {
         | head -1)
 
     if [ -n "$tmp_ip" ]; then
-        log "✅ INGAME via logcat! IP: $tmp_ip"
+        log "✅ INGAME via logcat! IP: $tmp_ip" "success"
+            update_dashboard_state "$pkg" "online" "Ingame via logcat - IP: $tmp_ip"
         send_discord_notification "reconnect_success" "IP: $tmp_ip" "$pkg"
         release_join_lock "$pkg"
         return
@@ -1577,7 +1633,8 @@ wait_ingame() {
         # Juga cek activity foreground sebagai konfirmasi tambahan
         if [ "$alive" = "1" ]; then
             if dumpsys activity top 2>/dev/null | grep -q "ACTIVITY ${pkg}"; then
-                log "✅ INGAME via PID+Activity (fallback)"
+                log "✅ INGAME via PID+Activity (fallback)" "success"
+                update_dashboard_state "$pkg" "online" "Ingame via fallback detect"
                 send_discord_notification "reconnect_success" "Joined (fallback detect)" "$pkg"
                 release_join_lock "$pkg"
                 return
@@ -1646,7 +1703,8 @@ verify_ingame_stable() {
 
     # Stabil — lepas join lock agar crash_monitor kembali aktif memantau
     release_join_lock "$pkg"
-    log "✅ Stabil pasca-join — crash_monitor aktif kembali"
+    log "✅ Stabil pasca-join — crash_monitor aktif kembali" "success"
+    update_dashboard_state "$pkg" "online" "Stabil pasca-join"
 }
 
 monitor_events() {
@@ -1739,7 +1797,8 @@ monitor_events() {
                 continue
             fi
 
-            log "❌ DC via monitor_events: $reason"
+            log "❌ DC via monitor_events: $reason" "error"
+            update_dashboard_state "$pkg" "offline" "Disconnect: $reason"
             send_discord_notification "disconnect" "$reason" "$pkg"
 
             sleep 3
@@ -1855,7 +1914,8 @@ crash_monitor() {
                     continue
                 fi
 
-                log "💥 CRASH DETECTED — $pkg tidak ditemukan (PID hilang)"
+                log "💥 CRASH DETECTED — $pkg tidak ditemukan (PID hilang)" "error"
+                update_dashboard_state "$pkg" "crashed" "Crash: PID hilang"
                 send_discord_notification "crash" "App crashed / PID hilang" "$pkg"
                 sleep 3
 
@@ -2011,7 +2071,8 @@ logcat_crash_detector() {
                     continue
                 fi
 
-                log "💥 CRASH DETECTED via logcat — $reason (PID utama terkonfirmasi hilang)"
+                log "💥 CRASH DETECTED via logcat — $reason (PID utama terkonfirmasi hilang)" "error"
+                update_dashboard_state "$pkg" "crashed" "Crash via logcat: $reason"
                 send_discord_notification "crash" "$reason" "$pkg"
                 sleep 5
 
@@ -2445,13 +2506,18 @@ open_second_package() {
 ensure_deps() {
     echo "🔧 Cek dependency..."
     pkg install -y curl wget bash coreutils procps termux-tools \
-        python android-tools tsu 2>&1 \
+        python android-tools tsu figlet sqlite 2>&1 \
         | grep -E "^(Unpacking|Setting up|is already)" | while read -r l; do echo "   $l"; done
 
-    # Pillow untuk pixel analysis dialog Roblox (ganti tesseract — tidak ada SIGFPE)
-    if ! python -c "from PIL import Image" 2>/dev/null; then
-        echo "   📦 Install Pillow..."
-        pip install pillow 2>&1 | tail -2
+    # Python libs: Pillow untuk pixel analysis, rich+pyfiglet untuk dashboard
+    local pip_needed=""
+    python -c "from PIL import Image" 2>/dev/null    || pip_needed="$pip_needed pillow"
+    python -c "from rich.console import Console" 2>/dev/null || pip_needed="$pip_needed rich"
+    python -c "import pyfiglet" 2>/dev/null          || pip_needed="$pip_needed pyfiglet"
+
+    if [ -n "$pip_needed" ]; then
+        echo "   📦 pip install$pip_needed..."
+        pip install $pip_needed 2>&1 | tail -3
     fi
 
     echo "✅ Dependency OK"
@@ -2464,6 +2530,184 @@ if [ "$(id -u)" != "0" ]; then
 fi
 
 ensure_deps
+
+# Tulis Python dashboard script ke ~/rbx_dashboard.py
+write_dashboard_script() {
+    cat > "$HOME/rbx_dashboard.py" << 'DASHEOF'
+#!/usr/bin/env python3
+"""
+RBX Monitor Dashboard — by Wardz
+Jalankan di session Termux terpisah:
+  python ~/rbx_dashboard.py com.roblox.client
+"""
+import json, os, sys, time
+from datetime import datetime
+
+try:
+    from rich.console import Console
+    from rich.live import Live
+    from rich.table import Table
+    from rich.panel import Panel
+    from rich.columns import Columns
+    from rich.text import Text
+    from rich.align import Align
+    from rich.rule import Rule
+    from rich import box
+    from rich.console import Group
+except ImportError:
+    print("Install: pip install rich"); sys.exit(1)
+
+try:
+    import pyfiglet
+    HEADER = pyfiglet.figlet_format("RBX Monitor", font="small").rstrip()
+except ImportError:
+    HEADER = "  RBX MONITOR"
+
+DASH_DIR = "/data/local/tmp/rbx_dash"
+REFRESH  = 3
+
+STATUS_STYLE = {
+    "online":  ("bright_green", "●  INGAME"),
+    "offline": ("yellow",       "○  OFFLINE"),
+    "joining": ("cyan",         "⟳  JOINING"),
+    "crashed": ("red",          "✗  CRASH"),
+    "idle":    ("dim",          "–  IDLE"),
+}
+
+def read_state(pkg):
+    sf = os.path.join(DASH_DIR, pkg.replace(".", "_") + ".json")
+    try:
+        with open(sf) as f: return json.load(f)
+    except: return {}
+
+def read_events(pkg, n=6):
+    ef = os.path.join(DASH_DIR, pkg.replace(".", "_") + "_events.jsonl")
+    try:
+        lines = open(ef).readlines()
+        return [json.loads(l) for l in lines[-n:]]
+    except: return []
+
+def sys_stats():
+    cpu = ram = temp = "N/A"
+    try:
+        tok = open("/proc/stat").readline().split()[1:]
+        vals = [int(x) for x in tok]
+        idle = vals[3]; total = sum(vals)
+        cpu = f"{max(0, round(100*(1-idle/total)))}%" if total else "N/A"
+    except: pass
+    try:
+        mem = {}
+        for l in open("/proc/meminfo"):
+            if ":" in l:
+                k, v = l.split(":", 1)
+                mem[k.strip()] = int(v.split()[0])
+        free  = mem.get("MemAvailable", 0) // 1024
+        total = mem.get("MemTotal", 0) // 1024
+        pct   = round(free / total * 100) if total else 0
+        ram   = f"{free}MB ({pct}%)"
+    except: pass
+    for tz in ["/sys/class/thermal/thermal_zone0/temp",
+               "/sys/class/thermal/thermal_zone1/temp"]:
+        try:
+            t = int(open(tz).read().strip())
+            temp = f"{t//1000}°C"; break
+        except: pass
+    return cpu, ram, temp
+
+def uptime_str(since_ts):
+    try:
+        s = int(time.time() - float(since_ts))
+        h, r = divmod(s, 3600); m, sec = divmod(r, 60)
+        return f"{h:02d}:{m:02d}:{sec:02d}"
+    except: return "--:--:--"
+
+def build(pkgs):
+    hdr = Align.center(
+        f"[bold cyan]{HEADER}[/bold cyan]\n"
+        f"[dim]by Wardz  •  {datetime.now():%H:%M:%S}[/dim]"
+    )
+
+    panels = []
+    for pkg in pkgs:
+        st    = read_state(pkg)
+        skey  = st.get("status", "idle")
+        color, label = STATUS_STYLE.get(skey, ("white", skey.upper()))
+        short = pkg.split(".")[-1] if "." in pkg else pkg
+
+        info = Table.grid(padding=(0, 1))
+        info.add_column(style="bold dim", min_width=10)
+        info.add_column()
+        info.add_row("Status",  f"[{color}]{label}[/{color}]")
+        info.add_row("Uptime",  uptime_str(st.get("ts")) if skey == "online" else "–")
+        info.add_row("Mode",    (st.get("mode") or "–").title())
+        if st.get("cpu"): info.add_row("CPU", st["cpu"])
+        if st.get("ram"): info.add_row("RAM", st["ram"])
+
+        ctr = Table(box=None, show_header=True, header_style="bold",
+                    padding=(0, 2))
+        ctr.add_column("🔄 Reconnect", justify="center")
+        ctr.add_column("💀 Crash",     justify="center")
+        ctr.add_row(
+            f"[cyan]{st.get('rc', 0)}[/cyan]",
+            f"[red]{st.get('cr', 0)}[/red]",
+        )
+
+        panels.append(Panel(
+            Group(info, "", ctr),
+            title=f"[bold]{short}[/bold]",
+            border_style=color, padding=(0, 1)
+        ))
+
+    pkg_cols = Columns(panels, equal=True, expand=True) if panels \
+               else Panel("[dim]Menunggu data...[/dim]", border_style="dim")
+
+    ev_lines = []
+    for pkg in pkgs:
+        for ev in read_events(pkg):
+            t     = ev.get("t", "?")
+            msg   = ev.get("ev", "")[:72]
+            etype = ev.get("type", "info")
+            c = {"success": "green", "error": "red",
+                 "warning": "yellow"}.get(etype, "white")
+            ev_lines.append(f"[dim]{t}[/dim]  [{c}]{msg}[/{c}]")
+    ev_text = "\n".join(ev_lines[-7:]) if ev_lines \
+              else "[dim]Belum ada event[/dim]"
+    ev_panel = Panel(ev_text, title="📝 Events",
+                     border_style="dim", padding=(0, 1))
+
+    cpu, ram, temp = sys_stats()
+    sg = Table.grid(padding=(0, 3))
+    sg.add_column(); sg.add_column(); sg.add_column()
+    sg.add_row(
+        f"CPU  [bold cyan]{cpu}[/bold cyan]",
+        f"RAM  [bold cyan]{ram}[/bold cyan]",
+        f"Temp [bold cyan]{temp}[/bold cyan]",
+    )
+    sys_panel = Panel(sg, title="🖥️ System",
+                      border_style="dim", padding=(0, 1))
+
+    footer = Align.center(
+        f"[dim]Refresh {REFRESH}s  •  Ctrl+C keluar[/dim]")
+
+    return Group(hdr, Rule(style="dim"),
+                 pkg_cols, ev_panel, sys_panel, footer)
+
+if __name__ == "__main__":
+    pkgs = sys.argv[1:] if len(sys.argv) > 1 else ["com.roblox.client"]
+    console = Console()
+    try:
+        with Live(console=console, refresh_per_second=1/REFRESH,
+                  screen=True) as live:
+            while True:
+                try: live.update(build(pkgs))
+                except Exception: pass
+                time.sleep(REFRESH)
+    except KeyboardInterrupt:
+        pass
+DASHEOF
+    chmod +x "$HOME/rbx_dashboard.py"
+}
+write_dashboard_script
 
 # Menu awal
 clr
@@ -2589,7 +2833,167 @@ fi
 find "${STATE_BASE_DIR}" -name "join_lock_*" -delete 2>/dev/null
 find "${STATE_BASE_DIR}" -name "crash_lock_*" -delete 2>/dev/null
 
+# ── Generate Python dashboard script ─────────────────────────────────────
+mkdir -p "$DASH_DIR" 2>/dev/null
+cat > "${DASH_DIR}/dashboard.py" << 'PYEOF'
+#!/usr/bin/env python3
+import json, time, os, sys
+from datetime import datetime
+try:
+    from rich.live        import Live
+    from rich.table       import Table
+    from rich.panel       import Panel
+    from rich.layout      import Layout
+    from rich.console     import Console
+    from rich.text        import Text
+    from rich.align       import Align
+    from rich.columns     import Columns
+    RICH = True
+except ImportError:
+    RICH = False
+
+try:
+    from pyfiglet import Figlet
+    FIGLET = True
+except ImportError:
+    FIGLET = False
+
+PKG      = sys.argv[1] if len(sys.argv) > 1 else ""
+DASH_DIR = "/data/local/tmp/rbx_dash"
+SAFE     = lambda p: ''.join(c if c.isalnum() else '_' for c in p)
+
+def pkgs():
+    files = [f for f in os.listdir(DASH_DIR) if f.endswith('.json') and not f.startswith('dashboard')]
+    return [f[:-5] for f in files]
+
+def state(pkg):
+    try:
+        with open(f"{DASH_DIR}/{pkg}.json") as f:
+            return json.load(f)
+    except:
+        return {"pkg": pkg, "status": "unknown", "event": "-",
+                "rc": 0, "cr": 0, "ts": 0, "cpu": "?", "ram": "?", "temp": "?"}
+
+def events(pkg, n=10):
+    try:
+        with open(f"{DASH_DIR}/{pkg}_events.jsonl") as f:
+            lines = f.readlines()
+        result = []
+        for line in reversed(lines):
+            try: result.append(json.loads(line.strip()))
+            except: pass
+            if len(result) >= n: break
+        return result
+    except:
+        return []
+
+def uptime(ts):
+    if not ts: return "?"
+    s = max(0, int(time.time()) - int(ts))
+    h, r = divmod(s, 3600)
+    m, _ = divmod(r, 60)
+    return f"{h}j {m}m"
+
+STATUS_COLOR = {"online": "green", "offline": "red", "crashed": "red",
+                "joining": "yellow", "unknown": "dim"}
+STATUS_ICON  = {"online": "●", "offline": "○", "crashed": "✖",
+                "joining": "◌", "unknown": "?"}
+EVENT_ICON   = {"success": "✅", "error": "❌", "warning": "⚠️", "info": "ℹ️"}
+
+def make_layout():
+    all_pkgs = pkgs() or ([SAFE(PKG)] if PKG else ["unknown"])
+
+    # Header
+    if FIGLET:
+        hdr = Figlet(font='small').renderText('SPHINX')
+    else:
+        hdr = 'SPHINX MONITOR'
+
+    header_panel = Panel(
+        Align.center(Text(hdr.rstrip(), style="bold cyan")),
+        subtitle=f"[dim]Roblox Auto Reconnect  |  {datetime.now().strftime('%H:%M:%S')}",
+        border_style="bright_blue", padding=(0, 2)
+    )
+
+    pkg_panels = []
+    all_events = []
+
+    for p in all_pkgs:
+        s = state(p)
+        st  = s.get("status", "unknown")
+        col = STATUS_COLOR.get(st, "dim")
+        ico = STATUS_ICON.get(st, "?")
+
+        t = Table.grid(padding=(0, 2))
+        t.add_column(style="bold dim", width=12)
+        t.add_column()
+        t.add_row("Status",   Text(f"{ico} {st.upper()}", style=f"bold {col}"))
+        t.add_row("Package",  Text(s.get("pkg", p), style="dim", overflow="fold"))
+        t.add_row("Uptime",   uptime(s.get("ts", 0)))
+        t.add_row("Reconnect",Text(f"🔄 {s.get('rc',0)}x", style="cyan"))
+        t.add_row("Crash",    Text(f"💥 {s.get('cr',0)}x", style="red"))
+        t.add_row("",         "")
+        t.add_row("CPU",      Text(s.get("cpu","?"), style="yellow"))
+        t.add_row("RAM",      Text(s.get("ram","?"), style="yellow"))
+        t.add_row("Suhu",     Text(s.get("temp","?"), style="yellow"))
+        t.add_row("",         "")
+        t.add_row("Last",     Text(s.get("event","-"), style="italic dim", overflow="fold"))
+
+        pkg_panels.append(Panel(t, title=f"[bold]{s.get('pkg',p)[-25:]}",
+                                border_style=col, padding=(0,1)))
+        all_events.extend(events(p, 10))
+
+    all_events.sort(key=lambda e: e.get("ts", 0), reverse=True)
+
+    ev_table = Table(show_header=False, box=None, padding=(0,1), expand=True)
+    ev_table.add_column(style="dim", width=9, no_wrap=True)
+    ev_table.add_column(width=3,  no_wrap=True)
+    ev_table.add_column(overflow="fold")
+    for ev in all_events[:12]:
+        tp = ev.get("type","info")
+        ev_table.add_row(
+            ev.get("t",""),
+            EVENT_ICON.get(tp,"ℹ️"),
+            Text(ev.get("ev","-"),
+                 style=("green" if tp=="success" else "red" if tp=="error" else "dim"))
+        )
+
+    layout = Layout()
+    layout.split_column(
+        Layout(header_panel, name="header", size=6 if FIGLET else 4),
+        Layout(name="main"),
+        Layout(Panel(ev_table, title="[bold]Recent Events", border_style="dim"),
+               name="events", size=min(len(all_events)+2, 14)),
+    )
+    layout["main"].update(Columns(pkg_panels, equal=True, expand=True))
+    return layout
+
+if __name__ == "__main__":
+    if not RICH:
+        print("Install rich dulu: pip install rich")
+        sys.exit(1)
+    console = Console()
+    console.print(f"[dim]Dashboard: {DASH_DIR}  |  Ctrl+C untuk keluar[/dim]")
+    try:
+        with Live(make_layout(), refresh_per_second=1, screen=True, console=console) as live:
+            while True:
+                time.sleep(2)
+                live.update(make_layout())
+    except KeyboardInterrupt:
+        console.print("\n[dim]Dashboard ditutup.[/dim]")
+PYEOF
+chmod +x "${DASH_DIR}/dashboard.py" 2>/dev/null
+
 log "🚀 Ready untuk monitoring"
+log "📊 Dashboard: buka Termux session baru → python ~/rbx_dashboard.py $PKG1"
+echo ""
+echo ""
+echo "  ┌─────────────────────────────────────────────┐"
+echo "  │  📊 DASHBOARD tersedia di sesi Termux baru  │"
+echo "  │  Jalankan:                                   │"
+echo "  │    python ${DASH_DIR}/dashboard.py           │"
+echo "  └─────────────────────────────────────────────┘"
+echo ""
 echo ""
 
 # Abaikan SIGHUP — cegah script mati saat Termux di-background atau
