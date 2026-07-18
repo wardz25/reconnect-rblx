@@ -2292,131 +2292,115 @@ error_code_monitor() {
 ocr_error_monitor() {
     local pkg=$1
     local cfg_file=$2
-    local ocr_interval=25   # cek layar setiap 25 detik
 
-    # Cek tesseract tersedia — kalau tidak, fungsi ini langsung exit
-    # (tidak perlu loop, keep-alive di MAIN tidak akan restart karena
-    # kita pakai return bukan exit, dan keep-alive cek kill -0 $PID)
-    if ! command -v tesseract >/dev/null 2>&1; then
-        log "📦 ocr_error_monitor: tesseract belum ada — install otomatis..."
-        pkg install -y tesseract 2>&1 | grep -E "^(Unpacking|Setting up)" | while read -r l; do log "   $l"; done
-        # eng language data — nama package berbeda di beberapa Termux versi
-        pkg install -y tesseract-ocr-data-eng 2>/dev/null \
-            || pkg install -y tesseract-lang 2>/dev/null \
-            || true
-        if ! command -v tesseract >/dev/null 2>&1; then
-            log "⚠️ ocr_error_monitor: gagal install tesseract — idle"
-            log "   Install manual: pkg install tesseract"
+    # Cek Python tersedia
+    local PYTHON=""
+    command -v python3 >/dev/null 2>&1 && PYTHON="python3"
+    command -v python  >/dev/null 2>&1 && PYTHON="${PYTHON:-python}"
+
+    if [ -z "$PYTHON" ]; then
+        log "⚠️ ocr_error_monitor: python tidak tersedia — idle"
+        log "   Install: pkg install python"
+        while true; do sleep 86400; done
+        return
+    fi
+
+    # Cek Pillow tersedia
+    if ! $PYTHON -c "from PIL import Image" 2>/dev/null; then
+        log "📦 ocr_error_monitor: install Pillow..."
+        pip install pillow 2>&1 | tail -2 | while read -r l; do log "   $l"; done
+        if ! $PYTHON -c "from PIL import Image" 2>/dev/null; then
+            log "⚠️ ocr_error_monitor: gagal install Pillow — idle"
+            log "   Install manual: pip install pillow"
             while true; do sleep 86400; done
             return
         fi
-        log "✅ ocr_error_monitor: tesseract siap"
+        log "✅ ocr_error_monitor: Pillow siap"
     fi
 
-    # Nama file sementara pakai pkg (ganti titik → underscore biar aman)
-    local safe_pkg="${pkg//[.]/_}"
-    local scr_file="/data/local/tmp/rbx_ocr_${safe_pkg}.png"
-    local txt_base="/data/local/tmp/rbx_ocr_${safe_pkg}_out"
+    local ocr_interval=20
+    local scr_file="/data/local/tmp/rbx_sc_${pkg//[^a-zA-Z0-9]/_}.png"
 
-    log "📸 ocr_error_monitor: aktif (interval: ${ocr_interval}s)"
+    log "📸 ocr_error_monitor: aktif via Python PIL (interval: ${ocr_interval}s, tanpa tesseract)"
 
     while true; do
         sleep "$ocr_interval"
 
-        # Skip kalau join lagi berlangsung
-        if is_joining "$pkg"; then
-            continue
-        fi
+        is_joining "$pkg" && continue
 
-        # Roblox harus running
         local pid
         pid=$(get_pid_for_pkg "$pkg")
         [ -z "$pid" ] && continue
 
-        # Roblox harus di foreground — kalau di background, screencap
-        # akan tangkap layar lain dan OCR tidak relevan
+        # Cek Roblox di foreground
         dumpsys activity top 2>/dev/null | grep -q "ACTIVITY ${pkg}" || continue
 
-        # Ambil screenshot
+        # Wake screen
+        input keyevent KEYCODE_WAKEUP 2>/dev/null
+        sleep 0.3
+
         screencap -p "$scr_file" 2>/dev/null
         [ -f "$scr_file" ] || continue
 
-        # PRE-PROCESS IMAGE sebelum OCR:
-        # screencap output PNG RGBA 32-bit → tesseract SIGFPE di ARM karena
-        # format tidak di-support langsung. Fix: convert ke grayscale 8-bit
-        # + resize 40% via ImageMagick. Grayscale juga meningkatkan akurasi
-        # OCR untuk teks putih di background gelap (dialog disconnect Roblox).
-        local ocr_input="$scr_file"
-        local proc_file="${scr_file%.png}_gray.png"
-        if command -v convert >/dev/null 2>&1; then
-            convert "$scr_file" \
-                -colorspace Gray \
-                -resize 40% \
-                -depth 8 \
-                -auto-level \
-                "$proc_file" 2>/dev/null \
-                && ocr_input="$proc_file"
-        fi
+        # Python PIL: pixel analysis tanpa OCR engine
+        # Deteksi dialog disconnect Roblox via karakteristik warna:
+        #   - Background dialog: abu-abu gelap ~RGB(40-70)
+        #   - Overlay luar: sangat gelap ~RGB(0-30)
+        #   - Teks & tombol: putih terang ~RGB(200-255)
+        local result
+        result=$($PYTHON - "$scr_file" 2>/dev/null << 'PYEOF'
+import sys
+try:
+    from PIL import Image
+    img = Image.open(sys.argv[1]).convert('RGB')
+    w, h = img.size
 
-        # Wrap tesseract di `bash -c` agar pesan "Floating point exception"
-        # dari sinyal SIGFPE masuk ke stderr bash subprocess → ke /dev/null.
-        # Tanpa ini, bash outer cetak pesan sinyal ke terminal meskipun
-        # tesseract sendiri sudah punya 2>/dev/null.
-        # --oem 3 = auto-select engine terbaik yang tersedia (legacy/LSTM)
-        # --psm 11 = sparse text, tidak asumsi layout — cocok dialog game
-        if ! bash -c \
-            'tesseract "$1" "$2" -l eng --oem 3 --psm 11 quiet' \
-            -- "$ocr_input" "$txt_base" 2>/dev/null; then
-            rm -f "$scr_file" "$proc_file" "${txt_base}.txt" 2>/dev/null
-            continue
-        fi
-        local txt_file="${txt_base}.txt"
+    # Crop area tengah: 30-70% lebar, 25-75% tinggi
+    x1, x2 = int(w * 0.30), int(w * 0.70)
+    y1, y2 = int(h * 0.25), int(h * 0.75)
+    region = img.crop((x1, y1, x2, y2))
+    pixels = list(region.getdata())
+    total  = len(pixels)
 
-        if [ ! -f "$txt_file" ]; then
-            rm -f "$scr_file" 2>/dev/null
-            continue
-        fi
+    dark_grey = 0
+    very_dark = 0
+    bright    = 0
 
-        # Cari pola "Error Code NNN" atau "Error NNN" atau "(NNN)" dekat kata error/disconnect
-        # Pola primer: "Error Code" diikuti angka
-        local detected_code=""
-        detected_code=$(grep -oiE "error.{0,8}code.{0,8}([0-9]{3,4})" "$txt_file" \
-            | grep -oE "[0-9]{3,4}" | head -1)
+    for r, g, b in pixels:
+        grey_ness  = abs(r - g) + abs(g - b)
+        brightness = (r + g + b) / 3
+        if grey_ness < 25:
+            if 35 <= brightness <= 80:
+                dark_grey += 1
+            elif brightness < 20:
+                very_dark += 1
+            elif brightness > 195:
+                bright += 1
 
-        # Pola sekunder: salah satu error code list di dekat kata disconnect/error
-        if [ -z "$detected_code" ]; then
-            # Hanya match kalau ada kata konteks disconnect/error di baris yang sama
-            while IFS= read -r ocr_line; do
-                echo "$ocr_line" | grep -qiE "disconnect|error|kicked|connection" || continue
-                detected_code=$(printf '%s' "$ocr_line" \
-                    | grep -oE "(^|[^0-9])(${ERROR_CODE_LIST})([^0-9]|$)" \
-                    | grep -oE "[0-9]+" | head -1)
-                [ -n "$detected_code" ] && break
-            done < "$txt_file"
-        fi
+    r_dark  = dark_grey / total
+    r_black = very_dark / total
+    r_white = bright    / total
 
-        rm -f "$scr_file" "$txt_file" 2>/dev/null
+    if r_dark > 0.18 and r_black > 0.08 and r_white > 0.04:
+        print("DIALOG")
+    else:
+        print("CLEAR")
+except Exception:
+    print("ERROR")
+PYEOF
+)
 
-        [ -z "$detected_code" ] && continue
+        rm -f "$scr_file" 2>/dev/null
+        [ "$result" = "DIALOG" ] || continue
 
-        # Error dialog terdeteksi di layar
-        if ! acquire_crash_lock "$pkg"; then
-            log "⏭️ ocr_error_monitor: handler lain aktif — skip (Code $detected_code)"
-            continue
-        fi
+        is_joining "$pkg" && continue
+        acquire_crash_lock "$pkg" || continue
 
-        log "📸 OCR: Error Code $detected_code terdeteksi di layar — auto-rejoin"
-        send_discord_notification "disconnect" "Error Code: $detected_code (OCR layar)" "$pkg"
+        log "📸 screen_monitor: Disconnect dialog terdeteksi (PIL pixel analysis)"
+        send_discord_notification "disconnect" "Disconnect dialog terdeteksi di layar" "$pkg"
 
-        sleep 2
-        source "$cfg_file" 2>/dev/null || true
-
-        if [ "${DETEKSI_ERROR_CODE:-1}" != "1" ]; then
-            log "ℹ️ DETEKSI_ERROR_CODE=OFF — tidak auto-rejoin"
-            release_crash_lock "$pkg"
-            continue
-        fi
-
+        sleep 3
+        source "$cfg_file" 2>/dev/null
         local active_url
         active_url=$(get_active_url "$MODE" "$URL")
         join_server "$pkg" "$active_url" "$MODE"
@@ -2460,8 +2444,16 @@ open_second_package() {
 
 ensure_deps() {
     echo "🔧 Cek dependency..."
-    pkg install -y curl wget bash coreutils procps termux-tools imagemagick 2>&1 \
+    pkg install -y curl wget bash coreutils procps termux-tools \
+        python android-tools tsu 2>&1 \
         | grep -E "^(Unpacking|Setting up|is already)" | while read -r l; do echo "   $l"; done
+
+    # Pillow untuk pixel analysis dialog Roblox (ganti tesseract — tidak ada SIGFPE)
+    if ! python -c "from PIL import Image" 2>/dev/null; then
+        echo "   📦 Install Pillow..."
+        pip install pillow 2>&1 | tail -2
+    fi
+
     echo "✅ Dependency OK"
     echo ""
 }
