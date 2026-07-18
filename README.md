@@ -50,7 +50,7 @@ bash ~/roblox_reconnect.sh
 | `python` | Runtime untuk screen detection |
 | `android-tools` | `screencap`, `input`, `dumpsys` |
 | `tsu` | Root helper — `su` tanpa terminal terpisah |
-| `pillow` (pip) | Pixel analysis dialog disconnect — ganti tesseract, tidak SIGFPE |
+| `pillow` (pip) | Pixel analysis dialog disconnect |
 
 ---
 
@@ -67,7 +67,7 @@ bash ~/roblox_reconnect.sh
 
 ## 📸 Screen Monitor
 
-Script pakai `screencap` + Python Pillow untuk deteksi dialog disconnect Roblox. Pillow di-install otomatis. Tidak ada tesseract, tidak ada SIGFPE.
+Script pakai `screencap` + Python Pillow untuk deteksi dialog disconnect Roblox. Pillow di-install otomatis.
 
 > **Catatan:** Layar device harus tetap nyala saat monitoring agar OCR bisa baca layar.
 
