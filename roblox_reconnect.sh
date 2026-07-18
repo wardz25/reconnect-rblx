@@ -2505,19 +2505,23 @@ open_second_package() {
 
 ensure_deps() {
     echo "🔧 Cek dependency..."
-    pkg install -y curl wget bash coreutils procps termux-tools \
-        python android-tools tsu figlet sqlite 2>&1 \
-        | grep -E "^(Unpacking|Setting up|is already)" | while read -r l; do echo "   $l"; done
 
-    # Python libs: Pillow untuk pixel analysis, rich+pyfiglet untuk dashboard
+    # Pillow WAJIB via pkg, bukan pip — pip akan compile dari source
+    # (butuh C compiler, bisa 5-10 menit, dan sering gagal di ARM karena
+    # ABI mismatch). pkg install pakai pre-built binary → selesai < 10 detik.
+    pkg install -y curl wget bash coreutils procps termux-tools \
+        python android-tools tsu figlet sqlite python-pillow 2>&1 \
+        | grep -E "^(Unpacking|Setting up|is already)" \
+        | while read -r l; do echo "   $l"; done
+
+    # rich dan pyfiglet = pure Python (tidak ada C extension) → pip aman dan cepat
     local pip_needed=""
-    python -c "from PIL import Image" 2>/dev/null    || pip_needed="$pip_needed pillow"
     python -c "from rich.console import Console" 2>/dev/null || pip_needed="$pip_needed rich"
-    python -c "import pyfiglet" 2>/dev/null          || pip_needed="$pip_needed pyfiglet"
+    python -c "import pyfiglet"                 2>/dev/null || pip_needed="$pip_needed pyfiglet"
 
     if [ -n "$pip_needed" ]; then
         echo "   📦 pip install$pip_needed..."
-        pip install $pip_needed 2>&1 | tail -3
+        pip install --quiet $pip_needed
     fi
 
     echo "✅ Dependency OK"
@@ -2985,83 +2989,61 @@ PYEOF
 chmod +x "${DASH_DIR}/dashboard.py" 2>/dev/null
 
 log "🚀 Ready untuk monitoring"
-log "📊 Dashboard: buka Termux session baru → python ~/rbx_dashboard.py $PKG1"
-echo ""
-echo ""
-echo "  ┌─────────────────────────────────────────────┐"
-echo "  │  📊 DASHBOARD tersedia di sesi Termux baru  │"
-echo "  │  Jalankan:                                   │"
-echo "  │    python ${DASH_DIR}/dashboard.py           │"
-echo "  └─────────────────────────────────────────────┘"
-echo ""
 echo ""
 
-# Abaikan SIGHUP — cegah script mati saat Termux di-background atau
-# session su di-hangup oleh Android. Tanpa ini, LMK / screen off bisa
-# kirim SIGHUP ke proses ini → script exit ke shell tiba-tiba.
+# Abaikan SIGHUP
 trap '' SIGHUP
 
-# Outer restart loop: kalau keep-alive loop keluar karena apapun
-# (sinyal, error sleep, edge case), restart seluruh monitoring block
-# tanpa kembali ke menu. Script tidak pernah exit ke Termux shell.
-while true; do
+# PID files agar keep-alive subshell bisa track + restart monitor
+RBX_PID_DIR="/data/local/tmp/rbx_pids_${PKG1//[^a-zA-Z0-9]/_}"
+mkdir -p "$RBX_PID_DIR" 2>/dev/null
 
-# Start monitors
-monitor_events "$PKG1" "${CONFIG_BASE_DIR}/roblox_config_${PKG1}.cfg" &
-MONITOR_PID=$!
+_mon_start() {
+    local name=$1; shift
+    "$@" &
+    echo $! > "$RBX_PID_DIR/$name"
+}
 
-crash_monitor "$PKG1" "${CONFIG_BASE_DIR}/roblox_config_${PKG1}.cfg" &
-CRASH_PID=$!
+_mon_alive() {
+    local pid; pid=$(cat "$RBX_PID_DIR/$1" 2>/dev/null)
+    [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null
+}
 
-logcat_crash_detector "$PKG1" "${CONFIG_BASE_DIR}/roblox_config_${PKG1}.cfg" &
-LOGCAT_CRASH_PID=$!
+# Launch semua monitor
+_mon_start monitor  monitor_events         "$PKG1" "${CONFIG_BASE_DIR}/roblox_config_${PKG1}.cfg"
+_mon_start crash    crash_monitor          "$PKG1" "${CONFIG_BASE_DIR}/roblox_config_${PKG1}.cfg"
+_mon_start logcat   logcat_crash_detector  "$PKG1" "${CONFIG_BASE_DIR}/roblox_config_${PKG1}.cfg"
+_mon_start errcode  error_code_monitor     "$PKG1" "${CONFIG_BASE_DIR}/roblox_config_${PKG1}.cfg"
+_mon_start watchdog stuck_watchdog         "$PKG1" "${CONFIG_BASE_DIR}/roblox_config_${PKG1}.cfg"
+_mon_start ocr      ocr_error_monitor      "$PKG1" "${CONFIG_BASE_DIR}/roblox_config_${PKG1}.cfg"
 
-error_code_monitor "$PKG1" "${CONFIG_BASE_DIR}/roblox_config_${PKG1}.cfg" &
-ERROR_CODE_PID=$!
+# Keep-alive di background — cek + restart monitor tiap CHECK_INTERVAL
+(
+    trap '' SIGHUP
+    CFG="${CONFIG_BASE_DIR}/roblox_config_${PKG1}.cfg"
+    while true; do
+        _mon_alive monitor  || { log "⚠️ monitor_events mati — restart";        _mon_start monitor  monitor_events        "$PKG1" "$CFG"; }
+        _mon_alive crash    || { log "⚠️ crash_monitor mati — restart";         _mon_start crash    crash_monitor         "$PKG1" "$CFG"; }
+        _mon_alive logcat   || { log "⚠️ logcat_crash_detector mati — restart"; _mon_start logcat   logcat_crash_detector "$PKG1" "$CFG"; }
+        _mon_alive errcode  || { log "⚠️ error_code_monitor mati — restart";    _mon_start errcode  error_code_monitor    "$PKG1" "$CFG"; }
+        _mon_alive watchdog || { log "⚠️ stuck_watchdog mati — restart";        _mon_start watchdog stuck_watchdog        "$PKG1" "$CFG"; }
+        _mon_alive ocr      || { log "⚠️ ocr_error_monitor mati — restart";     _mon_start ocr      ocr_error_monitor     "$PKG1" "$CFG"; }
+        sleep "${CHECK_INTERVAL:-10}"
+    done
+) &
+echo $! > "$RBX_PID_DIR/keepalive"
 
-stuck_watchdog "$PKG1" "${CONFIG_BASE_DIR}/roblox_config_${PKG1}.cfg" &
-STUCK_WD_PID=$!
+# Dashboard langsung di foreground — tidak butuh session Termux kedua
+sleep 1
+if command -v python >/dev/null 2>&1; then
+    python "${DASH_DIR}/dashboard.py" "$PKG1"
+else
+    log "⚠️ Python tidak tersedia — fallback ke wait"
+    wait
+fi
 
-ocr_error_monitor "$PKG1" "${CONFIG_BASE_DIR}/roblox_config_${PKG1}.cfg" &
-OCR_PID=$!
-
-# Keep alive — restart monitor jika mati
-while true; do
-    if ! kill -0 "$MONITOR_PID" 2>/dev/null; then
-        log "⚠️ monitor_events mati — restart otomatis"
-        monitor_events "$PKG1" "${CONFIG_BASE_DIR}/roblox_config_${PKG1}.cfg" &
-        MONITOR_PID=$!
-    fi
-    if ! kill -0 "$CRASH_PID" 2>/dev/null; then
-        log "⚠️ crash_monitor mati — restart otomatis"
-        crash_monitor "$PKG1" "${CONFIG_BASE_DIR}/roblox_config_${PKG1}.cfg" &
-        CRASH_PID=$!
-    fi
-    if ! kill -0 "$LOGCAT_CRASH_PID" 2>/dev/null; then
-        log "⚠️ logcat_crash_detector mati — restart otomatis"
-        logcat_crash_detector "$PKG1" "${CONFIG_BASE_DIR}/roblox_config_${PKG1}.cfg" &
-        LOGCAT_CRASH_PID=$!
-    fi
-    if ! kill -0 "$ERROR_CODE_PID" 2>/dev/null; then
-        log "⚠️ error_code_monitor mati — restart otomatis"
-        error_code_monitor "$PKG1" "${CONFIG_BASE_DIR}/roblox_config_${PKG1}.cfg" &
-        ERROR_CODE_PID=$!
-    fi
-    if ! kill -0 "$STUCK_WD_PID" 2>/dev/null; then
-        log "⚠️ stuck_watchdog mati — restart otomatis"
-        stuck_watchdog "$PKG1" "${CONFIG_BASE_DIR}/roblox_config_${PKG1}.cfg" &
-        STUCK_WD_PID=$!
-    fi
-    if ! kill -0 "$OCR_PID" 2>/dev/null; then
-        log "⚠️ ocr_error_monitor mati — restart otomatis"
-        ocr_error_monitor "$PKG1" "${CONFIG_BASE_DIR}/roblox_config_${PKG1}.cfg" &
-        OCR_PID=$!
-    fi
-    sleep "${CHECK_INTERVAL:-10}"
-done
-
-# Kalau inner loop keluar (seharusnya tidak pernah), log dan restart semua
-log "⚠️ Keep-alive loop keluar — restart monitoring block..."
-sleep 5
-
-done
+# Kalau dashboard di-close (Ctrl+C) — monitoring tetap jalan di background
+echo ""
+log "📊 Dashboard ditutup — monitoring lanjut di background"
+log "   Buka lagi: python ${DASH_DIR}/dashboard.py $PKG1"
+wait
