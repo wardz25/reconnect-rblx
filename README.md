@@ -1,68 +1,92 @@
-# ⚒️ Roblox Auto Reconnect Tools
-
-**Automatic Detection of Disconnects, Crashes, and Freezes for Roblox on Android**  
-*Open Source — Built with bash & Termux*
+# 🔄 Roblox Auto Reconnect + Auto Relog
+**by Wardz** — Auto reconnect, crash recovery, error code detection via OCR, Discord webhook notification.
 
 ---
 
-## 📖 About These Tools
+## 📋 Requirements
 
-These tools are designed to keep your Roblox account *online* 24/7, without worrying about disconnects or crashes.
-
-> 💡 These tools are an optimized version of the `roblox_reconnect.sh` script.
-
----
-
-## ✅ Requirements
-
-| Requirement | Description |
-|-----------|------------|
-| **Android Device** | *Rooted* (with `su` access) |
-| **Termux** | Version from **F-Droid** (not the Play Store) |
-| **Storage** | Storage permission (`termux-setup-storage`) |
-| **Internet Connection** | Stable, for downloading dependencies and accessing Roblox |
+- Android (rooted)
+- Termux
+- Roblox terinstall (official atau clone app)
 
 ---
 
-## 📥 Installation
+## ⚡ Install
 
-Follow these steps carefully:
+### 1. Install Termux dependency
 
-### 1. Install Termux from F-Droid
-Download and install Termux from [F-Droid](https://f-droid.org/en/packages/com.termux/).  
-> ⚠️ **Do not use the Play Store version** because it does not support all the required features.
-
-### 2. Open Termux and Run the Command to Install Dependencies
-Copy and paste the command below (one line):
+Buka Termux, jalankan:
 
 ```bash
-pkg update -y && pkg upgrade -y && pkg install -y curl wget bash coreutils procps termux-tools tesseract tesseract-ocr-data-eng
+pkg update -y && pkg upgrade -y && pkg install -y curl wget bash coreutils procps termux-tools python android-tools tsu && pip install pillow
 ```
-> When prompted with Y/N/D, type Y (Yes) and press Enter.
 
-### 3. Grant Storage Permissions
-```
-termux-setup-storage
-```
-> Follow the on-screen instructions to grant access to storage.
+### 2. Download script
 
-### 4. Make Sure Root Is Working
-Your device must be rooted. Check with the command:
+```bash
+curl -o ~/roblox_reconnect.sh https://raw.githubusercontent.com/wardz25/reconnect-rblx/main/roblox_reconnect.sh
+```
 
-```
-su
-```
-> If the # prompt appears, root access is successful. Type exit to return to the normal shell.
+### 3. Jalankan
 
-### 5. Download the Script
-```
-curl -o ~/roblox_reconnect.sh https://raw.githubusercontent.com/wardz25/reconnect-rblx/refs/heads/main/roblox_reconnect.sh
-```
-### 6. Set Execution Permissions
-```
-chmod +x ~/roblox_reconnect.sh
-```
-### 7. Run the Script for the First Time
-```
+```bash
 bash ~/roblox_reconnect.sh
 ```
+
+> Script otomatis minta root saat pertama kali dijalankan.
+
+---
+
+## 📦 Dependency Detail
+
+| Package | Fungsi |
+|---|---|
+| `curl` | Kirim Discord webhook notification |
+| `wget` | Download fallback |
+| `bash` | Shell eksplisit (bukan sh default Termux) |
+| `coreutils` | `date`, `sleep`, `awk`, `grep` versi GNU |
+| `procps` | `ps` untuk filter PID dengan reliable |
+| `termux-tools` | `termux-wake-lock` agar Termux tidak di-kill Android |
+| `python` | Runtime untuk screen detection |
+| `android-tools` | `screencap`, `input`, `dumpsys` |
+| `tsu` | Root helper — `su` tanpa terminal terpisah |
+| `pillow` (pip) | Pixel analysis dialog disconnect — ganti tesseract, tidak SIGFPE |
+
+---
+
+## 🔍 Fitur
+
+- **Auto reconnect** — deteksi disconnect & rejoin otomatis
+- **Crash recovery** — deteksi Roblox force-close & relaunch
+- **OCR error monitor** — baca dialog error code langsung dari layar via `screencap + tesseract`
+- **Discord webhook** — notifikasi status dengan Discord native timestamp
+- **Multi-package** — support clone app (2 package sekaligus via floating window)
+- **Private server support** — mode URL private server
+
+---
+
+## 📸 Screen Monitor
+
+Script pakai `screencap` + Python Pillow untuk deteksi dialog disconnect Roblox. Pillow di-install otomatis. Tidak ada tesseract, tidak ada SIGFPE.
+
+> **Catatan:** Layar device harus tetap nyala saat monitoring agar OCR bisa baca layar.
+
+---
+
+## 🔔 Discord Webhook (Opsional)
+
+Setup saat pertama kali jalankan script — akan ada prompt untuk masukkan webhook URL.
+
+Notifikasi yang dikirim:
+- Disconnect / reconnect
+- Crash & relaunch
+- Error code terdeteksi (via OCR)
+- Status device (CPU, RAM, suhu)
+
+---
+
+## ⚠️ Catatan
+
+- Script harus dijalankan sebagai root (`su` otomatis via Termux)
+- Layar harus nyala untuk OCR error monitor aktif
+- Tested di Android 12+ dengan Termux dari F-Droid
