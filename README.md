@@ -6,7 +6,7 @@
 ## 📋 Requirements
 
 - Android (rooted)
-- Termux
+- Termux [Click Here](https://f-droid.org/en/packages/com.termux/)
 - Roblox terinstall (official atau clone app)
 
 ---
@@ -20,14 +20,28 @@ Buka Termux, jalankan:
 ```bash
 pkg update -y && pkg upgrade -y && pkg install -y curl wget bash coreutils procps termux-tools python android-tools tsu && pip install pillow
 ```
+### 2. Grant Storage Permissions
 
-### 2. Download script
+```
+termux-setup-storage
+```
+
+## 📱 3. Enable root in your device and then give access with this command
+Your device must be rooted.
+
+```
+su 
+```
+ If the # prompt appears, root access is successful. Type exit to return to the normal shell.
+
+
+### 4. Download Script
 
 ```bash
 curl -o ~/roblox_reconnect.sh https://raw.githubusercontent.com/wardz25/reconnect-rblx/main/roblox_reconnect.sh
 ```
 
-### 3. Jalankan
+### 5. Run the Script
 
 ```bash
 bash ~/roblox_reconnect.sh
