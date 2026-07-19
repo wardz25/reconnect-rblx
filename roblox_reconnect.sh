@@ -1708,119 +1708,15 @@ verify_ingame_stable() {
 }
 
 monitor_events() {
-    local pkg=$1
-    local cfg_file=$2
-
-    # Outer loop: restart otomatis kalau logcat pipe tutup (disconnect,
-    # Android kill proses logcat, dll). Sebelumnya fungsi ini langsung
-    # return saat pipe selesai → background process mati → wait di MAIN
-    # kehabisan job → script exit ke Termux shell.
-    while true; do
-        # BUG FIX: sama seperti logcat_crash_detector — tanpa -T, logcat
-        # dump seluruh buffer historis dulu tiap kali loop restart, bisa
-        # re-trigger sinyal disconnect LAMA yang sudah lama selesai.
-        local start_ts
-        start_ts=$(date '+%m-%d %H:%M:%S.000')
-
-        # v3.1 FIX (bug "disconnect tidak bekerja sama sekali"):
-        # Prefilter sebelumnya terlalu spesifik — "Sending disconnect with
-        # reason", "Connection lost", "Disconnected from server" adalah
-        # string literal yang mungkin TIDAK PERNAH muncul di logcat Roblox
-        # versi terbaru / ROM tertentu. Kalau prefilter di level grep tidak
-        # pernah match → inner while read tidak pernah dapat baris → fungsi
-        # ini kelihatan "mati" padahal sebenarnya hanya grep-nya yang miss.
-        #
-        # Fix 3 lapis:
-        # (1) Prefilter diperluas: tangkap semua baris logcat yang mengandung
-        #     nama package ATAU kata-kata yang mungkin terkait disconnect.
-        #     Inner bash-check yang menentukan apakah baris itu beneran
-        #     disconnect atau bukan (bukan outer grep).
-        # (2) acquire_crash_lock sebelum handle: koordinasi dengan
-        #     error_code_monitor & stuck_watchdog yang bisa race untuk event
-        #     yang sama → cegah double-reconnect & double-webhook.
-        # (3) break inner loop setelah join selesai: tanpa ini, logcat yang
-        #     sudah terbuffer selama proses join (bisa menit-an) dibaca saat
-        #     loop lanjut — baris "Connection lost" lama yang terbuffer
-        #     langsung re-trigger reconnect → webhook + rejoin kedua/ketiga.
-        #
-        # v3.2 FIX (root cause "randomly kill" / loop rejoin):
-        # (4) _seen_joining flag: kalau MONITOR LAIN yang trigger rejoin
-        #     (bukan monitor_events sendiri), logcat pipe kita tetap jalan dan
-        #     akumula baris selama join berlangsung. Saat join lock dilepas,
-        #     baris-baris itu langsung dibaca → false disconnect signal.
-        #     Fix: tandai kalau join pernah aktif di iterasi ini. Begitu join
-        #     selesai (is_joining → false), LANGSUNG break → restart pipe
-        #     dengan start_ts baru → buffer lama tidak pernah diproses.
-
-        local _seen_joining=0
-
-        while read -r line; do
-            # ── Inner filter ketat: hanya explicit disconnect signal ──────
-            # "Connection error" dan "Network error" DIHAPUS — terlalu broad,
-            # match normal network activity saat loading private server dan
-            # menyebabkan false-positive rejoin. OCR monitor yang handle
-            # deteksi error code (277/278/279 dll) dari dialog layar.
-            local reason=""
-
-            if echo "$line" | grep -qiE "Sending disconnect"; then
-                reason="Sending disconnect"
-            elif echo "$line" | grep -qiE "Connection lost|Lost connection"; then
-                reason="Connection lost"
-            elif echo "$line" | grep -qiE "Disconnected from server"; then
-                reason="Disconnected"
-            elif echo "$line" | grep -qiE "kicked from game|kick.*reason"; then
-                reason="Kicked"
-            fi
-
-            # Bukan sinyal disconnect yang dikenal — abaikan
-            [ -n "$reason" ] || continue
-
-            # Skip jika join sedang berlangsung — signal disconnect bisa muncul
-            # saat Roblox berpindah server / loading private server baru
-            if is_joining "$pkg"; then
-                _seen_joining=1
-                log "⏭️ monitor_events: join aktif — abaikan '$reason'"
-                continue
-            fi
-
-            # v3.2: join BARU SELESAI — buffer logcat dari proses join masih
-            # antri di pipe. Restart pipe agar baris lama tidak ke-proses.
-            if [ "$_seen_joining" = "1" ]; then
-                _seen_joining=0
-                log "⏭️ monitor_events: join baru selesai — reset pipe (buang buffer join)"
-                break
-            fi
-
-            # Koordinasi dengan monitor lain — cegah double-handle & double-webhook
-            if ! acquire_crash_lock "$pkg"; then
-                log "⏭️ monitor_events: handler lain sedang aktif — skip ($reason)"
-                continue
-            fi
-
-            log "❌ DC via monitor_events: $reason" "error"
-            update_dashboard_state "$pkg" "offline" "Disconnect: $reason"
-            send_discord_notification "disconnect" "$reason" "$pkg"
-
-            sleep 3
-            source "$cfg_file" 2>/dev/null
-            local active_url
-            active_url=$(get_active_url "$MODE" "$URL")
-            join_server "$pkg" "$active_url" "$MODE"
-            wait_ingame "$pkg"
-            verify_ingame_stable "$pkg" "$cfg_file"
-            release_crash_lock "$pkg"
-
-            # FIX: break inner loop setelah join — jangan baca sisa buffer
-            # logcat yang terbuffer selama proses join berlangsung
-            break
-
-        done < <(logcat -T "$start_ts" -b main -b system -v time 2>/dev/null \
-            | grep --line-buffered -iE \
-                "Sending disconnect|Connection lost|Lost connection|Disconnected from server|kicked from game|kick.*reason|${pkg}.*(disconnect|kicked)")
-
-        sleep 3
-    done
+    # DINONAKTIFKAN: Roblox tidak mengirim string "Sending disconnect",
+    # "Connection lost", "Disconnected from server" ke logcat — monitor
+    # ini tidak pernah fire untuk event yang sebenarnya.
+    # Deteksi disconnect sekarang via:
+    #   - ocr_error_monitor (PIL pixel analysis dialog di layar)
+    #   - crash_monitor + logcat_crash_detector (PID hilang / System.exit)
+    while true; do sleep 86400; done
 }
+
 
 crash_monitor() {
     local pkg=$1
@@ -2354,121 +2250,144 @@ ocr_error_monitor() {
     local pkg=$1
     local cfg_file=$2
 
-    # Cek Python tersedia
     local PYTHON=""
     command -v python3 >/dev/null 2>&1 && PYTHON="python3"
     command -v python  >/dev/null 2>&1 && PYTHON="${PYTHON:-python}"
 
     if [ -z "$PYTHON" ]; then
         log "⚠️ ocr_error_monitor: python tidak tersedia — idle"
-        log "   Install: pkg install python"
-        while true; do sleep 86400; done
-        return
+        while true; do sleep 86400; done; return
     fi
 
-    # Cek Pillow tersedia
     if ! $PYTHON -c "from PIL import Image" 2>/dev/null; then
-        log "📦 ocr_error_monitor: install Pillow..."
-        pip install pillow 2>&1 | tail -2 | while read -r l; do log "   $l"; done
-        if ! $PYTHON -c "from PIL import Image" 2>/dev/null; then
-            log "⚠️ ocr_error_monitor: gagal install Pillow — idle"
-            log "   Install manual: pip install pillow"
-            while true; do sleep 86400; done
-            return
-        fi
-        log "✅ ocr_error_monitor: Pillow siap"
+        log "⚠️ ocr_error_monitor: Pillow tidak tersedia — idle"
+        while true; do sleep 86400; done; return
     fi
 
     local ocr_interval=20
-    local scr_file="/data/local/tmp/rbx_sc_${pkg//[^a-zA-Z0-9]/_}.png"
+    local safe_pkg="${pkg//[^a-zA-Z0-9]/_}"
+    local scr_file="/data/local/tmp/rbx_sc_${safe_pkg}.png"
+    local py_file="/data/local/tmp/rbx_pil_${safe_pkg}.py"
 
-    log "📸 ocr_error_monitor: aktif via Python PIL (interval: ${ocr_interval}s, tanpa tesseract)"
+    # Tulis Python detector ke file — lebih reliable dari heredoc di $()
+    cat > "$py_file" << 'PYEOF'
+import sys, os
+try:
+    from PIL import Image
+
+    scr = sys.argv[1]
+    if not os.path.exists(scr):
+        print("ERROR:file_not_found"); sys.exit(0)
+
+    img = Image.open(scr).convert('RGB')
+    w, h = img.size
+
+    # ── Wide center crop untuk r_black ───────────────────────────────
+    # Dialog Roblox ~50% lebar layar, posisi center. Overlay gelap ada
+    # di SEKELILING dialog. Kalau crop terlalu ketat (25-75%) kita hanya
+    # dapat dialog itu sendiri — overlay tidak ikut → r_black selalu kecil.
+    # Solusi: crop lebih lebar (10-90%) — masih center, tapi cukup lebar
+    # untuk menangkap overlay di kiri/kanan/atas/bawah dialog.
+    wx1, wx2 = int(w * 0.10), int(w * 0.90)
+    wy1, wy2 = int(h * 0.10), int(h * 0.90)
+    wide_region = img.crop((wx1, wy1, wx2, wy2))
+    wide_px     = list(wide_region.getdata())
+    wide_total  = len(wide_px)
+
+    very_dark_count = 0
+    for r, g, b in wide_px:
+        if abs(r - g) + abs(g - b) < 25 and (r + g + b) / 3 < 20:
+            very_dark_count += 1
+    r_black = very_dark_count / wide_total
+
+    # ── 3 region center untuk r_dark + r_white ────────────────────────
+    regions = [
+        (int(w*0.25), int(h*0.20), int(w*0.75), int(h*0.80)),  # center
+        (int(w*0.20), int(h*0.15), int(w*0.80), int(h*0.65)),  # upper-center
+        (int(w*0.20), int(h*0.35), int(w*0.80), int(h*0.85)),  # lower-center
+    ]
+
+    for x1, y1, x2, y2 in regions:
+        region = img.crop((x1, y1, x2, y2))
+        pixels = list(region.getdata())
+        total  = len(pixels)
+        if total == 0:
+            continue
+
+        dark_grey = 0
+        bright    = 0
+
+        for r, g, b in pixels:
+            grey_ness  = abs(r - g) + abs(g - b)   # grey_ness < 25 (original)
+            brightness = (r + g + b) / 3
+            if grey_ness < 25:
+                if 35 <= brightness <= 80:
+                    dark_grey += 1
+                elif brightness > 195:
+                    bright += 1
+
+        r_dark  = dark_grey / total
+        r_white = bright    / total
+
+        # Kondisi original dipertahankan — hanya r_black sekarang dari full screen
+        if r_dark > 0.18 and r_black > 0.08 and r_white > 0.04:
+            print(f"DIALOG:{r_dark:.3f}:{r_black:.3f}:{r_white:.3f}")
+            sys.exit(0)
+
+    print(f"CLEAR:bg={max(0,0):.3f}:blk={r_black:.3f}")
+
+except Exception as e:
+    print(f"ERROR:{e}")
+PYEOF
+
+    log "📸 ocr_error_monitor: aktif (PIL pixel, interval ${ocr_interval}s)"
 
     while true; do
         sleep "$ocr_interval"
-
         is_joining "$pkg" && continue
 
         local pid
         pid=$(get_pid_for_pkg "$pkg")
         [ -z "$pid" ] && continue
 
-        # Cek Roblox di foreground
-        dumpsys activity top 2>/dev/null | grep -q "ACTIVITY ${pkg}" || continue
+        # Cek Roblox di foreground — support dua format output dumpsys
+        local fg
+        fg=$(dumpsys activity top 2>/dev/null | grep -E "ACTIVITY|mResumedActivity" | head -5)
+        echo "$fg" | grep -q "$pkg" || continue
 
-        # Wake screen
         input keyevent KEYCODE_WAKEUP 2>/dev/null
         sleep 0.3
 
         screencap -p "$scr_file" 2>/dev/null
         [ -f "$scr_file" ] || continue
 
-        # Python PIL: pixel analysis tanpa OCR engine
-        # Deteksi dialog disconnect Roblox via karakteristik warna:
-        #   - Background dialog: abu-abu gelap ~RGB(40-70)
-        #   - Overlay luar: sangat gelap ~RGB(0-30)
-        #   - Teks & tombol: putih terang ~RGB(200-255)
         local result
-        result=$($PYTHON - "$scr_file" 2>/dev/null << 'PYEOF'
-import sys
-try:
-    from PIL import Image
-    img = Image.open(sys.argv[1]).convert('RGB')
-    w, h = img.size
-
-    # Crop area tengah: 30-70% lebar, 25-75% tinggi
-    x1, x2 = int(w * 0.30), int(w * 0.70)
-    y1, y2 = int(h * 0.25), int(h * 0.75)
-    region = img.crop((x1, y1, x2, y2))
-    pixels = list(region.getdata())
-    total  = len(pixels)
-
-    dark_grey = 0
-    very_dark = 0
-    bright    = 0
-
-    for r, g, b in pixels:
-        grey_ness  = abs(r - g) + abs(g - b)
-        brightness = (r + g + b) / 3
-        if grey_ness < 25:
-            if 35 <= brightness <= 80:
-                dark_grey += 1
-            elif brightness < 20:
-                very_dark += 1
-            elif brightness > 195:
-                bright += 1
-
-    r_dark  = dark_grey / total
-    r_black = very_dark / total
-    r_white = bright    / total
-
-    if r_dark > 0.18 and r_black > 0.08 and r_white > 0.04:
-        print("DIALOG")
-    else:
-        print("CLEAR")
-except Exception:
-    print("ERROR")
-PYEOF
-)
-
+        result=$($PYTHON "$py_file" "$scr_file" 2>&1)
         rm -f "$scr_file" 2>/dev/null
-        [ "$result" = "DIALOG" ] || continue
 
-        is_joining "$pkg" && continue
-        acquire_crash_lock "$pkg" || continue
-
-        log "📸 screen_monitor: Disconnect dialog terdeteksi (PIL pixel analysis)"
-        send_discord_notification "disconnect" "Disconnect dialog terdeteksi di layar" "$pkg"
-
-        sleep 3
-        source "$cfg_file" 2>/dev/null
-        local active_url
-        active_url=$(get_active_url "$MODE" "$URL")
-        join_server "$pkg" "$active_url" "$MODE"
-        wait_ingame "$pkg"
-        verify_ingame_stable "$pkg" "$cfg_file"
-        release_crash_lock "$pkg"
+        case "${result%%:*}" in
+            DIALOG)
+                log "📸 PIL: dialog disconnect terdeteksi (${result})"
+                is_joining "$pkg" && continue
+                acquire_crash_lock "$pkg" || continue
+                send_discord_notification "disconnect" "Disconnect dialog (PIL)" "$pkg"
+                sleep 3
+                source "$cfg_file" 2>/dev/null
+                local active_url
+                active_url=$(get_active_url "$MODE" "$URL")
+                join_server "$pkg" "$active_url" "$MODE"
+                wait_ingame "$pkg"
+                verify_ingame_stable "$pkg" "$cfg_file"
+                release_crash_lock "$pkg"
+                ;;
+            CLEAR) ;;
+            ERROR*)
+                log "⚠️ PIL error: ${result}"
+                ;;
+        esac
     done
+
+    rm -f "$py_file" 2>/dev/null
 }
 
 # ─────────────────────────────────────────
