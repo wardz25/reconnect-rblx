@@ -6,7 +6,7 @@ export PATH="/data/data/com.termux/files/usr/bin:/data/data/com.termux/files/usr
 
 # ─────────────────────────────────────────
 #   ROBLOX AUTO RECONNECT + AUTO RELOG
-#   by: Wardz | versi: 3.0 (+ Error Code Disconnect Detector)
+#   by: Wardz | versi: 3.1 (+ PIL Grid Error Detection + Auto Grid)
 #   Perbaikan (3.0): - Fitur baru: error_code_monitor() — deteksi kode
 #                error disconnect Roblox (272/273/274/275/277/278/279/282)
 #                via logcat, lalu auto-rejoin. Ini beda dari crash_monitor:
@@ -145,6 +145,12 @@ WAIT_INGAME_TIMEOUT=120
 # Verify stable duration: berapa detik tight-monitor pasca-join sebelum
 # dianggap stabil dan crash_monitor dikembalikan. Default 20 detik.
 VERIFY_STABLE_DURATION=20
+
+# Debug screenshot directory untuk error code detection
+SCREENSHOT_DIR="/data/local/tmp/rblx-reconnect"
+
+# Auto Grid: otomatis atur 2 Roblox dalam freeform window side-by-side
+AUTO_GRID_ENABLED=0
 
 # ─────────────────────────────────────────
 #   PATH PER-PACKAGE
@@ -459,26 +465,26 @@ save_config() {
     local home=$8
     local error_code=${9:-1}
 
-    # Timeout fields — arg 10/11/12 opsional. Kalau tidak diberikan, baca
-    # dari file existing agar nilai tidak ter-reset saat save_config dipanggil
-    # untuk ganti setting lain (mis. toggle reconnect tidak boleh reset timeout).
+    # Timeout fields — arg 10/11/12 opsional
     local t_wait="${10}"
     local t_verify="${11}"
     local t_watchdog="${12}"
+
+    # Auto Grid — arg 13, default baca dari file jika ada
+    local auto_grid="${13}"
 
     if [ -f "$cfg_file" ]; then
         [ -z "$t_wait" ]     && t_wait=$(grep '^WAIT_INGAME_TIMEOUT='    "$cfg_file" | cut -d= -f2)
         [ -z "$t_verify" ]   && t_verify=$(grep '^VERIFY_STABLE_DURATION=' "$cfg_file" | cut -d= -f2)
         [ -z "$t_watchdog" ] && t_watchdog=$(grep '^STUCK_WATCHDOG_TIMEOUT=' "$cfg_file" | cut -d= -f2)
+        [ -z "$auto_grid" ]  && auto_grid=$(grep '^AUTO_GRID=' "$cfg_file" | head -1 | cut -d= -f2)
     fi
     t_wait="${t_wait:-120}"
     t_verify="${t_verify:-20}"
     t_watchdog="${t_watchdog:-120}"
+    auto_grid="${auto_grid:-0}"
 
-    # BUG FIX: Discord setup terjadi SETELAH package setup.
-    # Kalau save_config dipanggil dari wizard/menu sebelum Discord diinput
-    # (globals masih kosong), webhook yang sudah tersimpan bakal ketimpa "".
-    # Solusi: baca dari file dulu jika global kosong.
+    # Discord settings — preserve existing if globals empty
     local disc_enabled="${DISCORD_ENABLED:-0}"
     local disc_webhook="${DISCORD_WEBHOOK}"
     local disc_uid="${DISCORD_USER_ID}"
@@ -505,6 +511,9 @@ WAIT_INGAME_TIMEOUT=$t_wait
 VERIFY_STABLE_DURATION=$t_verify
 STUCK_WATCHDOG_TIMEOUT=$t_watchdog
 
+# Auto Grid (freeform arrangement — 2 package)
+AUTO_GRID=$auto_grid
+
 DISCORD_ENABLED=${disc_enabled:-0}
 DISCORD_WEBHOOK="${disc_webhook}"
 DISCORD_USER_ID="${disc_uid}"
@@ -514,7 +523,7 @@ EOF
 persist_discord_settings() {
     local cfg_file=$1
     local pkg=$2
-    local saved_url saved_mode saved_relog saved_reconnect saved_restart saved_home saved_error_code
+    local saved_url saved_mode saved_relog saved_reconnect saved_restart saved_home saved_error_code saved_auto_grid
 
     if [ -f "$cfg_file" ]; then
         saved_url=$(grep '^URL=' "$cfg_file" | head -1 | cut -d'"' -f2)
@@ -524,11 +533,12 @@ persist_discord_settings() {
         saved_restart=$(grep '^RESTART_KALAU_CRASH=' "$cfg_file" | head -1 | cut -d= -f2)
         saved_home=$(grep '^RECONNECT_SAAT_HOME=' "$cfg_file" | head -1 | cut -d= -f2)
         saved_error_code=$(grep '^DETEKSI_ERROR_CODE=' "$cfg_file" | head -1 | cut -d= -f2)
+        saved_auto_grid=$(grep '^AUTO_GRID=' "$cfg_file" | head -1 | cut -d= -f2)
     fi
 
     save_config "$cfg_file" "$pkg" "$saved_url" "$saved_mode" \
         "$saved_relog" "$saved_reconnect" "$saved_restart" "$saved_home" \
-        "${saved_error_code:-1}"
+        "${saved_error_code:-1}" "" "" "" "${saved_auto_grid:-0}"
 }
 
 # ─────────────────────────────────────────
@@ -689,6 +699,7 @@ show_current_config() {
     local restart=$5
     local home=$6
     local error_code=${7:-1}
+    local auto_grid=${8:-0}
     
     echo ""
     echo "  Mode aktif  : $(get_mode_label $mode)"
@@ -698,6 +709,7 @@ show_current_config() {
     echo "  Restart     : $(show_toggle $restart)"
     echo "  Home RC     : $(show_toggle $home)"
     echo "  Error Code  : $(show_toggle $error_code)"
+    echo "  Auto Grid   : $(show_toggle $auto_grid)"
     echo ""
 }
 
@@ -957,9 +969,20 @@ wizard_setup_pkg() {
     read -r error_code
     if [ "$error_code" != "0" ]; then error_code=1; fi
     
+    local auto_grid=0
+    if [ "$USE_MULTI_PKG" = "1" ]; then
+        echo ""
+        echo "  Auto Grid (freeform window arrangement)?"
+        echo "  Buka 2 Roblox Paket side-by-side dalam floating windows"
+        echo "  (1=ON, 0=OFF, default: 0)"
+        printf "  > "
+        read -r auto_grid
+        if [ "$auto_grid" != "1" ]; then auto_grid=0; fi
+    fi
+    
     # Save
     local cfg_file="${CONFIG_BASE_DIR}/roblox_config_${pkg}.cfg"
-    save_config "$cfg_file" "$pkg" "$url" "$mode" "$relog" "$reconnect" "$restart" "$home" "$error_code"
+    save_config "$cfg_file" "$pkg" "$url" "$mode" "$relog" "$reconnect" "$restart" "$home" "$error_code" "" "" "" "$auto_grid"
     
     echo ""
     echo "  ✅ Config Package $pkg_num tersimpan!"
@@ -971,12 +994,14 @@ menu_ganti_url_mode_pkg() {
     local pkg_num=$2
     local cfg_file=$3
 
-    local keep_relog keep_reconnect keep_restart keep_home keep_error_code
+    local keep_relog keep_reconnect keep_restart keep_home keep_error_code keep_auto_grid
     keep_relog=$(grep '^RELOG_SETIAP_JAM=' "$cfg_file" | head -1 | cut -d= -f2)
     keep_reconnect=$(grep '^RECONNECT_OTOMATIS=' "$cfg_file" | head -1 | cut -d= -f2)
     keep_restart=$(grep '^RESTART_KALAU_CRASH=' "$cfg_file" | head -1 | cut -d= -f2)
     keep_home=$(grep '^RECONNECT_SAAT_HOME=' "$cfg_file" | head -1 | cut -d= -f2)
     keep_error_code=$(grep '^DETEKSI_ERROR_CODE=' "$cfg_file" | head -1 | cut -d= -f2)
+    keep_auto_grid=$(grep '^AUTO_GRID=' "$cfg_file" | head -1 | cut -d= -f2)
+    keep_auto_grid="${keep_auto_grid:-0}"
 
     local new_mode new_url
     setup_mode_and_url "Ganti Mode & URL — Package $pkg_num ($pkg)" new_mode new_url
@@ -987,7 +1012,7 @@ menu_ganti_url_mode_pkg() {
 
     save_config "$cfg_file" "$pkg" "$new_url" "$new_mode" \
         "$keep_relog" "$keep_reconnect" "$keep_restart" "$keep_home" \
-        "${keep_error_code:-1}"
+        "${keep_error_code:-1}" "" "" "" "$keep_auto_grid"
 
     echo ""
     echo "  ✅ Mode & URL diupdate, setting lain tetap."
@@ -999,7 +1024,7 @@ menu_edit_settings_pkg() {
     local cfg_file=$2
 
     while true; do
-        local cur_url cur_mode cur_relog cur_reconnect cur_restart cur_home cur_error_code
+        local cur_url cur_mode cur_relog cur_reconnect cur_restart cur_home cur_error_code cur_auto_grid
         local cur_wait cur_verify cur_watchdog
         cur_url=$(grep '^URL=' "$cfg_file" | head -1 | cut -d'"' -f2)
         cur_mode=$(grep '^MODE=' "$cfg_file" | head -1 | cut -d'"' -f2)
@@ -1009,6 +1034,8 @@ menu_edit_settings_pkg() {
         cur_home=$(grep '^RECONNECT_SAAT_HOME=' "$cfg_file" | head -1 | cut -d= -f2)
         cur_error_code=$(grep '^DETEKSI_ERROR_CODE=' "$cfg_file" | head -1 | cut -d= -f2)
         cur_error_code="${cur_error_code:-1}"
+        cur_auto_grid=$(grep '^AUTO_GRID=' "$cfg_file" | head -1 | cut -d= -f2)
+        cur_auto_grid="${cur_auto_grid:-0}"
         cur_wait=$(grep '^WAIT_INGAME_TIMEOUT=' "$cfg_file" | cut -d= -f2); cur_wait="${cur_wait:-120}"
         cur_verify=$(grep '^VERIFY_STABLE_DURATION=' "$cfg_file" | cut -d= -f2); cur_verify="${cur_verify:-20}"
         cur_watchdog=$(grep '^STUCK_WATCHDOG_TIMEOUT=' "$cfg_file" | cut -d= -f2); cur_watchdog="${cur_watchdog:-120}"
@@ -1017,26 +1044,27 @@ menu_edit_settings_pkg() {
         header
         echo ""
         echo "  ⚙️ UBAH SETTING — $pkg"
-        show_current_config "$cur_url" "$cur_mode" "$cur_relog" "$cur_reconnect" "$cur_restart" "$cur_home" "$cur_error_code"
+        show_current_config "$cur_url" "$cur_mode" "$cur_relog" "$cur_reconnect" "$cur_restart" "$cur_home" "$cur_error_code" "$cur_auto_grid"
         echo "  1) Relog interval        (sekarang: ${cur_relog} jam)"
         echo "  2) Reconnect otomatis    (sekarang: $(show_toggle $cur_reconnect))"
         echo "  3) Restart kalau crash   (sekarang: $(show_toggle $cur_restart))"
         echo "  4) Reconnect saat home   (sekarang: $(show_toggle $cur_home))"
         echo "  5) Deteksi Error Code    (sekarang: $(show_toggle $cur_error_code))"
-        echo "  6) Timeout settings      (Join: ${cur_wait}s | Verify: ${cur_verify}s | Watchdog: ${cur_watchdog}s)"
-        echo "  7) Kembali"
+        echo "  6) Auto Grid (freeform)  (sekarang: $(show_toggle $cur_auto_grid))"
+        echo "  7) Timeout settings      (Join: ${cur_wait}s | Verify: ${cur_verify}s | Watchdog: ${cur_watchdog}s)"
+        echo "  8) Kembali"
         echo ""
-        printf "  Pilih (1-7): "
+        printf "  Pilih (1-8): "
         read -r PILIHAN
 
-        case $PILIHAN in
+            case $PILIHAN in
             1)
                 echo ""
                 echo "  Relog setiap berapa jam? (0=OFF)"
                 printf "  > "
                 read -r V
                 if [[ "$V" =~ ^[0-9]+$ ]]; then
-                    save_config "$cfg_file" "$pkg" "$cur_url" "$cur_mode" "$V" "$cur_reconnect" "$cur_restart" "$cur_home" "$cur_error_code"
+                    save_config "$cfg_file" "$pkg" "$cur_url" "$cur_mode" "$V" "$cur_reconnect" "$cur_restart" "$cur_home" "$cur_error_code" "" "" "" "$cur_auto_grid"
                     echo "  ✅ Disimpan!"
                 else
                     echo "  ⚠ Masukkan angka!"
@@ -1045,29 +1073,37 @@ menu_edit_settings_pkg() {
                 ;;
             2)
                 local new_val; new_val=$([ "$cur_reconnect" = "1" ] && echo 0 || echo 1)
-                save_config "$cfg_file" "$pkg" "$cur_url" "$cur_mode" "$cur_relog" "$new_val" "$cur_restart" "$cur_home" "$cur_error_code"
+                save_config "$cfg_file" "$pkg" "$cur_url" "$cur_mode" "$cur_relog" "$new_val" "$cur_restart" "$cur_home" "$cur_error_code" "" "" "" "$cur_auto_grid"
                 echo "  ✅ Reconnect: $(show_toggle $new_val)"
                 sleep 1
                 ;;
             3)
                 local new_val; new_val=$([ "$cur_restart" = "1" ] && echo 0 || echo 1)
-                save_config "$cfg_file" "$pkg" "$cur_url" "$cur_mode" "$cur_relog" "$cur_reconnect" "$new_val" "$cur_home" "$cur_error_code"
+                save_config "$cfg_file" "$pkg" "$cur_url" "$cur_mode" "$cur_relog" "$cur_reconnect" "$new_val" "$cur_home" "$cur_error_code" "" "" "" "$cur_auto_grid"
                 echo "  ✅ Restart: $(show_toggle $new_val)"
                 sleep 1
                 ;;
             4)
                 local new_val; new_val=$([ "$cur_home" = "1" ] && echo 0 || echo 1)
-                save_config "$cfg_file" "$pkg" "$cur_url" "$cur_mode" "$cur_relog" "$cur_reconnect" "$cur_restart" "$new_val" "$cur_error_code"
+                save_config "$cfg_file" "$pkg" "$cur_url" "$cur_mode" "$cur_relog" "$cur_reconnect" "$cur_restart" "$new_val" "$cur_error_code" "" "" "" "$cur_auto_grid"
                 echo "  ✅ Home RC: $(show_toggle $new_val)"
                 sleep 1
                 ;;
-            5)
+             5)
                 local new_val; new_val=$([ "$cur_error_code" = "1" ] && echo 0 || echo 1)
-                save_config "$cfg_file" "$pkg" "$cur_url" "$cur_mode" "$cur_relog" "$cur_reconnect" "$cur_restart" "$cur_home" "$new_val"
+                save_config "$cfg_file" "$pkg" "$cur_url" "$cur_mode" "$cur_relog" "$cur_reconnect" "$cur_restart" "$cur_home" "$new_val" "" "" "" "$cur_auto_grid"
                 echo "  ✅ Deteksi Error Code: $(show_toggle $new_val)"
                 sleep 1
                 ;;
             6)
+                # ── Auto Grid toggle ──────────────────────────────────────
+                local new_val; new_val=$([ "$cur_auto_grid" = "1" ] && echo 0 || echo 1)
+                save_config "$cfg_file" "$pkg" "$cur_url" "$cur_mode" "$cur_relog" "$cur_reconnect" "$cur_restart" "$cur_home" "$cur_error_code" "$cur_wait" "$cur_verify" "$cur_watchdog" "$new_val"
+                AUTO_GRID_ENABLED="$new_val"
+                echo "  ✅ Auto Grid: $(show_toggle $new_val)"
+                sleep 1
+                ;;
+            7)
                 # ── Timeout sub-menu ─────────────────────────────────────
                 while true; do
                     clr; header
@@ -1100,7 +1136,7 @@ menu_edit_settings_pkg() {
                                 cur_wait="$V"
                                 save_config "$cfg_file" "$pkg" "$cur_url" "$cur_mode" \
                                     "$cur_relog" "$cur_reconnect" "$cur_restart" "$cur_home" \
-                                    "$cur_error_code" "$cur_wait" "$cur_verify" "$cur_watchdog"
+                                    "$cur_error_code" "$cur_wait" "$cur_verify" "$cur_watchdog" "$cur_auto_grid"
                                 WAIT_INGAME_TIMEOUT="$V"
                                 echo "  ✅ Wait INGAME timeout: ${V}s"
                             else
@@ -1115,7 +1151,7 @@ menu_edit_settings_pkg() {
                                 cur_verify="$V"
                                 save_config "$cfg_file" "$pkg" "$cur_url" "$cur_mode" \
                                     "$cur_relog" "$cur_reconnect" "$cur_restart" "$cur_home" \
-                                    "$cur_error_code" "$cur_wait" "$cur_verify" "$cur_watchdog"
+                                    "$cur_error_code" "$cur_wait" "$cur_verify" "$cur_watchdog" "$cur_auto_grid"
                                 VERIFY_STABLE_DURATION="$V"
                                 echo "  ✅ Verify stable duration: ${V}s"
                             else
@@ -1130,7 +1166,7 @@ menu_edit_settings_pkg() {
                                 cur_watchdog="$V"
                                 save_config "$cfg_file" "$pkg" "$cur_url" "$cur_mode" \
                                     "$cur_relog" "$cur_reconnect" "$cur_restart" "$cur_home" \
-                                    "$cur_error_code" "$cur_wait" "$cur_verify" "$cur_watchdog"
+                                    "$cur_error_code" "$cur_wait" "$cur_verify" "$cur_watchdog" "$cur_auto_grid"
                                 STUCK_WATCHDOG_TIMEOUT="$V"
                                 echo "  ✅ Stuck watchdog timeout: ${V}s"
                             else
@@ -1142,8 +1178,8 @@ menu_edit_settings_pkg() {
                     esac
                 done
                 ;;
-            7) return ;;
-            *) echo "  ⚠ Pilih 1-7"; sleep 1 ;;
+            8) return ;;
+            *) echo "  ⚠ Pilih 1-8"; sleep 1 ;;
         esac
     done
 }
@@ -1159,7 +1195,7 @@ setup_or_load_pkg() {
     fi
 
     while true; do
-        local saved_url saved_mode saved_relog saved_reconnect saved_restart saved_home saved_error_code
+        local saved_url saved_mode saved_relog saved_reconnect saved_restart saved_home saved_error_code saved_auto_grid
         saved_url=$(grep '^URL=' "$cfg_file" | head -1 | cut -d'"' -f2)
         saved_mode=$(grep '^MODE=' "$cfg_file" | head -1 | cut -d'"' -f2)
         saved_relog=$(grep '^RELOG_SETIAP_JAM=' "$cfg_file" | head -1 | cut -d= -f2)
@@ -1168,12 +1204,14 @@ setup_or_load_pkg() {
         saved_home=$(grep '^RECONNECT_SAAT_HOME=' "$cfg_file" | head -1 | cut -d= -f2)
         saved_error_code=$(grep '^DETEKSI_ERROR_CODE=' "$cfg_file" | head -1 | cut -d= -f2)
         saved_error_code="${saved_error_code:-1}"
+        saved_auto_grid=$(grep '^AUTO_GRID=' "$cfg_file" | head -1 | cut -d= -f2)
+        saved_auto_grid="${saved_auto_grid:-0}"
 
         clr
         header
         echo ""
         echo "  📦 Config Package $pkg_num ($pkg) ditemukan dari run sebelumnya:"
-        show_current_config "$saved_url" "$saved_mode" "$saved_relog" "$saved_reconnect" "$saved_restart" "$saved_home" "$saved_error_code"
+        show_current_config "$saved_url" "$saved_mode" "$saved_relog" "$saved_reconnect" "$saved_restart" "$saved_home" "$saved_error_code" "$saved_auto_grid"
         echo "  1) Pakai config ini, langsung jalan"
         echo "  2) Ganti mode / URL"
         echo "  3) Ubah setting (relog/reconnect/restart/home)"
@@ -1325,6 +1363,103 @@ try_floating_window() {
 }
 
 # ─────────────────────────────────────────
+#   AUTO GRID — freeform window arrangement
+# ─────────────────────────────────────────
+
+init_freeform_support() {
+    local changed=0
+    if [ "$(settings get global enable_freeform_support 2>/dev/null)" != "1" ]; then
+        settings put global enable_freeform_support 1 2>/dev/null && changed=1
+    fi
+    if [ "$(settings get global force_resizable_activities 2>/dev/null)" != "1" ]; then
+        settings put global force_resizable_activities 1 2>/dev/null && changed=1
+    fi
+    if [ "$changed" = "1" ]; then
+        log "🔲 Freeform support enabled"
+    fi
+}
+
+get_task_id_for_pkg() {
+    local pkg=$1
+    local tid=""
+    tid=$(dumpsys activity activities 2>/dev/null \
+        | grep -B3 "package=$pkg" \
+        | grep -oE "taskId=[0-9]+" \
+        | grep -oE "[0-9]+" \
+        | head -1)
+    echo "$tid"
+}
+
+auto_grid_arrange() {
+    local pkg1=$1 url1=$2
+    local pkg2=$3 url2=$4
+
+    log "🔲 Auto Grid: arranging windows..."
+
+    init_freeform_support
+
+    local display
+    display=$(wm size 2>/dev/null | grep -oE "[0-9]+x[0-9]+" | head -1)
+    local disp_w="${display%%x*}"
+    local disp_h="${display##*x}"
+    local half_w=$(( disp_w / 2 ))
+    log "🔲 Display: ${disp_w}x${disp_h}, half: ${half_w}"
+
+    local act1
+    act1=$(get_view_activity "$pkg1" "$url1")
+
+    local act2
+    act2=$(get_view_activity "$pkg2" "$url2")
+
+    # ── PKG1: resize existing task if running, else launch fresh ──
+    local tid1
+    tid1=$(get_task_id_for_pkg "$pkg1")
+
+    if [ -n "$tid1" ]; then
+        log "🔲 $pkg1 already running (task $tid1) — resizing to left half"
+        am task resize "$tid1" 0 0 "$half_w" "$disp_h" 2>/dev/null
+        if [ $? -eq 0 ]; then
+            log "✅ Auto Grid: PKG1 resized to left half (task $tid1)"
+        else
+            log "⚠️ Auto Grid: PKG1 resize failed — force-stop + relaunch"
+            am force-stop "$pkg1" 2>/dev/null
+            sleep 2
+            am start -a android.intent.action.VIEW -d "$url1" -n "$act1" \
+                --windowingMode 5 -f 0x10000000 </dev/null >/dev/null 2>&1
+        fi
+    else
+        log "🔲 Launching $pkg1 in freeform (left half)"
+        am start -a android.intent.action.VIEW -d "$url1" -n "$act1" \
+            --windowingMode 5 -f 0x10000000 </dev/null >/dev/null 2>&1
+    fi
+    sleep 5
+
+    # ── PKG2: launch fresh in right half ──────────────────────────
+    log "🔲 Launching $pkg2 in freeform (right half)"
+    am force-stop "$pkg2" 2>/dev/null
+    sleep 1
+    am start -a android.intent.action.VIEW -d "$url2" -n "$act2" \
+        --windowingMode 5 -f 0x10000000 </dev/null >/dev/null 2>&1
+    sleep 5
+
+    local tid2
+    tid2=$(get_task_id_for_pkg "$pkg2")
+    if [ -n "$tid2" ]; then
+        am task resize "$tid2" "$half_w" 0 "$disp_w" "$disp_h" 2>/dev/null
+        if [ $? -eq 0 ]; then
+            log "✅ Auto Grid: PKG2 resized to right half (task $tid2)"
+        else
+            log "⚠️ Auto Grid: PKG2 resize failed — freeform tetap jalan"
+        fi
+    else
+        log "⚠️ Auto Grid: cannot get task ID for $pkg2"
+    fi
+
+    log "✅ Auto Grid done"
+    send_discord_notification "floating" "Auto Grid — both arranged" "$pkg1"
+}
+
+# ─────────────────────────────────────────
 #   LOG & CORE
 # ─────────────────────────────────────────
 
@@ -1384,6 +1519,42 @@ write_dashboard_event() {
     # Trim ke 30 baris terakhir
     local lc; lc=$(wc -l < "$ef" 2>/dev/null || echo 0)
     [ "$lc" -gt 30 ] && tail -30 "$ef" > "${ef}.tmp" && mv "${ef}.tmp" "$ef"
+}
+
+# ─────────────────────────────────────────
+#   CAPTURE SCREEN — multiple fallback methods
+# ─────────────────────────────────────────
+capture_screen() {
+    local out_file=$1
+    mkdir -p "$(dirname "$out_file")" 2>/dev/null
+
+    # Method 1: direct screencap (via PATH)
+    screencap -p "$out_file" 2>/dev/null
+    if [ -s "$out_file" ]; then return 0; fi
+
+    # Method 2: full path
+    /system/bin/screencap -p "$out_file" 2>/dev/null
+    if [ -s "$out_file" ]; then return 0; fi
+
+    # Method 3: su 2000 (shell UID — works when root screencap blocked)
+    su 2000 -c "screencap -p '$out_file'" 2>/dev/null
+    if [ -s "$out_file" ]; then return 0; fi
+
+    # Method 4: su system
+    su system -c "screencap -p '$out_file'" 2>/dev/null
+    if [ -s "$out_file" ]; then return 0; fi
+
+    # Method 5: python subprocess
+    python -c "
+import subprocess, sys
+with open('$out_file', 'wb') as f:
+    try:
+        subprocess.run(['/system/bin/screencap', '-p'], stdout=f, check=True)
+    except: sys.exit(1)
+" 2>/dev/null
+    if [ -s "$out_file" ]; then return 0; fi
+
+    return 1
 }
 
 # ─────────────────────────────────────────
@@ -2250,6 +2421,8 @@ ocr_error_monitor() {
     local pkg=$1
     local cfg_file=$2
 
+    mkdir -p "$SCREENSHOT_DIR" 2>/dev/null
+
     local PYTHON=""
     command -v python3 >/dev/null 2>&1 && PYTHON="python3"
     command -v python  >/dev/null 2>&1 && PYTHON="${PYTHON:-python}"
@@ -2264,83 +2437,94 @@ ocr_error_monitor() {
         while true; do sleep 86400; done; return
     fi
 
-    local ocr_interval=20
+    local ocr_interval=45
     local safe_pkg="${pkg//[^a-zA-Z0-9]/_}"
-    local scr_file="/data/local/tmp/rbx_sc_${safe_pkg}.png"
     local py_file="/data/local/tmp/rbx_pil_${safe_pkg}.py"
+    local debug_log="${SCREENSHOT_DIR}/_pixel_grid_${safe_pkg}.log"
 
-    # Tulis Python detector ke file — lebih reliable dari heredoc di $()
     cat > "$py_file" << 'PYEOF'
 import sys, os
 try:
     from PIL import Image
+except ImportError:
+    print("ERROR:NO_PIL"); sys.exit(0)
 
-    scr = sys.argv[1]
-    if not os.path.exists(scr):
-        print("ERROR:file_not_found"); sys.exit(0)
+scr = sys.argv[1]
+if not os.path.exists(scr):
+    print("ERROR:FILE_NOT_FOUND"); sys.exit(0)
 
+try:
     img = Image.open(scr).convert('RGB')
     w, h = img.size
 
-    # ── Wide center crop untuk r_black ───────────────────────────────
-    # Dialog Roblox ~50% lebar layar, posisi center. Overlay gelap ada
-    # di SEKELILING dialog. Kalau crop terlalu ketat (25-75%) kita hanya
-    # dapat dialog itu sendiri — overlay tidak ikut → r_black selalu kecil.
-    # Solusi: crop lebih lebar (10-90%) — masih center, tapi cukup lebar
-    # untuk menangkap overlay di kiri/kanan/atas/bawah dialog.
-    wx1, wx2 = int(w * 0.10), int(w * 0.90)
-    wy1, wy2 = int(h * 0.10), int(h * 0.90)
-    wide_region = img.crop((wx1, wy1, wx2, wy2))
-    wide_px     = list(wide_region.getdata())
-    wide_total  = len(wide_px)
+    cols, rows = 6, 6
+    x_start = int(w * 0.10)
+    x_end   = int(w * 0.90)
+    y_start = int(h * 0.10)
+    y_end   = int(h * 0.85)
+    cell_w = max(1, (x_end - x_start) // cols)
+    cell_h = max(1, (y_end - y_start) // rows)
 
-    very_dark_count = 0
-    for r, g, b in wide_px:
-        if abs(r - g) + abs(g - b) < 25 and (r + g + b) / 3 < 20:
-            very_dark_count += 1
-    r_black = very_dark_count / wide_total
+    grid_grey  = [[0]*cols for _ in range(rows)]
+    grid_white = [[0]*cols for _ in range(rows)]
 
-    # ── 3 region center untuk r_dark + r_white ────────────────────────
-    regions = [
-        (int(w*0.25), int(h*0.20), int(w*0.75), int(h*0.80)),  # center
-        (int(w*0.20), int(h*0.15), int(w*0.80), int(h*0.65)),  # upper-center
-        (int(w*0.20), int(h*0.35), int(w*0.80), int(h*0.85)),  # lower-center
-    ]
+    for r in range(rows):
+        for c in range(cols):
+            cx1 = x_start + c * cell_w
+            cy1 = y_start + r * cell_h
+            cx2 = min(cx1 + cell_w, w)
+            cy2 = min(cy1 + cell_h, h)
+            region = img.crop((cx1, cy1, cx2, cy2))
+            pixels = list(region.getdata())
+            total = len(pixels)
+            if total == 0:
+                continue
+            grey_cnt = 0
+            white_cnt = 0
+            for pix in pixels:
+                greyness = abs(pix[0]-pix[1]) + abs(pix[1]-pix[2]) + abs(pix[2]-pix[0])
+                if greyness < 60:
+                    brightness = (pix[0] + pix[1] + pix[2]) / 3.0
+                    if 30 <= brightness <= 100:
+                        grey_cnt += 1
+                    elif brightness > 200:
+                        white_cnt += 1
+            grid_grey[r][c]  = grey_cnt / total if total else 0
+            grid_white[r][c] = white_cnt / total if total else 0
 
-    for x1, y1, x2, y2 in regions:
-        region = img.crop((x1, y1, x2, y2))
-        pixels = list(region.getdata())
-        total  = len(pixels)
-        if total == 0:
-            continue
+    center_grey  = 0
+    center_white = 0
+    center_total = 0
+    for r in range(1, rows-1):
+        for c in range(1, cols-1):
+            center_total += 1
+            if grid_grey[r][c] > 0.15:
+                center_grey += 1
+            if grid_white[r][c] > 0.03:
+                center_white += 1
 
-        dark_grey = 0
-        bright    = 0
+    grey_ratio  = center_grey  / center_total if center_total else 0
+    white_ratio = center_white / center_total if center_total else 0
 
-        for r, g, b in pixels:
-            grey_ness  = abs(r - g) + abs(g - b)   # grey_ness < 25 (original)
-            brightness = (r + g + b) / 3
-            if grey_ness < 25:
-                if 35 <= brightness <= 80:
-                    dark_grey += 1
-                elif brightness > 195:
-                    bright += 1
+    dbg = f"GREY:{grey_ratio:.3f}:WHITE:{white_ratio:.3f}"
+    logfile = os.path.join(os.path.dirname(scr), "_pixel_grid_" + os.path.basename(scr).replace(".png","") + ".log")
+    with open(logfile, "w") as f:
+        f.write(dbg + "\n== GREY grid ==\n")
+        for r in range(rows):
+            f.write(" ".join(f"{grid_grey[r][c]:.2f}" for c in range(cols)) + "\n")
+        f.write("== WHITE grid ==\n")
+        for r in range(rows):
+            f.write(" ".join(f"{grid_white[r][c]:.2f}" for c in range(cols)) + "\n")
 
-        r_dark  = dark_grey / total
-        r_white = bright    / total
-
-        # Kondisi original dipertahankan — hanya r_black sekarang dari full screen
-        if r_dark > 0.18 and r_black > 0.08 and r_white > 0.04:
-            print(f"DIALOG:{r_dark:.3f}:{r_black:.3f}:{r_white:.3f}")
-            sys.exit(0)
-
-    print(f"CLEAR:bg={max(0,0):.3f}:blk={r_black:.3f}")
-
+    if grey_ratio > 0.35 and white_ratio > 0.05:
+        print(f"DIALOG:{dbg}")
+    else:
+        print(f"CLEAR:{dbg}")
 except Exception as e:
     print(f"ERROR:{e}")
 PYEOF
 
-    log "📸 ocr_error_monitor: aktif (PIL pixel, interval ${ocr_interval}s)"
+    log "📸 ocr_error_monitor: aktif (PIL 6x6 grid, interval ${ocr_interval}s, debug: ${SCREENSHOT_DIR})"
 
     while true; do
         sleep "$ocr_interval"
@@ -2350,7 +2534,6 @@ PYEOF
         pid=$(get_pid_for_pkg "$pkg")
         [ -z "$pid" ] && continue
 
-        # Cek Roblox di foreground — support dua format output dumpsys
         local fg
         fg=$(dumpsys activity top 2>/dev/null | grep -E "ACTIVITY|mResumedActivity" | head -5)
         echo "$fg" | grep -q "$pkg" || continue
@@ -2358,19 +2541,26 @@ PYEOF
         input keyevent KEYCODE_WAKEUP 2>/dev/null
         sleep 0.3
 
-        screencap -p "$scr_file" 2>/dev/null
-        [ -f "$scr_file" ] || continue
+        local ts; ts=$(date '+%Y%m%d_%H%M%S')
+        local debug_scr="${SCREENSHOT_DIR}/${ts}_${safe_pkg}.png"
+
+        if ! capture_screen "$debug_scr"; then
+            log "⚠️ ocr_error_monitor: capture_screen gagal"
+            continue
+        fi
 
         local result
-        result=$($PYTHON "$py_file" "$scr_file" 2>&1)
-        rm -f "$scr_file" 2>/dev/null
+        result=$($PYTHON "$py_file" "$debug_scr" 2>&1)
+
+        # Cleanup old screenshots — keep last 100
+        ls -t "${SCREENSHOT_DIR}"/*.png 2>/dev/null | tail -n +101 | xargs -r rm -f 2>/dev/null
 
         case "${result%%:*}" in
             DIALOG)
-                log "📸 PIL: dialog disconnect terdeteksi (${result})"
+                log "📸 DIALOG DETECTED: ${result}" "warning"
                 is_joining "$pkg" && continue
                 acquire_crash_lock "$pkg" || continue
-                send_discord_notification "disconnect" "Disconnect dialog (PIL)" "$pkg"
+                send_discord_notification "disconnect" "Disconnect dialog detected" "$pkg"
                 sleep 3
                 source "$cfg_file" 2>/dev/null
                 local active_url
@@ -2398,7 +2588,16 @@ open_second_package() {
     if [ "$USE_MULTI_PKG" != "1" ] || [ -z "$PKG2" ]; then
         return
     fi
-    
+
+    local cfg1="${CONFIG_BASE_DIR}/roblox_config_${PKG1}.cfg"
+    local auto_grid
+
+    # Baca AUTO_GRID dari config PKG1
+    if [ -f "$cfg1" ]; then
+        auto_grid=$(grep '^AUTO_GRID=' "$cfg1" | head -1 | cut -d= -f2)
+    fi
+    auto_grid="${auto_grid:-0}"
+
     local mode2 url2
     local cfg2="${CONFIG_BASE_DIR}/roblox_config_${PKG2}.cfg"
     
@@ -2414,8 +2613,18 @@ open_second_package() {
     local active_url2
     active_url2=$(get_active_url "$mode2" "$url2")
 
-    # Split screen dihapus — langsung pakai floating/freeform window
-    try_floating_window "$PKG2" "$active_url2"
+    if [ "$auto_grid" = "1" ] && [ -n "$PKG1" ]; then
+        # Auto Grid: arrange PKG1 (left) + PKG2 (right) in freeform
+        local active_url1
+        local cfg1_mode cfg1_url
+        cfg1_mode=$(grep '^MODE=' "$cfg1" | head -1 | cut -d'"' -f2)
+        cfg1_url=$(grep '^URL=' "$cfg1" | head -1 | cut -d'"' -f2)
+        active_url1=$(get_active_url "$cfg1_mode" "$cfg1_url")
+        auto_grid_arrange "$PKG1" "$active_url1" "$PKG2" "$active_url2"
+    else
+        # Standard: floating window for PKG2 only
+        try_floating_window "$PKG2" "$active_url2"
+    fi
 }
 
 # ─────────────────────────────────────────
@@ -2710,6 +2919,10 @@ fi
 
 # Load config
 source "${CONFIG_BASE_DIR}/roblox_config_${PKG1}.cfg" 2>/dev/null
+AUTO_GRID_ENABLED="${AUTO_GRID:-0}"
+
+# Create debug screenshot directory
+mkdir -p "$SCREENSHOT_DIR" 2>/dev/null
 
 # START
 mkdir -p "$PKG1_STATE_DIR"
@@ -2726,6 +2939,7 @@ if [ "$USE_MULTI_PKG" = "1" ]; then
 fi
 log "Discord          : $(show_toggle $DISCORD_ENABLED)"
 log "Deteksi Error Code: $(show_toggle ${DETEKSI_ERROR_CODE:-1}) (stuck watchdog: ${STUCK_WATCHDOG_TIMEOUT}s)"
+log "Auto Grid        : $(show_toggle $AUTO_GRID_ENABLED)"
 echo "=========================================" | tee -a "$PKG1_LOG_FILE"
 echo ""
 
@@ -2952,17 +3166,17 @@ _mon_start ocr      ocr_error_monitor      "$PKG1" "${CONFIG_BASE_DIR}/roblox_co
 ) &
 echo $! > "$RBX_PID_DIR/keepalive"
 
-# Dashboard langsung di foreground — tidak butuh session Termux kedua
+# Dashboard di foreground — tidak butuh session Termux kedua
 sleep 1
 if command -v python >/dev/null 2>&1; then
+    log "📊 Buka dashboard: python ${DASH_DIR}/dashboard.py $PKG1"
     python "${DASH_DIR}/dashboard.py" "$PKG1"
-else
-    log "⚠️ Python tidak tersedia — fallback ke wait"
-    wait
+    log "📊 Dashboard ditutup — monitoring tetap jalan"
 fi
 
-# Kalau dashboard di-close (Ctrl+C) — monitoring tetap jalan di background
-echo ""
-log "📊 Dashboard ditutup — monitoring lanjut di background"
-log "   Buka lagi: python ${DASH_DIR}/dashboard.py $PKG1"
-wait
+# JANGAN pernah exit — tetap di foreground agar script tidak return ke shell
+# (background monitor processes bukan direct child, jadi wait tidak work)
+log "🟢 Monitoring aktif — Ctrl+C dobel untuk stop total"
+while true; do
+    sleep 60
+done
